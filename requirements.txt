@@ -1,0 +1,30 @@
+# 作业自动上传工具 - 依赖包列表
+# 安装命令: pip install -r requirements.txt
+
+# GUI框架(内置,无需安装)
+# tkinter
+
+# Selenium浏览器自动化
+selenium>=4.10.0
+
+# 文件监控
+watchdog>=3.0.0
+
+# 文档解析
+python-docx>=0.8.11    # .docx文件解析
+pdfplumber>=0.9.0      # .pdf文件解析
+
+# HTTP请求(AI科目识别)
+requests>=2.31.0
+
+# 数据库(内置,无需安装)
+# sqlite3
+
+# 其他标准库(内置,无需安装)
+# queue
+# threading
+# datetime
+# time
+# os
+# json
+# traceback
