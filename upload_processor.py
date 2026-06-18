@@ -45,10 +45,9 @@ class UploadProcessor:
         self.info_extractor = InfoExtractor()
         self.classifier = SubjectClassifier()
         self.browser = BrowserAutomation(log_queue=log_queue)
-        
-        # 当前处理的学校缓存(用于减少不必要的学校切换)
-        self.current_school = None
-    
+        # 处理中标记，防止后端在任务处理期间误关浏览器
+        self.processing = False
+
     def run(self):
         """
         主运行循环
@@ -126,50 +125,49 @@ class UploadProcessor:
         else:
             self._send_log(f"识别结果: {subject}")
         
-        # 步骤5: 确保浏览器已启动（延迟初始化，首次调用时才打开浏览器）
-        if not self.browser.ensure_initialized():
-            error_msg = "浏览器启动失败"
-            self._send_log(f"错误: {error_msg}")
-            self._handle_failure(file_name, file_path, folder_name, school, grade, subject, error_msg)
-            return
-
-        # 检查浏览器是否崩溃
-        if not self.browser.check_browser_status():
-            self._send_log("检测到浏览器异常,正在重启...")
-            if not self.browser.restart_browser():
-                error_msg = "浏览器重启失败"
+        # 标记处理中，防止后端在任务处理期间误关浏览器
+        self.processing = True
+        try:
+            # 步骤5: 确保浏览器已启动（延迟初始化，首次调用时才打开浏览器）
+            if not self.browser.ensure_initialized():
+                error_msg = "浏览器启动失败"
                 self._send_log(f"错误: {error_msg}")
                 self._handle_failure(file_name, file_path, folder_name, school, grade, subject, error_msg)
                 return
 
-        # 检查登录状态
-        if not self.browser.check_login_status():
-            self._send_log("检测到登录失效,正在重新登录...")
-            if not self.browser.restart_browser():
-                error_msg = "重新登录失败"
-                self._send_log(f"错误: {error_msg}")
-                self._handle_failure(file_name, file_path, folder_name, school, grade, subject, error_msg)
-                return
-        
-        # 步骤6: 校验并切换学校(优化:只在必要时切换)
-        if school != self.current_school:
-            self._send_log(f"需要切换学校: {school}")
+            # 检查浏览器是否崩溃
+            if not self.browser.check_browser_status():
+                self._send_log("检测到浏览器异常,正在重启...")
+                if not self.browser.restart_browser():
+                    error_msg = "浏览器重启失败"
+                    self._send_log(f"错误: {error_msg}")
+                    self._handle_failure(file_name, file_path, folder_name, school, grade, subject, error_msg)
+                    return
+
+            # 检查登录状态
+            if not self.browser.check_login_status():
+                self._send_log("检测到登录失效,正在重新登录...")
+                if not self.browser.restart_browser():
+                    error_msg = "重新登录失败"
+                    self._send_log(f"错误: {error_msg}")
+                    self._handle_failure(file_name, file_path, folder_name, school, grade, subject, error_msg)
+                    return
+
+            # 步骤6: 校验并切换学校(每次上传前都实际检查网页上的学校)
+            self._send_log(f"正在校验学校: {school}")
             if not self.browser.check_and_switch_school(school):
-                error_msg = f"学校切换失败: {school}"
+                error_msg = f"学校校验/切换失败: {school}"
                 self._send_log(f"错误: {error_msg}")
                 self._handle_failure(file_name, file_path, folder_name, school, grade, subject, error_msg)
                 return
-            else:
-                # 更新当前学校缓存
-                self.current_school = school
-                self._send_log(f"✓ 学校已切换到: {school}")
-        else:
-            self._send_log(f"学校一致,无需切换: {school}")
-        
-        # 步骤7: 执行上传(传递学校参数,用于在上传对话框中选择)
-        self._send_log(f"正在上传到平台...")
-        upload_success = self.browser.upload_file(file_path, grade, subject, school)
-        
+            self._send_log(f"✓ 学校校验通过: {school}")
+
+            # 步骤7: 执行上传(传递学校参数,用于在上传对话框中选择)
+            self._send_log(f"正在上传到平台...")
+            upload_success = self.browser.upload_file(file_path, grade, subject, school)
+        finally:
+            self.processing = False
+
         if upload_success:
             # 上传成功,记录到数据库
             self.db.add_record(
@@ -272,16 +270,13 @@ class UploadProcessor:
         if not self.browser.check_browser_status():
             self.browser.restart_browser()
 
-        # 校验学校(优化:只在必要时切换)
-        if school != self.current_school:
-            if not self.browser.check_and_switch_school(school):
-                error_msg = "学校切换失败"
-                self.db.update_error_message(record_id, error_msg)
-                self._send_log(f"错误: {error_msg}")
-                self._send_log("REFRESH_FAILED_LIST")
-                return
-            else:
-                self.current_school = school
+        # 校验学校(每次上传前都实际检查网页上的学校)
+        if not self.browser.check_and_switch_school(school):
+            error_msg = "学校校验/切换失败"
+            self.db.update_error_message(record_id, error_msg)
+            self._send_log(f"错误: {error_msg}")
+            self._send_log("REFRESH_FAILED_LIST")
+            return
         
         # 执行上传
         upload_success = self.browser.upload_file(file_path, grade, subject, school)

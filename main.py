@@ -57,30 +57,51 @@ def backend_worker(stop_event: threading.Event, task_queue: Queue,
         browser = BrowserAutomation(log_queue=log_queue)
         browser_error_logged = False
         while not stop_event.is_set():
-            time.sleep(5)  # 每5秒检查一次
+            # 用 stop_event.wait 替代 time.sleep，收到停止信号时立即退出
+            stop_event.wait(5)
+
+            if stop_event.is_set():
+                break
 
             # 浏览器未启动时跳过所有检查
             if not browser.is_initialized:
                 browser_error_logged = False
                 continue
 
-            # 检查浏览器空闲超时
-            if browser.is_idle_timeout():
+            # 上传完成后队列为空且无正在处理的任务，主动关闭浏览器
+            if task_queue.empty() and not upload_processor.processing and browser.is_idle_for(30):
+                log_queue.put("上传完成,队列为空,正在关闭浏览器...")
+                browser.close()
+                browser_error_logged = False
+                continue
+
+            # 检查浏览器空闲超时（空闲且无正在处理的任务才关闭）
+            if not upload_processor.processing and browser.is_idle_timeout():
                 log_queue.put("检测到浏览器空闲超时,正在关闭...")
                 browser.close()
                 browser_error_logged = False
 
             # 检查浏览器是否仍然可用
             elif not browser.check_browser_status():
-                if not browser_error_logged:
-                    log_queue.put("警告: 浏览器异常关闭,尝试重启...")
-                    browser_error_logged = True
-                if browser.restart_browser():
-                    browser_error_logged = False
-                # restart_browser() 内部会发送 BROWSER_STATUS 消息
+                if stop_event.is_set():
+                    break
+                # 只有任务队列中有待处理文件时才重启浏览器
+                # 空闲状态下浏览器关闭（含手动关闭）不自动重启
+                if task_queue.empty():
+                    if not browser_error_logged:
+                        log_queue.put("浏览器已关闭,队列为空,不重启")
+                        browser_error_logged = True
+                else:
+                    if not browser_error_logged:
+                        log_queue.put("警告: 浏览器异常关闭,尝试重启...")
+                        browser_error_logged = True
+                    if browser.restart_browser():
+                        browser_error_logged = False
 
             # 检查登录状态
             elif not browser.check_login_status():
+                if stop_event.is_set():
+                    break
                 if not browser_error_logged:
                     log_queue.put("警告: 登录态失效,尝试重新登录...")
                     browser_error_logged = True

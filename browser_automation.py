@@ -93,6 +93,7 @@ class BrowserAutomation:
             
             # 创建Chrome选项
             options = ChromeOptions()
+            options.page_load_strategy = "eager"  # DOM就绪即返回，不等图片加载
             # 添加常用选项(可根据需要调整)
             options.add_argument('--start-maximized')  # 最大化窗口
             # options.add_argument('--disable-gpu')      # 禁用GPU加速
@@ -389,6 +390,7 @@ class BrowserAutomation:
 
     def check_and_switch_school(self, target_school: str) -> bool:
         try:
+            self.update_activity_time()
             self._log(f"正在校验学校: {target_school}")
             self._log(f"当前页面URL: {self.driver.current_url}")
 
@@ -532,7 +534,7 @@ class BrowserAutomation:
             current_school = school_li.text.strip()
             self._log(f"当前学校: {current_school}")
 
-            # 3. 判断是否一致（支持模糊匹配）
+            # 3. 判断是否一致
             if current_school == target_school or target_school in current_school or current_school in target_school:
                 self._log("[OK] 学校一致，无需切换")
                 # 关闭下拉菜单
@@ -607,40 +609,39 @@ class BrowserAutomation:
             except Exception:
                 self.driver.execute_script("arguments[0].click();", search_btn)
             self._log("已点击搜索按钮")
-            time.sleep(2)  # 等待搜索结果加载
+            # 等待搜索完成：先等 loading 遮罩消失，再等表格行出现
+            try:
+                WebDriverWait(self.driver, 5).until(
+                    EC.invisibility_of_element_located(
+                        (By.CSS_SELECTOR, ".el-loading-mask, .el-table__empty-block, .el-loading-spinner")
+                    )
+                )
+            except TimeoutException:
+                pass
+            # 确保表格行已渲染
+            try:
+                WebDriverWait(self.driver, 5).until(
+                    EC.presence_of_element_located(
+                        (By.XPATH, "//tbody/tr[contains(@class, 'el-table__row')]")
+                    )
+                )
+            except TimeoutException:
+                pass
+            # 给 Vue 渲染一个稳定的短间隔，避免读到旧 DOM 导致 stale element
+            time.sleep(0.5)
 # ==============================================
 
             # 步骤5: 遍历所有学校容器，严格完全匹配目标学校名称
             school_found = False
             matched_school_name = ""
 
-            # 定义所有可能的学校条目容器选择器（适配Element UI表格布局）
-            school_container_selectors = [
-                "//tbody/tr[contains(@class, 'el-table__row')]",
-                "//div[contains(@class, 'el-table__body-wrapper')]//tr",
-                "//div[contains(@class, 'school-item') or contains(@class, 'school-card')]",
-                "//div[contains(@class, 'el-dialog')]//div[contains(@class, 'item')]",
-            ]
+            # 直接获取表格行，跳过冗余选择器和低效去重
+            school_rows = self.driver.find_elements(
+                By.XPATH, "//tbody/tr[contains(@class, 'el-table__row')]"
+            )
+            self._log(f"找到 {len(school_rows)} 条学校数据")
 
-            # 收集全部学校行
-            all_school_containers = []
-            for selector in school_container_selectors:
-                try:
-                    containers = self.driver.find_elements(By.XPATH, selector)
-                    if containers:
-                        all_school_containers.extend(containers)
-                        self._log(f"选择器 '{selector}' 找到 {len(containers)} 条学校数据")
-                except Exception as e:
-                    self._log(f"选择器 {selector} 查询无结果: {str(e)}")
-
-            # 元素去重，防止重复遍历
-            unique_containers = []
-            seen_sign = set()
-            for item in all_school_containers:
-                sign = item.get_attribute("id") or str(item.location)
-                if sign not in seen_sign:
-                    seen_sign.add(sign)
-                    unique_containers.append(item)
+            unique_containers = school_rows
 
             self._log(f"去重后待遍历学校总行数：{len(unique_containers)}")
 
@@ -676,13 +677,8 @@ class BrowserAutomation:
                             self._log("该行未找到立即进入按钮，跳过")
                             continue
 
-                        # 滚动并点击按钮
-                        self.driver.execute_script("arguments[0].scrollIntoView({block:'center'})", enter_btn)
-                        time.sleep(0.4)
-                        try:
-                            enter_btn.click()
-                        except Exception:
-                            self.driver.execute_script("arguments[0].click()", enter_btn)
+                        # 直接 JS 点击，跳过 scrollIntoView + sleep
+                        self.driver.execute_script("arguments[0].click();", enter_btn)
 
                         school_found = True
                         break
@@ -717,7 +713,7 @@ class BrowserAutomation:
             
             # 步骤6: 等待学校切换完成
             self._log("等待学校切换完成...")
-            time.sleep(3)
+            time.sleep(2)
             
             # 步骤7: 验证学校是否切换成功
             # 重新定位教师下拉元素（之前的引用可能因页面刷新而失效）
@@ -753,8 +749,11 @@ class BrowserAutomation:
                     return False
             except Exception as e:
                 self._log(f"警告: 验证学校切换时出错 - {e}")
-                # 即使验证失败,也假设成功
-                return True
+                # 连接断开类异常说明浏览器已不可用，不能假设成功
+                if any(kw in str(e).lower() for kw in ('connection', 'disconnected', 'timeout', 'closed')):
+                    self.is_logged_in = False
+                    return False
+                return True  # 其他非关键异常（如元素查找失败）假设切换成功
         
         except NoSuchElementException as e:
             self._log(f"错误: 未找到学校切换相关元素 - {e}")
@@ -767,6 +766,62 @@ class BrowserAutomation:
             self._log(traceback.format_exc())
             return False
     
+    def _read_select_value(self, label_text: str) -> Optional[str]:
+        """
+        读取上传对话框表单中el-select组件当前选中的显示文本
+
+        Args:
+            label_text: 表单标签文本（如"年级"、"科目"）
+
+        Returns:
+            当前选中的文本，读取失败或未选中时返回None
+        """
+        try:
+            result = self.driver.execute_script("""
+                const labelText = arguments[0];
+                const labels = document.querySelectorAll('label');
+                let formItem = null;
+                for (const label of labels) {
+                    if (label.textContent.includes(labelText)) {
+                        formItem = label.closest('.el-form-item');
+                        if (!formItem) {
+                            formItem = label.parentElement;
+                            while (formItem && !formItem.querySelector('.el-select')) {
+                                formItem = formItem.parentElement;
+                            }
+                        }
+                        break;
+                    }
+                }
+                if (!formItem) return null;
+
+                const select = formItem.querySelector('.el-select');
+                if (!select) return null;
+
+                // 方式1: Vue组件状态——最可靠
+                if (select.__vue__) {
+                    const vm = select.__vue__;
+                    const selected = vm.selected;
+                    if (selected && selected.currentLabel) {
+                        return selected.currentLabel;
+                    }
+                    if (vm.selectedLabel) {
+                        return vm.selectedLabel;
+                    }
+                }
+
+                // 方式2: el-input__inner 的 value（Element UI 在此显示选中文本）
+                const input = select.querySelector('.el-input__inner');
+                if (input && input.value && input.value.trim()) {
+                    return input.value.trim();
+                }
+                return null;
+            """, label_text)
+            return result.strip() if result else None
+        except Exception as e:
+            self._log(f"读取{label_text}选中值异常: {e}")
+            return None
+
     def upload_file(self, file_path: str, grade: str, subject: str, school: str = None) -> bool:
         """
         执行文件上传操作
@@ -841,110 +896,110 @@ class BrowserAutomation:
             print(f"[OK] 已选择文件: {os.path.basename(file_path)}")
 
             # 勾选年级+科目
-            # -------------------- 4. 选择年级（自定义下拉） --------------------
-            print(f"选择年级：{grade}")
-            # 初始化WebDriverWait（核心：使用self.driver，设置合理超时）
             wait = WebDriverWait(self.driver, 10)
 
-            # 4.1 点击年级下拉框展开列表（优化定位+等待+JS触发）
-            try:
-                # 兜底定位策略：先按固定XPath，失败则按文本/类名
-                grade_trigger = wait.until(EC.element_to_be_clickable(
-                    (By.XPATH,
-                     "//*[@id='main']/section/div/div[2]/div[2]/div/div[2]/form/div[4]/div/div/div[1]/span/span/i")
-                ))
-            except TimeoutException:
-                # 兜底定位：通过"年级"标签找相邻的下拉触发按钮
-                grade_trigger = wait.until(EC.element_to_be_clickable(
-                    (By.XPATH,
-                     "//label[contains(text(), '年级')]/following::div[contains(@class, 'el-select')]//i[contains(@class, 'el-icon-arrow-down')]")
-                ))
+            # 先读取页面当前已选中的年级和科目，若与目标一致则跳过选择
+            current_grade = self._read_select_value("年级")
+            current_subject = self._read_select_value("科目")
+            self._log(f"页面当前选中: 年级={current_grade}, 科目={current_subject}")
 
-            # 强制触发点击（解决Element UI组件点击不生效问题）
-            self.driver.execute_script("""
-                        arguments[0].click();
-                        // 手动触发下拉框展开（Element UI组件兼容）
-                        const selectEl = arguments[0].closest('.el-select');
-                        if (selectEl && selectEl.__vue__) {
-                            selectEl.__vue__.visible = true;
-                        }
-                    """, grade_trigger)
-            time.sleep(1.5)  # 等待下拉框完全展开
+            # -------------------- 4. 选择年级（自定义下拉） --------------------
+            if current_grade and current_grade == grade:
+                print(f"⏭️ 年级已匹配({grade})，跳过选择")
+            else:
+                print(f"选择年级：{grade}（当前: {current_grade}）")
+                # 4.1 点击年级下拉框展开列表（优化定位+等待+JS触发）
+                try:
+                    grade_trigger = wait.until(EC.element_to_be_clickable(
+                        (By.XPATH,
+                         "//*[@id='main']/section/div/div[2]/div[2]/div/div[2]/form/div[4]/div/div/div[1]/span/span/i")
+                    ))
+                except TimeoutException:
+                    grade_trigger = wait.until(EC.element_to_be_clickable(
+                        (By.XPATH,
+                         "//label[contains(text(), '年级')]/following::div[contains(@class, 'el-select')]//i[contains(@class, 'el-icon-arrow-down')]")
+                    ))
 
-            # 4.2 选择目标年级（优化匹配逻辑+强制点击）
-            grade_selected = False
-            # 先尝试精确匹配
-            try:
-                grade_option = wait.until(EC.element_to_be_clickable(
-                    (By.XPATH,
-                     f"//li[contains(@class, 'el-select-dropdown__item') and normalize-space(text())='{grade}']")
-                ))
-                self.driver.execute_script("arguments[0].click();", grade_option)
-                grade_selected = True
-            except TimeoutException:
-                # 兜底：遍历所有选项匹配
-                grade_options = self.driver.find_elements(By.XPATH,
-                                                          "//li[contains(@class, 'el-select-dropdown__item')]")
-                for option in grade_options:
-                    option_text = option.text.strip()
-                    if option_text == grade or grade in option_text:
-                        # 强制点击（避免元素遮挡/不可点击）
-                        self.driver.execute_script("arguments[0].click();", option)
-                        grade_selected = True
-                        break
+                self.driver.execute_script("""
+                            arguments[0].click();
+                            const selectEl = arguments[0].closest('.el-select');
+                            if (selectEl && selectEl.__vue__) {
+                                selectEl.__vue__.visible = true;
+                            }
+                        """, grade_trigger)
+                time.sleep(1)
 
-            if not grade_selected:
-                raise Exception(f"未找到年级选项: {grade}")
-            print(f"✅ 年级选择完成：{grade}")
+                # 4.2 选择目标年级
+                grade_selected = False
+                try:
+                    grade_option = wait.until(EC.element_to_be_clickable(
+                        (By.XPATH,
+                         f"//li[contains(@class, 'el-select-dropdown__item') and normalize-space(text())='{grade}']")
+                    ))
+                    self.driver.execute_script("arguments[0].click();", grade_option)
+                    grade_selected = True
+                except TimeoutException:
+                    grade_options = self.driver.find_elements(By.XPATH,
+                                                              "//li[contains(@class, 'el-select-dropdown__item')]")
+                    for option in grade_options:
+                        option_text = option.text.strip()
+                        if option_text == grade or grade in option_text:
+                            self.driver.execute_script("arguments[0].click();", option)
+                            grade_selected = True
+                            break
 
-            # -------------------- 修复后的科目选择逻辑 --------------------
-            print(f"选择科目：{subject}")
-            # 5.1 点击科目下拉框展开列表（同年级的兜底策略）
-            try:
-                subject_trigger = wait.until(EC.element_to_be_clickable(
-                    (By.XPATH,
-                     "//*[@id='main']/section/div/div[2]/div[2]/div/div[2]/form/div[5]/div/div/div[1]/span/span/i")
-                ))
-            except TimeoutException:
-                subject_trigger = wait.until(EC.element_to_be_clickable(
-                    (By.XPATH,
-                     "//label[contains(text(), '科目')]/following::div[contains(@class, 'el-select')]//i[contains(@class, 'el-icon-arrow-down')]")
-                ))
+                if not grade_selected:
+                    raise Exception(f"未找到年级选项: {grade}")
+                print(f"✅ 年级选择完成：{grade}")
 
-            # 强制触发下拉框展开
-            self.driver.execute_script("""
-                        arguments[0].click();
-                        const selectEl = arguments[0].closest('.el-select');
-                        if (selectEl && selectEl.__vue__) {
-                            selectEl.__vue__.visible = true;
-                        }
-                    """, subject_trigger)
-            time.sleep(1.5)  # 等待下拉框完全展开
+            # -------------------- 5. 选择科目（自定义下拉） --------------------
+            if current_subject and current_subject == subject:
+                print(f"⏭️ 科目已匹配({subject})，跳过选择")
+            else:
+                print(f"选择科目：{subject}（当前: {current_subject}）")
+                # 5.1 点击科目下拉框展开列表
+                try:
+                    subject_trigger = wait.until(EC.element_to_be_clickable(
+                        (By.XPATH,
+                         "//*[@id='main']/section/div/div[2]/div[2]/div/div[2]/form/div[5]/div/div/div[1]/span/span/i")
+                    ))
+                except TimeoutException:
+                    subject_trigger = wait.until(EC.element_to_be_clickable(
+                        (By.XPATH,
+                         "//label[contains(text(), '科目')]/following::div[contains(@class, 'el-select')]//i[contains(@class, 'el-icon-arrow-down')]")
+                    ))
 
-            # 5.2 选择目标科目（优化匹配逻辑）
-            subject_selected = False
-            # 精确匹配优先
-            try:
-                subject_option = wait.until(EC.element_to_be_clickable(
-                    (By.XPATH,
-                     f"//li[contains(@class, 'el-select-dropdown__item') and normalize-space(text())='{subject}']")
-                ))
-                self.driver.execute_script("arguments[0].click();", subject_option)
-                subject_selected = True
-            except TimeoutException:
-                # 兜底遍历
-                subject_options = self.driver.find_elements(By.XPATH,
-                                                            "//li[contains(@class, 'el-select-dropdown__item')]")
-                for option in subject_options:
-                    option_text = option.text.strip()
-                    if option_text == subject or subject in option_text:
-                        self.driver.execute_script("arguments[0].click();", option)
-                        subject_selected = True
-                        break
+                self.driver.execute_script("""
+                            arguments[0].click();
+                            const selectEl = arguments[0].closest('.el-select');
+                            if (selectEl && selectEl.__vue__) {
+                                selectEl.__vue__.visible = true;
+                            }
+                        """, subject_trigger)
+                time.sleep(1)
 
-            if not subject_selected:
-                raise Exception(f"未找到科目选项: {subject}")
-            print(f"✅ 科目选择完成：{subject}")
+                # 5.2 选择目标科目
+                subject_selected = False
+                try:
+                    subject_option = wait.until(EC.element_to_be_clickable(
+                        (By.XPATH,
+                         f"//li[contains(@class, 'el-select-dropdown__item') and normalize-space(text())='{subject}']")
+                    ))
+                    self.driver.execute_script("arguments[0].click();", subject_option)
+                    subject_selected = True
+                except TimeoutException:
+                    subject_options = self.driver.find_elements(By.XPATH,
+                                                                "//li[contains(@class, 'el-select-dropdown__item')]")
+                    for option in subject_options:
+                        option_text = option.text.strip()
+                        if option_text == subject or subject in option_text:
+                            self.driver.execute_script("arguments[0].click();", option)
+                            subject_selected = True
+                            break
+
+                if not subject_selected:
+                    raise Exception(f"未找到科目选项: {subject}")
+                print(f"✅ 科目选择完成：{subject}")
 
             # 步骤5: 设置预计使用时间(明天)
             print("正在设置预计使用时间...")
@@ -960,7 +1015,7 @@ class BrowserAutomation:
                     "//input[@placeholder='选择日期' and @class='el-input__inner']"
                 )
                 self.driver.execute_script("arguments[0].click();", date_trigger)
-                time.sleep(1.5)  # 等待日期选择器完全展开
+                time.sleep(1)  # 等待日期选择器完全展开
 
                 # 在日历中点击明天的日期
                 try:
@@ -1173,6 +1228,18 @@ class BrowserAutomation:
         """
         self.last_active_time = time.time()
     
+    def is_idle_for(self, seconds: float) -> bool:
+        """
+        检查浏览器是否已空闲超过指定秒数
+
+        Args:
+            seconds: 空闲秒数阈值
+
+        Returns:
+            True表示已空闲超过指定秒数
+        """
+        return (time.time() - self.last_active_time) > seconds
+
     def is_idle_timeout(self) -> bool:
         """
         检查是否超过空闲超时时间
