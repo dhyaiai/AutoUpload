@@ -436,56 +436,83 @@ class BrowserAutomation:
             time.sleep(1)  # 等 Vue 完成事件绑定
 
             # 3. 多方案点击，每步验证
+            # 关键：后续方案使用 JS click 会 toggle 下拉状态，所以每步先检查是否已经打开了
             dropdown_opened = False
             menu_selector = "li.el-dropdown-menu__item.info-dropdown-item.info-school"
 
-            # 方案1：Vue 组件 API（最直接，绕过事件系统）
-            try:
-                self.driver.execute_script("""
-                    const dropdown = document.querySelector('.info-user > .el-dropdown');
-                    if (dropdown && dropdown.__vue__ && dropdown.__vue__.show) {
-                        dropdown.__vue__.show();
-                    } else {
-                        // fallback: 直接修改 visible 属性
-                        if (dropdown && dropdown.__vue__) {
-                            dropdown.__vue__.visible = true;
-                        }
-                    }
-                """)
-                self._log("方案1: Vue API 展开")
-                WebDriverWait(self.driver, 2).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, menu_selector))
-                )
-                dropdown_opened = True
-                self._log("下拉框已确认打开(方案1: Vue API)")
-            except TimeoutException:
-                self._log("方案1 未打开下拉框")
-            except Exception as e:
-                self._log(f"方案1 异常: {type(e).__name__}: {e}")
+            def _is_dropdown_visible():
+                """检查下拉菜单是否已可见（避免重复点击导致toggle关闭）"""
+                try:
+                    el = self.driver.find_element(By.CSS_SELECTOR, menu_selector)
+                    return el.is_displayed()
+                except Exception:
+                    return False
 
-            # 方案2：JS 原生 click()
+            # 先检查下拉是否已经处于打开状态（上一轮操作可能残留）
+            if _is_dropdown_visible():
+                dropdown_opened = True
+                self._log("下拉框已处于打开状态，跳过点击")
+
+            # 方案1：Vue 组件 API（最直接，绕过事件系统，不会toggle）
+            if not dropdown_opened:
+                try:
+                    self.driver.execute_script("""
+                        const dropdown = document.querySelector('.info-user > .el-dropdown');
+                        if (dropdown && dropdown.__vue__) {
+                            if (dropdown.__vue__.show) {
+                                dropdown.__vue__.show();
+                            } else {
+                                dropdown.__vue__.visible = true;
+                            }
+                        }
+                    """)
+                    self._log("方案1: Vue API 展开")
+                    WebDriverWait(self.driver, 3).until(
+                        EC.visibility_of_element_located((By.CSS_SELECTOR, menu_selector))
+                    )
+                    dropdown_opened = True
+                    self._log("下拉框已确认打开(方案1: Vue API)")
+                except TimeoutException:
+                    self._log("方案1 未打开下拉框")
+                except Exception as e:
+                    self._log(f"方案1 异常: {type(e).__name__}: {e}")
+
+            # 方案2：JS 原生 click()（注意：这是toggle操作！使用前先确保下拉未打开）
             if not dropdown_opened:
                 try:
                     self.driver.execute_script("arguments[0].click();", teacher_dropdown)
                     self._log("方案2: JS click()")
-                    WebDriverWait(self.driver, 2).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, menu_selector))
+                    WebDriverWait(self.driver, 3).until(
+                        EC.visibility_of_element_located((By.CSS_SELECTOR, menu_selector))
                     )
                     dropdown_opened = True
                     self._log("下拉框已确认打开(方案2: JS click)")
                 except TimeoutException:
                     self._log("方案2 未打开下拉框")
+                    # 方案2可能toggle关闭了方案1打开的下拉，用Vue API重新打开
+                    try:
+                        self.driver.execute_script("""
+                            const dropdown = document.querySelector('.info-user > .el-dropdown');
+                            if (dropdown && dropdown.__vue__) {
+                                dropdown.__vue__.visible = true;
+                            }
+                        """)
+                        if _is_dropdown_visible():
+                            dropdown_opened = True
+                            self._log("方案2回退: Vue API重新打开成功")
+                    except Exception:
+                        pass
                 except Exception as e:
                     self._log(f"方案2 异常: {type(e).__name__}: {e}")
 
-            # 方案3：Selenium 原生 click + ActionChains
+            # 方案3：Selenium 原生 click + ActionChains（同样会toggle）
             if not dropdown_opened:
                 try:
                     actions = ActionChains(self.driver)
                     actions.move_to_element(teacher_dropdown).pause(0.3).click().perform()
                     self._log("方案3: ActionChains")
-                    WebDriverWait(self.driver, 2).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, menu_selector))
+                    WebDriverWait(self.driver, 3).until(
+                        EC.visibility_of_element_located((By.CSS_SELECTOR, menu_selector))
                     )
                     dropdown_opened = True
                     self._log("下拉框已确认打开(方案3: ActionChains)")
@@ -494,7 +521,7 @@ class BrowserAutomation:
                 except Exception as e:
                     self._log(f"方案3 异常: {type(e).__name__}: {e}")
 
-            # 方案4：MouseEvent 序列
+            # 方案4：MouseEvent 序列（最后兜底）
             if not dropdown_opened:
                 try:
                     self.driver.execute_script("""
@@ -504,8 +531,8 @@ class BrowserAutomation:
                         });
                     """, teacher_dropdown)
                     self._log("方案4: MouseEvent 序列")
-                    WebDriverWait(self.driver, 2).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, menu_selector))
+                    WebDriverWait(self.driver, 3).until(
+                        EC.visibility_of_element_located((By.CSS_SELECTOR, menu_selector))
                     )
                     dropdown_opened = True
                     self._log("下拉框已确认打开(方案4: MouseEvent)")
@@ -1096,41 +1123,75 @@ class BrowserAutomation:
             print("已点击提交按钮")
             
             # 步骤7: 等待上传完成并验证
-            # 尝试多种策略检测上传成功（适配 Element UI 提示样式）
+            # 同时检测成功和失败，避免假成功阻塞重试
             try:
                 success_indicators = [
-                    # Element UI 成功消息
                     (By.CSS_SELECTOR, ".el-message--success"),
                     (By.CSS_SELECTOR, ".el-notification--success"),
                     (By.CSS_SELECTOR, ".el-message .el-message--success"),
-                    # 通用成功提示
                     (By.CLASS_NAME, "success-message"),
                     (By.CSS_SELECTOR, "[class*='success']"),
                 ]
+                error_indicators = [
+                    (By.CSS_SELECTOR, ".el-message--error"),
+                    (By.CSS_SELECTOR, ".el-notification--error"),
+                    (By.CLASS_NAME, "error-message"),
+                ]
                 success_detected = False
+                error_detected = False
                 deadline = time.time() + 30  # 最多等待30秒
                 while time.time() < deadline:
+                    # 优先检查错误消息
+                    for by, selector in error_indicators:
+                        try:
+                            el = self.driver.find_element(by, selector)
+                            if el.is_displayed():
+                                error_text = el.text.strip()
+                                print(f"[FAIL] 检测到上传失败提示: {error_text}")
+                                error_detected = True
+                                break
+                        except Exception:
+                            continue
+                    if error_detected:
+                        break
+
+                    # 检查成功消息
                     for by, selector in success_indicators:
                         try:
-                            self.driver.find_element(by, selector)
-                            success_detected = True
-                            break
-                        except NoSuchElementException:
+                            el = self.driver.find_element(by, selector)
+                            if el.is_displayed():
+                                success_detected = True
+                                break
+                        except Exception:
                             continue
                     if success_detected:
                         break
                     time.sleep(1)
 
+                self.last_active_time = time.time()
                 if success_detected:
                     print("[OK] 文件上传成功")
+                    return True
+                elif error_detected:
+                    print("[FAIL] 文件上传失败(检测到错误提示)")
+                    return False
                 else:
-                    print("[WARN] 上传超时,未检测到成功提示,但假设上传成功")
-                self.last_active_time = time.time()
-                return True
+                    # 超时未检测到明确信号 → 检查上传对话框是否已关闭（间接验证）
+                    try:
+                        dialog_still_open = self.driver.find_elements(
+                            By.CSS_SELECTOR, ".el-dialog__wrapper:not([style*='display: none'])"
+                        )
+                        if not dialog_still_open:
+                            print("[OK] 上传对话框已关闭，视为上传成功")
+                            return True
+                    except Exception:
+                        pass
+                    print("[FAIL] 上传超时，未检测到成功或失败提示")
+                    return False
             except Exception:
-                print("[WARN] 上传验证异常,但假设上传成功")
+                print("[FAIL] 上传验证异常")
                 self.last_active_time = time.time()
-                return True  # 即使超时也返回成功,避免误判
+                return False
         
         except Exception as e:
             print(f"错误: 文件上传失败 - {e}")

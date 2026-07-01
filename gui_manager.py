@@ -2,6 +2,7 @@
 GUI管理界面模块
 功能:提供图形化用户界面,管理文件夹、查看失败文件、显示日志
 技术:使用tkinter构建桌面应用
+支持:关闭窗口时最小化到系统托盘
 """
 import os
 import shutil
@@ -36,7 +37,7 @@ class MainApplication:
         self.task_queue = task_queue
         self.log_queue = log_queue
         self.upload_processor = upload_processor
-        
+
         # 初始化数据库和配置
         self.db = DatabaseManager()
         self.config = ConfigManager()
@@ -44,6 +45,11 @@ class MainApplication:
         # 存储 Treeview 行 iid 与实际数据的映射
         self._folder_data = {}  # iid -> (folder_path, folder_name)
         self._failed_data = {}  # iid -> (record_id, file_path, retry_count)
+
+        # 系统托盘相关
+        self.tray_icon = None
+        self.tray_thread = None
+        self._tray_setup_done = False
         
         # 设置窗口属性
         self.root.title("作业自动上传管理工具")
@@ -528,26 +534,144 @@ class MainApplication:
         elif status == "重启中":
             self.status_label.config(text="浏览器状态: 🟡 重启中...", foreground="orange")
     
-    def _on_closing(self):
+    def _setup_tray(self):
         """
-        窗口关闭事件处理
-        安全停止所有后台线程,释放资源
+        初始化系统托盘图标（延迟加载，仅在首次最小化时创建）
+        返回 True 表示托盘创建成功，False 表示失败
         """
-        if not messagebox.askokcancel("退出", "确定要退出程序吗?\n正在进行的上传任务将被中断。"):
-            return
+        if self._tray_setup_done and self.tray_icon is not None \
+                and self.tray_thread is not None and self.tray_thread.is_alive():
+            return True
 
-        # 发送停止信号
+        try:
+            import pystray
+            from PIL import Image, ImageDraw
+
+            # 生成托盘图标（蓝底白色上传箭头）
+            def _make_icon():
+                img = Image.new('RGB', (64, 64), color='#4A90D9')
+                draw = ImageDraw.Draw(img)
+                draw.rectangle([8, 14, 56, 50], fill='white')
+                draw.polygon([(32, 6), (8, 22), (56, 22)], fill='white')
+                return img
+
+            menu = pystray.Menu(
+                pystray.MenuItem("显示窗口", self._show_window, default=True),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("退出", self._quit_app),
+            )
+
+            self.tray_icon = pystray.Icon(
+                "auto_upload",
+                _make_icon(),
+                "作业自动上传 - 运行中",
+                menu
+            )
+            self.tray_thread = Thread(target=self.tray_icon.run, daemon=True)
+            self.tray_thread.start()
+
+            self._tray_setup_done = True
+            self._log_to_gui("程序已最小化到系统托盘，双击托盘图标可恢复窗口", "info")
+            return True
+
+        except ImportError as e:
+            self._log_to_gui(f"无法启动系统托盘（缺少依赖）: {e}", "error")
+            self._tray_setup_done = False
+            return False
+        except Exception as e:
+            import traceback
+            self._log_to_gui(f"系统托盘启动失败: {e}", "error")
+            self._log_to_gui(traceback.format_exc(), "error")
+            self._tray_setup_done = False
+            return False
+
+    def _show_window(self):
+        """从系统托盘恢复显示主窗口"""
+        self.root.after(0, self._restore_window)
+
+    def _restore_window(self):
+        """在主线程中恢复窗口"""
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def _quit_app(self):
+        """从托盘菜单完全退出程序"""
+        self._perform_exit()
+
+    def _perform_exit(self):
+        """统一的退出流程：设停止信号、等队列清空、销毁窗口"""
         self.stop_event.set()
+        if self.tray_icon:
+            self.tray_icon.stop()
+            self.tray_icon = None
 
-        # 在后台线程中等待任务完成,避免阻塞GUI
         def _wait_and_destroy():
             try:
                 self.task_queue.join()
             except Exception:
                 pass
             finally:
-                self.root.destroy()
+                try:
+                    self.root.destroy()
+                except Exception:
+                    pass
 
         if not self.task_queue.empty():
             messagebox.showinfo("提示", "等待当前任务完成...")
         Thread(target=_wait_and_destroy, daemon=True).start()
+
+    def _log_to_gui(self, message: str, tag: str = "info"):
+        """向GUI日志区域写入消息（线程安全）"""
+        try:
+            self.root.after(0, lambda: self._insert_log(message, tag))
+        except Exception:
+            pass
+
+    def _insert_log(self, message: str, tag: str):
+        """实际执行日志插入（必须在主线程调用）"""
+        try:
+            self.log_text.configure(state="normal")
+            self.log_text.insert("end", f"{message}\n", tag)
+            self.log_text.see("end")
+            self.log_text.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _on_closing(self):
+        """
+        窗口关闭事件处理
+        - 如果启用托盘模式：最小化到系统托盘
+        - 如果禁用托盘模式：直接确认退出
+        """
+        use_tray = self.config.get("MINIMIZE_TO_TRAY", True)
+
+        if use_tray:
+            # 尝试最小化到托盘，失败则回退到退出确认
+            try:
+                if self._setup_tray():
+                    self.root.withdraw()
+                    if self.tray_icon and hasattr(self.tray_icon, 'notify'):
+                        try:
+                            self.tray_icon.notify(
+                                "作业自动上传工具仍在后台运行\n双击托盘图标可恢复窗口",
+                                title="作业自动上传"
+                            )
+                        except Exception:
+                            pass
+                    return  # 成功隐藏到托盘，不退出
+                else:
+                    self._log_to_gui("托盘启动失败，回退到退出确认模式", "error")
+            except Exception:
+                import traceback
+                self._log_to_gui(f"托盘异常: {traceback.format_exc()}", "error")
+
+            # 回退：传统退出确认
+            if not messagebox.askokcancel("退出", "托盘不可用，确定要退出程序吗？\n正在进行的上传任务将被中断。"):
+                return
+            self._perform_exit()
+        else:
+            # 传统退出模式
+            if not messagebox.askokcancel("退出", "确定要退出程序吗?\n正在进行的上传任务将被中断。"):
+                return
+            self._perform_exit()

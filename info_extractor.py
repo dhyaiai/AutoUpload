@@ -16,7 +16,7 @@ class InfoExtractor:
     
     # 年级匹配正则表达式
     # 匹配模式:任意字符 + (高一|高二|...|小六)
-    GRADE_PATTERN = re.compile(r'^(.+?)(高一|高二|高三|初一|初二|初三)$')
+    GRADE_PATTERN = re.compile(r'^(.+?)(高一|高二|高三|初一|初二|初三|小一|小二|小三|小四|小五|小六)$')
     
     # 需要提取的文本长度(字符数)
     TEXT_EXTRACT_LENGTH = 200
@@ -74,6 +74,8 @@ class InfoExtractor:
                 return InfoExtractor._read_txt(file_path)
             elif ext == '.docx':
                 return InfoExtractor._read_docx(file_path)
+            elif ext == '.doc':
+                return InfoExtractor._read_doc(file_path)
             elif ext == '.pdf':
                 return InfoExtractor._read_pdf(file_path)
             else:
@@ -135,6 +137,87 @@ class InfoExtractor:
             print("错误: 未安装python-docx库,请运行: pip install python-docx")
             return ""
     
+    @staticmethod
+    def _read_doc(file_path: str) -> str:
+        """
+        读取DOC文件(Word 97-2003格式)的前200个字符
+        使用olefile解析OLE2复合文档，从WordDocument流中提取文本
+
+        Args:
+            file_path: DOC文件路径
+
+        Returns:
+            前200个字符
+        """
+        try:
+            import olefile
+
+            ole = olefile.OleFileIO(file_path)
+            try:
+                # .doc 文件必须包含 WordDocument 流
+                if not ole.exists('WordDocument'):
+                    print("警告: .doc文件中未找到WordDocument流")
+                    return ""
+
+                data = ole.openstream('WordDocument').read()
+            finally:
+                ole.close()
+
+            # Word二进制格式的文本提取：
+            # .doc文件的文本在WordDocument流中，按piece table存储
+            # 简化方案：尝试UTF-16LE解码后过滤可读字符
+            text_candidates = []
+
+            # 方案A: UTF-16LE解码（多数中文.doc文件使用）
+            try:
+                decoded = data.decode('utf-16-le', errors='ignore')
+                # 保留中文、英文、数字、标点和常见空白
+                import re
+                cleaned = re.sub(r'[^一-鿿　-〿＀-￯a-zA-Z0-9\s.,;:!?()（）、。，；：！？""''【】《》+=-]', '', decoded)
+                cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+                if len(cleaned) > 20:
+                    text_candidates.append(cleaned)
+            except Exception:
+                pass
+
+            # 方案B: 原始二进制中提取连续可打印ASCII+中文序列
+            try:
+                import re
+                # 将bytes中可打印的ASCII和UTF-8中文序列提取出来
+                text = data.decode('utf-8', errors='ignore')
+                cleaned = re.sub(r'[^一-鿿　-〿＀-￯a-zA-Z0-9\s.,;:!?()（）]', '', text)
+                cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+                if len(cleaned) > 20:
+                    text_candidates.append(cleaned)
+            except Exception:
+                pass
+
+            # 方案C: Latin-1 + 中文区域检测
+            if not text_candidates:
+                try:
+                    text = data.decode('latin-1', errors='ignore')
+                    import re
+                    cleaned = re.sub(r'[^\x20-\x7E一-鿿]', '', text)
+                    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+                    if len(cleaned) > 20:
+                        text_candidates.append(cleaned)
+                except Exception:
+                    pass
+
+            # 返回最长的有效文本
+            if text_candidates:
+                best = max(text_candidates, key=len)
+                return best[:InfoExtractor.TEXT_EXTRACT_LENGTH]
+
+            return ""
+
+        except ImportError:
+            print("警告: 未安装olefile库，无法读取.doc文件。请运行: pip install olefile")
+            return ""
+        except Exception as e:
+            print(f"错误: 读取.doc文件失败 {file_path} - {e}")
+            return ""
+
     @staticmethod
     def _read_pdf(file_path: str) -> str:
         """

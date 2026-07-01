@@ -63,7 +63,8 @@ class ConfigManager:
             "FILE_STABLE_DELAY": 2,                                # 文件稳定等待时间(秒)
             "BROWSER_IDLE_TIMEOUT": 1800,                          # 浏览器空闲超时时间(秒)
             "MAX_RETRY_COUNT": 3,                                  # 最大重试次数
-            "SLEEP_INTERVAL": 0.5                                  # 操作间隔时间(秒)
+            "SLEEP_INTERVAL": 0.5,                                # 操作间隔时间(秒)
+            "MINIMIZE_TO_TRAY": True                              # 关闭窗口时最小化到托盘(False=直接退出)
         }
 
         # 尝试加载配置文件
