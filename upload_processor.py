@@ -179,6 +179,16 @@ class UploadProcessor:
                 subject=subject,
                 status='success'
             )
+            # 同步写入分析表，确保持久化统计（即使后续删除上传记录也不丢失）
+            self.db.add_analysis_record(
+                file_name=file_name,
+                file_path=file_path,
+                folder_name=folder_name,
+                school=school,
+                grade=grade,
+                subject=subject,
+                status='success'
+            )
             self._send_log(f"✓ 上传成功: {file_name} ({subject})")
         else:
             # 上传失败,记录失败信息
@@ -284,6 +294,16 @@ class UploadProcessor:
         if upload_success:
             # 更新记录为成功
             self.db.mark_record_success(record_id)
+            # 同步写入分析表
+            self.db.add_analysis_record(
+                file_name=file_name,
+                file_path=file_path,
+                folder_name=folder_name,
+                school=school,
+                grade=grade,
+                subject=subject,
+                status='success'
+            )
             self._send_log(f"✓ 重新上传成功: {file_name}")
         else:
             # 更新错误信息

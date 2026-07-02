@@ -33,9 +33,6 @@ class StatsPanel:
         self._bar_canvas = None
         self._line_canvas = None
 
-        # 数据是否已复制到分析表
-        self._data_copied = False
-
         # 中文字体
         self._setup_chinese_font()
 
@@ -85,17 +82,19 @@ class StatsPanel:
         # === 5. 失败记录表 ===
         self._create_failed_table_section()
 
+        # 初始加载表格数据
+        self._refresh_upload_table()
+        self._refresh_failed_table()
+
     def _create_action_bar(self):
-        """数据管理区: 复制数据按钮"""
+        """数据管理区: 状态提示"""
         frame = ttk.LabelFrame(self._inner_frame, text="【数据管理】", padding=10)
         frame.pack(fill="x", padx=10, pady=5)
 
-        self.copy_btn = ttk.Button(frame, text="📋 复制数据到分析表",
-                                    command=self._on_copy_data)
-        self.copy_btn.pack(side="left", padx=5)
-
-        self._copy_status_label = ttk.Label(frame, text="尚未复制数据", foreground="gray")
-        self._copy_status_label.pack(side="left", padx=10)
+        self._sync_status_label = ttk.Label(frame,
+            text="✓ 上传成功自动同步到分析表，数据持久保留不受上传记录清理影响",
+            foreground="green")
+        self._sync_status_label.pack(side="left", padx=5)
 
     def _create_bar_chart_section(self):
         """柱状图区: 作业上传数量图"""
@@ -113,9 +112,8 @@ class StatsPanel:
         self._bar_canvas = FigureCanvasTkAgg(self._bar_figure, master=frame)
         self._bar_canvas.get_tk_widget().pack(fill="x", padx=5, pady=5)
 
-        # 初始显示提示
-        self._show_empty_chart(self._bar_figure, "请先点击「复制数据」按钮")
-        self._bar_canvas.draw()
+        # 初始尝试加载数据
+        self._refresh_bar_chart()
 
     def _create_line_chart_section(self):
         """折线图区: 作业上传趋势图"""
@@ -136,8 +134,7 @@ class StatsPanel:
         self._line_canvas = FigureCanvasTkAgg(self._line_figure, master=frame)
         self._line_canvas.get_tk_widget().pack(fill="x", padx=5, pady=5)
 
-        self._show_empty_chart(self._line_figure, "请先点击「复制数据」按钮")
-        self._line_canvas.draw()
+        self._refresh_line_chart()
 
     def _create_upload_table_section(self):
         """上传记录表"""
@@ -200,22 +197,6 @@ class StatsPanel:
         scrollbar.pack(side="right", fill="y")
         return tree_frame, tree
 
-    # ==================== 数据操作 ====================
-
-    def _on_copy_data(self):
-        """复制成功记录到分析表,并刷新所有图表和表格"""
-        try:
-            count = self.db.copy_success_to_analysis()
-            self._data_copied = True
-            self._copy_status_label.config(
-                text=f"✓ 已复制 {count} 条记录到分析表", foreground="green")
-            self._refresh_bar_chart()
-            self._refresh_line_chart()
-            self._refresh_upload_table()
-            self._refresh_failed_table()
-        except Exception as e:
-            messagebox.showerror("错误", f"复制数据失败: {e}")
-
     # ==================== 图表刷新 ====================
 
     def _toggle_bar_chart(self):
@@ -232,11 +213,6 @@ class StatsPanel:
 
     def _refresh_bar_chart(self):
         """重绘柱状图"""
-        if not self._data_copied:
-            self._show_empty_chart(self._bar_figure, "请先点击「复制数据」按钮")
-            self._bar_canvas.draw()
-            return
-
         if self._bar_mode == "subject":
             data = self.db.get_upload_count_by_subject()
             x_label = "科目"
@@ -288,11 +264,6 @@ class StatsPanel:
 
     def _refresh_line_chart(self):
         """重绘折线图"""
-        if not self._data_copied:
-            self._show_empty_chart(self._line_figure, "请先点击「复制数据」按钮")
-            self._line_canvas.draw()
-            return
-
         data = self.db.get_upload_count_by_date(self._line_mode)
 
         self._line_figure.clear()
@@ -347,10 +318,10 @@ class StatsPanel:
     # ==================== 表格刷新 ====================
 
     def _refresh_upload_table(self):
-        """刷新上传记录表"""
+        """刷新上传记录表（从分析表读取，数据持久不受上传记录清理影响）"""
         for item in self._upload_tree.get_children():
             self._upload_tree.delete(item)
-        records = self.db.get_all_successful_records()
+        records = self.db.get_all_analysis_records()
         for r in records:
             self._upload_tree.insert("", "end", values=(
                 r["file_name"], r["school"], r["grade"],

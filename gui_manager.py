@@ -59,10 +59,10 @@ class MainApplication:
         
         # 设置窗口属性
         self.root.title("作业自动上传管理工具")
-        self.root.geometry("900x750")
-        self.root.minsize(700, 500)
+        self.root.geometry("1050x700")
+        self.root.minsize(900, 550)
 
-        # 可滚动画布（状态栏固定在底部不滚动）
+        # 可滚动画布（内容溢出时可滚动）
         self._canvas = tk.Canvas(self.root, highlightthickness=0)
         self._scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=self._canvas.yview)
         self.content_frame = ttk.Frame(self._canvas)
@@ -123,13 +123,22 @@ class MainApplication:
 
     def _create_upload_tab(self):
         """
-        创建上传管理标签页内容（原 _create_widgets 的主体部分）
+        创建上传管理标签页内容
+        布局：左侧（创建文件夹 + 合并文件 + 文件夹列表 + 失败列表）| 右侧（浏览器状态 + 运行日志）
         """
         parent = self.tab_upload
 
+        # 左右分栏容器
+        main_pw = ttk.PanedWindow(parent, orient="horizontal")
+        main_pw.pack(fill="both", expand=True)
+
+        # ===== 左侧面板：功能区域 =====
+        left_frame = ttk.Frame(main_pw)
+        main_pw.add(left_frame, weight=3)
+
         # === 1. 创建文件夹区域 ===
-        create_frame = ttk.LabelFrame(parent, text="【创建新文件夹】", padding=10)
-        create_frame.pack(fill="x", padx=10, pady=5)
+        create_frame = ttk.LabelFrame(left_frame, text="【创建新文件夹】", padding=10)
+        create_frame.pack(fill="x", padx=5, pady=(5, 2))
 
         # 学校名称输入
         ttk.Label(create_frame, text="学校名称:").grid(row=0, column=0, sticky="w", padx=5)
@@ -149,8 +158,8 @@ class MainApplication:
         create_btn.grid(row=0, column=4, padx=10)
 
         # === 2. 合并文件区域 ===
-        merge_frame = ttk.LabelFrame(parent, text="【合并文件】", padding=10)
-        merge_frame.pack(fill="x", padx=10, pady=5)
+        merge_frame = ttk.LabelFrame(left_frame, text="【合并文件（仅支持同文件格式进行合并）】", padding=10)
+        merge_frame.pack(fill="x", padx=5, pady=2)
 
         merge_frame.columnconfigure(0, weight=1)
         merge_frame.columnconfigure(1, weight=1)
@@ -193,8 +202,8 @@ class MainApplication:
         merge_btn.grid(row=0, column=2, padx=(5, 0), sticky="ns")
 
         # === 3. 文件夹列表区域 ===
-        folder_frame = ttk.LabelFrame(parent, text="文件夹列表:", padding=10)
-        folder_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        folder_frame = ttk.LabelFrame(left_frame, text="文件夹列表:", padding=10)
+        folder_frame.pack(fill="both", expand=True, padx=5, pady=2)
 
         # 创建Treeview显示文件夹列表
         columns = ("序号", "文件夹名称", "清空文件", "删除文件夹")
@@ -227,8 +236,8 @@ class MainApplication:
         self._refresh_folder_list()
 
         # === 4. 上传失败文件列表 ===
-        failed_frame = ttk.LabelFrame(parent, text="⚠️ 上传失败文件(需处理):", padding=10)
-        failed_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        failed_frame = ttk.LabelFrame(left_frame, text="⚠️ 上传失败文件(需处理):", padding=10)
+        failed_frame.pack(fill="both", expand=True, padx=5, pady=2)
 
         # 创建Treeview显示失败文件
         failed_columns = ("ID", "文件名", "失败原因", "重试次数", "重新上传", "忽略")
@@ -266,12 +275,24 @@ class MainApplication:
         # 初始加载失败列表
         self._load_failed_records()
 
-        # === 5. 日志区域 ===
-        log_frame = ttk.LabelFrame(parent, text="运行日志:", padding=10)
-        log_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        # ===== 右侧面板：浏览器状态 + 运行日志 =====
+        right_frame = ttk.Frame(main_pw)
+        main_pw.add(right_frame, weight=1)
+
+        # --- 浏览器状态 ---
+        status_frame = ttk.LabelFrame(right_frame, text="浏览器状态", padding=8)
+        status_frame.pack(fill="x", padx=5, pady=(5, 2))
+
+        self.status_label = ttk.Label(status_frame, text="🔴 未启动 (等待文件...)",
+                                      font=("Arial", 10), foreground="gray")
+        self.status_label.pack(fill="x")
+
+        # --- 运行日志 ---
+        log_frame = ttk.LabelFrame(right_frame, text="运行日志", padding=8)
+        log_frame.pack(fill="both", expand=True, padx=5, pady=(2, 5))
 
         # 创建滚动文本框
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=8, wrap="word", state="disabled")
+        self.log_text = scrolledtext.ScrolledText(log_frame, wrap="word", state="disabled")
         self.log_text.pack(fill="both", expand=True)
 
         # 配置日志文本样式
@@ -279,26 +300,19 @@ class MainApplication:
         self.log_text.tag_configure("success", foreground="green")
         self.log_text.tag_configure("info", foreground="blue")
 
-        # === 6. 状态栏 ===
-        status_frame = ttk.Frame(self.root)
-        status_frame.pack(fill="x", padx=10, pady=5)
-
-        self.status_label = ttk.Label(status_frame, text="浏览器状态: 🔴 未启动 (等待文件...)",
-                                      font=("Arial", 10), foreground="gray")
-        self.status_label.pack(side="left")
-
     def _create_stats_tab(self):
         """创建作业上传数据统计标签页"""
         self.stats_panel = StatsPanel(self.tab_stats, self.db, self.root)
 
     def _start_stats_refresh(self):
-        """定时刷新统计面板表格数据（仅当统计标签页可见时）"""
+        """定时刷新统计面板（仅当统计标签页可见时）"""
         def _auto_refresh():
             try:
                 if hasattr(self, 'stats_panel') and self._is_stats_tab_selected():
-                    if self.stats_panel._data_copied:
-                        self.stats_panel._refresh_upload_table()
-                        self.stats_panel._refresh_failed_table()
+                    self.stats_panel._refresh_bar_chart()
+                    self.stats_panel._refresh_line_chart()
+                    self.stats_panel._refresh_upload_table()
+                    self.stats_panel._refresh_failed_table()
             finally:
                 self.root.after(30000, _auto_refresh)
         self.root.after(30000, _auto_refresh)
@@ -863,10 +877,10 @@ class MainApplication:
                     status = message.split(":", 1)[1]
                     if status == "CONNECTED":
                         self.status_label.config(
-                            text="浏览器状态: 🟢 已连接", foreground="green")
+                            text="🟢 已连接", foreground="green")
                     elif status == "DISCONNECTED":
                         self.status_label.config(
-                            text="浏览器状态: 🔴 未启动 (等待文件...)", foreground="gray")
+                            text="🔴 未启动 (等待文件...)", foreground="gray")
                     continue
                 
                 # 显示日志消息
@@ -905,16 +919,16 @@ class MainApplication:
     def update_browser_status(self, status: str):
         """
         更新浏览器状态显示
-        
+
         Args:
             status: 状态字符串,如"已连接"、"未连接"、"重启中"
         """
         if status == "已连接":
-            self.status_label.config(text="浏览器状态: 🟢 已连接", foreground="green")
+            self.status_label.config(text="🟢 已连接", foreground="green")
         elif status == "未连接":
-            self.status_label.config(text="浏览器状态: 🔴 未连接", foreground="red")
+            self.status_label.config(text="🔴 未连接", foreground="red")
         elif status == "重启中":
-            self.status_label.config(text="浏览器状态: 🟡 重启中...", foreground="orange")
+            self.status_label.config(text="🟡 重启中...", foreground="orange")
     
     def _setup_tray(self):
         """

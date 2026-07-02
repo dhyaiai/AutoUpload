@@ -122,10 +122,11 @@ class DatabaseManager:
         """
         cursor = self._connection.cursor()
         cursor.execute('''
-            INSERT INTO upload_records 
-            (file_name, file_path, folder_name, school, grade, subject, status, error_message)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (file_name, file_path, folder_name, school, grade, subject, status, error_message))
+            INSERT INTO upload_records
+            (file_name, file_path, folder_name, school, grade, subject, status, error_message, upload_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (file_name, file_path, folder_name, school, grade, subject, status, error_message,
+              datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
         self._connection.commit()
         return cursor.lastrowid
     
@@ -180,12 +181,13 @@ class DatabaseManager:
         """
         cursor = self._connection.cursor()
         cursor.execute('''
-            UPDATE upload_records 
-            SET status = 'success', 
-                error_message = NULL, 
-                retry_count = 0
+            UPDATE upload_records
+            SET status = 'success',
+                error_message = NULL,
+                retry_count = 0,
+                upload_time = ?
             WHERE id = ?
-        ''', (record_id,))
+        ''', (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), record_id))
         self._connection.commit()
     
     def increment_retry(self, record_id: int) -> int:
@@ -276,11 +278,48 @@ class DatabaseManager:
         self._connection.commit()
         return cursor.rowcount
 
+    def add_analysis_record(self, file_name: str, file_path: str, folder_name: str,
+                            school: str, grade: str, subject: str,
+                            status: str = 'success', error_message: str = None) -> int:
+        """
+        直接插入一条记录到分析表（上传成功时自动同步，无需手动复制）
+
+        Args:
+            file_name: 文件名(不含路径)
+            file_path: 文件的完整路径
+            folder_name: 所在文件夹名称
+            school: 学校名称
+            grade: 年级
+            subject: 科目
+            status: 上传状态
+            error_message: 失败时的错误描述信息
+
+        Returns:
+            新插入记录的ID
+        """
+        cursor = self._connection.cursor()
+        cursor.execute('''
+            INSERT INTO analysis_records
+            (file_name, file_path, folder_name, school, grade, subject, status, error_message, upload_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (file_name, file_path, folder_name, school, grade, subject, status, error_message,
+              datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+        self._connection.commit()
+        return cursor.lastrowid
+
     def get_all_successful_records(self) -> List[Dict]:
         """获取所有上传成功的记录,按上传时间倒序"""
         cursor = self._connection.cursor()
         cursor.execute(
             "SELECT * FROM upload_records WHERE status = 'success' ORDER BY upload_time DESC"
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_all_analysis_records(self) -> List[Dict]:
+        """获取分析表中所有记录,按上传时间倒序"""
+        cursor = self._connection.cursor()
+        cursor.execute(
+            "SELECT * FROM analysis_records ORDER BY upload_time DESC"
         )
         return [dict(row) for row in cursor.fetchall()]
 
