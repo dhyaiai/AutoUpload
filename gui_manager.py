@@ -14,6 +14,7 @@ from typing import Optional
 from db_manager import DatabaseManager
 from config_manager import ConfigManager
 from file_merger import FileMerger
+from stats_panel import StatsPanel
 
 
 class MainApplication:
@@ -97,31 +98,58 @@ class MainApplication:
     def _create_widgets(self):
         """
         创建所有界面组件
-        按照设计文档的布局结构实现
+        使用Notebook实现标签页切换
         """
+        # 创建Notebook标签页容器
+        self.notebook = ttk.Notebook(self.content_frame)
+        self.notebook.pack(fill="both", expand=True, padx=0, pady=0)
+
+        # 标签页1: 上传管理（原有内容）
+        self.tab_upload = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_upload, text="📤 上传管理")
+
+        # 标签页2: 数据统计
+        self.tab_stats = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_stats, text="📊 作业上传数据统计")
+
+        # 创建上传管理标签页内容
+        self._create_upload_tab()
+
+        # 创建数据统计标签页内容
+        self._create_stats_tab()
+
+        # 启动统计面板定时刷新
+        self._start_stats_refresh()
+
+    def _create_upload_tab(self):
+        """
+        创建上传管理标签页内容（原 _create_widgets 的主体部分）
+        """
+        parent = self.tab_upload
+
         # === 1. 创建文件夹区域 ===
-        create_frame = ttk.LabelFrame(self.content_frame, text="【创建新文件夹】", padding=10)
+        create_frame = ttk.LabelFrame(parent, text="【创建新文件夹】", padding=10)
         create_frame.pack(fill="x", padx=10, pady=5)
-        
+
         # 学校名称输入
         ttk.Label(create_frame, text="学校名称:").grid(row=0, column=0, sticky="w", padx=5)
         self.school_entry = ttk.Entry(create_frame, width=20)
         self.school_entry.grid(row=0, column=1, padx=5)
-        
+
         # 年级下拉选择
         ttk.Label(create_frame, text="年级:").grid(row=0, column=2, sticky="w", padx=5)
         self.grade_combo = ttk.Combobox(create_frame, width=10, state="readonly")
-        self.grade_combo['values'] = ('高一', '高二', '高三', '初一', '初二', '初三', 
+        self.grade_combo['values'] = ('高一', '高二', '高三', '初一', '初二', '初三',
                                       '小一', '小二', '小三', '小四', '小五', '小六')
         self.grade_combo.current(0)
         self.grade_combo.grid(row=0, column=3, padx=5)
-        
+
         # 创建按钮
         create_btn = ttk.Button(create_frame, text="创建", command=self._create_folder)
         create_btn.grid(row=0, column=4, padx=10)
-        
+
         # === 2. 合并文件区域 ===
-        merge_frame = ttk.LabelFrame(self.content_frame, text="【合并文件】", padding=10)
+        merge_frame = ttk.LabelFrame(parent, text="【合并文件】", padding=10)
         merge_frame.pack(fill="x", padx=10, pady=5)
 
         merge_frame.columnconfigure(0, weight=1)
@@ -165,9 +193,9 @@ class MainApplication:
         merge_btn.grid(row=0, column=2, padx=(5, 0), sticky="ns")
 
         # === 3. 文件夹列表区域 ===
-        folder_frame = ttk.LabelFrame(self.content_frame, text="文件夹列表:", padding=10)
+        folder_frame = ttk.LabelFrame(parent, text="文件夹列表:", padding=10)
         folder_frame.pack(fill="both", expand=True, padx=10, pady=5)
-        
+
         # 创建Treeview显示文件夹列表
         columns = ("序号", "文件夹名称", "清空文件", "删除文件夹")
         self.folder_tree = ttk.Treeview(folder_frame, columns=columns, show="headings", height=6)
@@ -187,21 +215,21 @@ class MainApplication:
         # 绑定点击事件：点击"清空文件"或"删除文件夹"列时触发操作
         self.folder_tree.bind("<ButtonRelease-1>", self._on_folder_tree_click)
         self.folder_tree.bind("<Motion>", self._on_folder_tree_motion)
-        
+
         # 添加滚动条
         folder_scrollbar = ttk.Scrollbar(folder_frame, orient="vertical", command=self.folder_tree.yview)
         self.folder_tree.configure(yscrollcommand=folder_scrollbar.set)
-        
+
         self.folder_tree.pack(side="left", fill="both", expand=True)
         folder_scrollbar.pack(side="right", fill="y")
-        
+
         # 刷新文件夹列表
         self._refresh_folder_list()
-        
+
         # === 4. 上传失败文件列表 ===
-        failed_frame = ttk.LabelFrame(self.content_frame, text="⚠️ 上传失败文件(需处理):", padding=10)
+        failed_frame = ttk.LabelFrame(parent, text="⚠️ 上传失败文件(需处理):", padding=10)
         failed_frame.pack(fill="both", expand=True, padx=10, pady=5)
-        
+
         # 创建Treeview显示失败文件
         failed_columns = ("ID", "文件名", "失败原因", "重试次数", "重新上传", "忽略")
         self.failed_tree = ttk.Treeview(failed_frame, columns=failed_columns, show="headings", height=6)
@@ -227,37 +255,59 @@ class MainApplication:
         # 绑定点击事件
         self.failed_tree.bind("<ButtonRelease-1>", self._on_failed_tree_click)
         self.failed_tree.bind("<Motion>", self._on_failed_tree_motion)
-        
+
         # 添加滚动条
         failed_scrollbar = ttk.Scrollbar(failed_frame, orient="vertical", command=self.failed_tree.yview)
         self.failed_tree.configure(yscrollcommand=failed_scrollbar.set)
-        
+
         self.failed_tree.pack(side="left", fill="both", expand=True)
         failed_scrollbar.pack(side="right", fill="y")
-        
+
         # 初始加载失败列表
         self._load_failed_records()
-        
+
         # === 5. 日志区域 ===
-        log_frame = ttk.LabelFrame(self.content_frame, text="运行日志:", padding=10)
+        log_frame = ttk.LabelFrame(parent, text="运行日志:", padding=10)
         log_frame.pack(fill="both", expand=True, padx=10, pady=5)
-        
+
         # 创建滚动文本框
         self.log_text = scrolledtext.ScrolledText(log_frame, height=8, wrap="word", state="disabled")
         self.log_text.pack(fill="both", expand=True)
-        
+
         # 配置日志文本样式
         self.log_text.tag_configure("error", foreground="red")
         self.log_text.tag_configure("success", foreground="green")
         self.log_text.tag_configure("info", foreground="blue")
-        
+
         # === 6. 状态栏 ===
         status_frame = ttk.Frame(self.root)
         status_frame.pack(fill="x", padx=10, pady=5)
-        
+
         self.status_label = ttk.Label(status_frame, text="浏览器状态: 🔴 未启动 (等待文件...)",
                                       font=("Arial", 10), foreground="gray")
         self.status_label.pack(side="left")
+
+    def _create_stats_tab(self):
+        """创建作业上传数据统计标签页"""
+        self.stats_panel = StatsPanel(self.tab_stats, self.db, self.root)
+
+    def _start_stats_refresh(self):
+        """定时刷新统计面板表格数据（仅当统计标签页可见时）"""
+        def _auto_refresh():
+            try:
+                if hasattr(self, 'stats_panel') and self._is_stats_tab_selected():
+                    if self.stats_panel._data_copied:
+                        self.stats_panel._refresh_upload_table()
+                        self.stats_panel._refresh_failed_table()
+            finally:
+                self.root.after(30000, _auto_refresh)
+        self.root.after(30000, _auto_refresh)
+
+    def _is_stats_tab_selected(self) -> bool:
+        """判断当前是否选中了统计标签页"""
+        if hasattr(self, 'notebook'):
+            return self.notebook.index(self.notebook.select()) == 1
+        return False
 
     def _on_canvas_configure(self, event):
         """画布宽度变化时同步内容帧宽度，确保内容填满画布"""
@@ -934,6 +984,9 @@ class MainApplication:
     def _perform_exit(self):
         """统一的退出流程：设停止信号、等队列清空、销毁窗口"""
         self.stop_event.set()
+        # 清理matplotlib资源
+        if hasattr(self, 'stats_panel'):
+            self.stats_panel.destroy()
         if self.tray_icon:
             self.tray_icon.stop()
             self.tray_icon = None

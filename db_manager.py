@@ -76,7 +76,28 @@ class DatabaseManager:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_name ON upload_records(file_name)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_status ON upload_records(status)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_folder_name ON upload_records(folder_name)')
-        
+
+        # 创建数据分析表(结构与upload_records一致，用于存放用户手动复制的快照数据)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS analysis_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                folder_name TEXT NOT NULL,
+                school TEXT NOT NULL,
+                grade TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'success',
+                error_message TEXT,
+                retry_count INTEGER DEFAULT 0,
+                upload_time DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_analysis_subject ON analysis_records(subject)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_analysis_school ON analysis_records(school)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_analysis_grade ON analysis_records(grade)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_analysis_upload_time ON analysis_records(upload_time)')
+
         # 提交事务
         self._connection.commit()
     
@@ -233,6 +254,102 @@ class DatabaseManager:
         ''', (error_message, record_id))
         self._connection.commit()
     
+    # ==================== 数据分析相关方法 ====================
+
+    def copy_success_to_analysis(self) -> int:
+        """
+        将所有成功上传的记录复制到分析表(先清空再复制,实现快照功能)
+
+        Returns:
+            复制的记录数
+        """
+        cursor = self._connection.cursor()
+        cursor.execute("DELETE FROM analysis_records")
+        cursor.execute('''
+            INSERT INTO analysis_records
+            (file_name, file_path, folder_name, school, grade, subject,
+             status, error_message, retry_count, upload_time)
+            SELECT file_name, file_path, folder_name, school, grade, subject,
+                   status, error_message, retry_count, upload_time
+            FROM upload_records WHERE status = 'success'
+        ''')
+        self._connection.commit()
+        return cursor.rowcount
+
+    def get_all_successful_records(self) -> List[Dict]:
+        """获取所有上传成功的记录,按上传时间倒序"""
+        cursor = self._connection.cursor()
+        cursor.execute(
+            "SELECT * FROM upload_records WHERE status = 'success' ORDER BY upload_time DESC"
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_failed_records_for_stats(self) -> List[Dict]:
+        """获取失败记录的关键字段,用于统计面板显示"""
+        cursor = self._connection.cursor()
+        cursor.execute('''
+            SELECT file_name, school, grade, subject, upload_time, error_message
+            FROM upload_records WHERE status = 'failed'
+            ORDER BY upload_time DESC
+        ''')
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_upload_count_by_subject(self) -> List[Dict]:
+        """从分析表按科目统计上传数量,降序排列"""
+        cursor = self._connection.cursor()
+        cursor.execute(
+            "SELECT subject, COUNT(*) as count FROM analysis_records "
+            "GROUP BY subject ORDER BY count DESC"
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_upload_count_by_school_grade(self) -> List[Dict]:
+        """从分析表按学校+年级统计上传数量,降序排列"""
+        cursor = self._connection.cursor()
+        cursor.execute(
+            "SELECT school, grade, COUNT(*) as count FROM analysis_records "
+            "GROUP BY school, grade ORDER BY count DESC"
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_upload_count_by_date(self, aggregation: str = "daily") -> List[Dict]:
+        """
+        从分析表按日期统计上传数量
+
+        Args:
+            aggregation: 'daily'按日 / 'weekly'按周 / 'monthly'按月
+
+        Returns:
+            [{"date_label": "2026-06-15", "count": 7}, ...]
+        """
+        cursor = self._connection.cursor()
+        if aggregation == "weekly":
+            cursor.execute('''
+                SELECT strftime('%Y-%W', upload_time) as date_label,
+                       MIN(DATE(upload_time)) as sort_key,
+                       COUNT(*) as count
+                FROM analysis_records GROUP BY date_label ORDER BY sort_key
+            ''')
+        elif aggregation == "monthly":
+            cursor.execute('''
+                SELECT strftime('%Y-%m', upload_time) as date_label,
+                       COUNT(*) as count
+                FROM analysis_records GROUP BY date_label ORDER BY date_label
+            ''')
+        else:  # daily
+            cursor.execute('''
+                SELECT DATE(upload_time) as date_label,
+                       COUNT(*) as count
+                FROM analysis_records GROUP BY date_label ORDER BY date_label
+            ''')
+        return [dict(row) for row in cursor.fetchall()]
+
+    def clear_analysis_table(self):
+        """清空分析表"""
+        cursor = self._connection.cursor()
+        cursor.execute("DELETE FROM analysis_records")
+        self._connection.commit()
+
     def close(self):
         """
         关闭数据库连接
