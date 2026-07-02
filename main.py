@@ -85,12 +85,20 @@ def backend_worker(stop_event: threading.Event, task_queue: Queue,
             elif not browser.check_browser_status():
                 if stop_event.is_set():
                     break
-                # 只有任务队列中有待处理文件时才重启浏览器
-                # 空闲状态下浏览器关闭（含手动关闭）不自动重启
-                if task_queue.empty():
+                # 上传处理中不干预：让 upload_processor 自行检测失败并处理
+                if upload_processor.processing:
+                    if not browser_error_logged:
+                        log_queue.put("浏览器已关闭，但上传正在处理中，等待处理完成...")
+                        browser_error_logged = True
+                # 队列为空且无处理任务 → 不重启，清理状态避免重复检查
+                elif task_queue.empty():
                     if not browser_error_logged:
                         log_queue.put("浏览器已关闭,队列为空,不重启")
                         browser_error_logged = True
+                    # 清理内部状态，避免下次循环重复检测已失效的浏览器
+                    browser.driver = None
+                    browser.is_logged_in = False
+                # 队列中有待处理文件 → 重启
                 else:
                     if not browser_error_logged:
                         log_queue.put("警告: 浏览器异常关闭,尝试重启...")
@@ -173,7 +181,11 @@ def main():
 
         # 启动GUI主循环
         print("启动图形界面...")
-        root = tk.Tk()
+        try:
+            from tkinterdnd2 import TkinterDnD
+            root = TkinterDnD.Tk()
+        except ImportError:
+            root = tk.Tk()
 
         # 创建主应用窗口
         app = MainApplication(root, stop_event, task_queue, log_queue, upload_processor)

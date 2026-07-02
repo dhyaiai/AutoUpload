@@ -14,7 +14,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException
+from selenium.webdriver.common.keys import Keys
 from config_manager import ConfigManager
 from selenium.webdriver.chrome.service import Service
 
@@ -75,8 +76,14 @@ class BrowserAutomation:
             True表示浏览器可用,False表示启动失败
         """
         if self.is_initialized:
-            self.update_activity_time()
-            return True
+            # 验证浏览器是否真的还活着（用户可能手动关闭了浏览器）
+            if self.check_browser_status():
+                self.update_activity_time()
+                return True
+            else:
+                self._log("检测到浏览器已被手动关闭，将重新初始化...")
+                self.is_logged_in = False
+                self.driver = None
         self._log("检测到新文件,正在启动浏览器...")
         return self.initialize()
 
@@ -806,7 +813,12 @@ class BrowserAutomation:
         try:
             result = self.driver.execute_script("""
                 const labelText = arguments[0];
-                const labels = document.querySelectorAll('label');
+
+                // 限定在上传对话框内搜索，避免读到主页面上的筛选条件
+                const dialog = document.querySelector('.el-dialog__wrapper:not([style*="display: none"])');
+                const scope = dialog || document;
+
+                const labels = scope.querySelectorAll('label');
                 let formItem = null;
                 for (const label of labels) {
                     if (label.textContent.includes(labelText)) {
@@ -867,10 +879,8 @@ class BrowserAutomation:
             无需在Windows文件选择对话框中手动导航。
         """
         try:
-            print(f"开始上传文件: {os.path.basename(file_path)}")
-            print(f"学校: {school}, 年级: {grade}, 科目: {subject}")
-            print(f"文件路径: {file_path}")
-            
+            self._log(f"开始上传: {os.path.basename(file_path)} (学校={school}, 年级={grade}, 科目={subject})")
+
             # 步骤1: 点击"上传作业"按钮
             try:
                 # 方法1: 通过精确XPath定位(参考ceshi3.py)
@@ -896,7 +906,7 @@ class BrowserAutomation:
             # 使用JavaScript点击避免被遮挡
             self.driver.execute_script("arguments[0].click();", upload_btn)
             time.sleep(self.config.sleep_interval)
-            print("已打开上传作业对话框")
+            self._log("已打开上传作业对话框")
             
             # 步骤2: 定位文件输入框并直接发送完整文件路径
             # Selenium会自动处理Windows文件选择对话框,无需手动操作
@@ -916,11 +926,11 @@ class BrowserAutomation:
                 except NoSuchElementException:
                     continue
             if not file_input:
-                print("页面源码(前500字符):", self.driver.page_source[:500])
+                self._log(f"页面源码(前500字符): {self.driver.page_source[:500]}")
                 raise Exception("找不到文件上传input,请检查上传对话框是否正确打开")
             file_input.send_keys(file_path)
             time.sleep(self.config.sleep_interval)
-            print(f"[OK] 已选择文件: {os.path.basename(file_path)}")
+            self._log(f"[OK] 已选择文件: {os.path.basename(file_path)}")
 
             # 勾选年级+科目
             wait = WebDriverWait(self.driver, 10)
@@ -932,9 +942,9 @@ class BrowserAutomation:
 
             # -------------------- 4. 选择年级（自定义下拉） --------------------
             if current_grade and current_grade == grade:
-                print(f"⏭️ 年级已匹配({grade})，跳过选择")
+                self._log(f"⏭️ 年级已匹配({grade})，跳过选择")
             else:
-                print(f"选择年级：{grade}（当前: {current_grade}）")
+                self._log(f"选择年级: {grade}（当前: {current_grade}）")
                 # 4.1 点击年级下拉框展开列表（优化定位+等待+JS触发）
                 try:
                     grade_trigger = wait.until(EC.element_to_be_clickable(
@@ -977,13 +987,24 @@ class BrowserAutomation:
 
                 if not grade_selected:
                     raise Exception(f"未找到年级选项: {grade}")
-                print(f"✅ 年级选择完成：{grade}")
+                # 验证年级选择是否生效
+                time.sleep(0.5)
+                verify_grade = self._read_select_value("年级")
+                if verify_grade and verify_grade != grade:
+                    self._log(f"⚠ 年级选择可能未生效: 期望={grade}, 实际={verify_grade}")
+                else:
+                    self._log(f"✅ 年级选择完成: {grade}")
 
             # -------------------- 5. 选择科目（自定义下拉） --------------------
+            # 重要：年级切换后科目可能被页面重置，必须重新读取
+            if current_grade != grade:
+                time.sleep(0.5)
+                current_subject = self._read_select_value("科目")
+                self._log(f"年级已变更，重新读取科目: {current_subject}")
             if current_subject and current_subject == subject:
-                print(f"⏭️ 科目已匹配({subject})，跳过选择")
+                self._log(f"⏭️ 科目已匹配({subject})，跳过选择")
             else:
-                print(f"选择科目：{subject}（当前: {current_subject}）")
+                self._log(f"选择科目: {subject}（当前: {current_subject}）")
                 # 5.1 点击科目下拉框展开列表
                 try:
                     subject_trigger = wait.until(EC.element_to_be_clickable(
@@ -1026,81 +1047,34 @@ class BrowserAutomation:
 
                 if not subject_selected:
                     raise Exception(f"未找到科目选项: {subject}")
-                print(f"✅ 科目选择完成：{subject}")
+                # 验证科目选择是否生效
+                time.sleep(0.5)
+                verify_subject = self._read_select_value("科目")
+                if verify_subject and verify_subject != subject:
+                    self._log(f"⚠ 科目选择可能未生效: 期望={subject}, 实际={verify_subject}")
+                else:
+                    self._log(f"✅ 科目选择完成: {subject}")
 
-            # 步骤5: 设置预计使用时间(明天)
-            print("正在设置预计使用时间...")
+            # 步骤5: 设置预计使用时间(明天) — 直接输入模式，跳过不稳定的日历选择器
+            self._log("正在设置预计使用时间...")
             try:
-                # 计算明天的日期和时间
                 tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
                 tomorrow_time = tomorrow + " 09:00"
-                print(f"目标日期时间: {tomorrow_time}")
+                self._log(f"目标日期时间: {tomorrow_time}")
 
-                # 方法1: 点击日期输入框,打开日历选择器
-                date_trigger = self.driver.find_element(
+                date_input = self.driver.find_element(
                     By.XPATH,
                     "//input[@placeholder='选择日期' and @class='el-input__inner']"
                 )
-                self.driver.execute_script("arguments[0].click();", date_trigger)
-                time.sleep(1)  # 等待日期选择器完全展开
-
-                # 在日历中点击明天的日期
-                try:
-                    # 获取明天的日期数字
-                    day = int(tomorrow.split('-')[2])
-
-                    # 等待日历面板出现
-                    WebDriverWait(self.driver, 5).until(
-                        EC.presence_of_element_located((By.CLASS_NAME, "el-picker-panel"))
-                    )
-                    time.sleep(0.5)
-
-                    # 定位并点击明天的日期(Element UI日历中的日期单元格)
-                    # 需要排除上个月/下个月的灰色日期,只选择当前月份的可用日期
-                    date_cell_xpath = f"//td[contains(@class, 'available') and not(contains(@class, 'next-month')) and not(contains(@class, 'prev-month'))]//div[text()='{day}']"
-                    date_cell = self.driver.find_element(By.XPATH, date_cell_xpath)
-                    self.driver.execute_script("arguments[0].click();", date_cell)
-                    print(f"[OK] 已选择日期: {tomorrow}")
-
-                    # 如果是日期时间选择器,还需要选择时间
-                    time.sleep(0.5)
-                    try:
-                        # 查找时间输入框并设置为 09:00
-                        time_input = self.driver.find_element(
-                            By.XPATH,
-                            "//input[@placeholder='请选择时间']"
-                        )
-                        time_input.clear()
-                        time_input.send_keys("09:00")
-                        print("[OK] 时间已设置为 09:00")
-                    except:
-                        print("[WARN] 未找到时间输入框,使用默认时间")
-                    # 点击确定按钮
-                    confirm_btn = self.driver.find_element(
-                        By.XPATH,
-                        "//button[contains(@class, 'el-button') and contains(text(), '确定')]"
-                    )
-                    self.driver.execute_script("arguments[0].click();", confirm_btn)
-                    time.sleep(1)
-                    print("[OK] 使用时间设置完成!")
-
-                except Exception as e:
-                    print(f"日历选择器操作失败,尝试直接输入: {e}")
-                    # 如果日历操作失败,回退到直接输入方式
-                    date_input = self.driver.find_element(
-                        By.XPATH,
-                        "//input[@placeholder='选择日期' and @class='el-input__inner']"
-                    )
-                    date_input.clear()
-                    date_input.send_keys(tomorrow_time)
-                    from selenium.webdriver.common.keys import Keys
-                    date_input.send_keys(Keys.RETURN)  # 按回车确认
-                    time.sleep(self.config.sleep_interval)
-                    print("[OK] 使用时间设置完成(直接输入模式)!")
+                date_input.clear()
+                date_input.send_keys(tomorrow_time)
+                date_input.send_keys(Keys.RETURN)
+                time.sleep(0.3)
+                self._log("[OK] 使用时间设置完成!")
 
             except Exception as e:
-                print(f"警告: 设置预计使用时间失败 - {e}")
-            
+                self._log(f"警告: 设置预计使用时间失败 - {e}")
+
             # 步骤6: 提交表单
             try:
                 # 方法1: 通过精确XPath定位提交按钮(参考ceshi3.py)
@@ -1120,81 +1094,101 @@ class BrowserAutomation:
                     )
             
             self.driver.execute_script("arguments[0].click();", submit_btn)
-            print("已点击提交按钮")
-            
+            self._log("已点击提交按钮，等待上传结果...")
+
             # 步骤7: 等待上传完成并验证
-            # 同时检测成功和失败，避免假成功阻塞重试
+            # 核心策略：监控提交按钮是否消失。点击提交后，上传对话框关闭 →
+            # 提交按钮要么从DOM移除(v-if)要么隐藏(v-show)，这是最可靠的完成信号。
+            # Element UI 的 toast 消息（.el-message--success）~3秒自动消失，
+            # 不能作为主要判断依据。
+            #
+            # 关键：轮询期间必须临时禁用 implicit_wait，否则每次 find_elements()
+            # 在找不到元素时会等待10秒才返回空列表，导致每轮循环耗时30秒以上。
+            upload_timeout = self.config.get("UPLOAD_TIMEOUT", 120)
+            deadline = time.time() + upload_timeout
+            result = None  # None=等待中, True=成功, False=失败
+            error_text = ""
+
+            self.driver.implicitly_wait(0)  # 轮询阶段禁用隐式等待
             try:
-                success_indicators = [
-                    (By.CSS_SELECTOR, ".el-message--success"),
-                    (By.CSS_SELECTOR, ".el-notification--success"),
-                    (By.CSS_SELECTOR, ".el-message .el-message--success"),
-                    (By.CLASS_NAME, "success-message"),
-                    (By.CSS_SELECTOR, "[class*='success']"),
-                ]
-                error_indicators = [
-                    (By.CSS_SELECTOR, ".el-message--error"),
-                    (By.CSS_SELECTOR, ".el-notification--error"),
-                    (By.CLASS_NAME, "error-message"),
-                ]
-                success_detected = False
-                error_detected = False
-                deadline = time.time() + 30  # 最多等待30秒
                 while time.time() < deadline:
-                    # 优先检查错误消息
-                    for by, selector in error_indicators:
-                        try:
-                            el = self.driver.find_element(by, selector)
-                            if el.is_displayed():
-                                error_text = el.text.strip()
-                                print(f"[FAIL] 检测到上传失败提示: {error_text}")
-                                error_detected = True
-                                break
-                        except Exception:
-                            continue
-                    if error_detected:
-                        break
-
-                    # 检查成功消息
-                    for by, selector in success_indicators:
-                        try:
-                            el = self.driver.find_element(by, selector)
-                            if el.is_displayed():
-                                success_detected = True
-                                break
-                        except Exception:
-                            continue
-                    if success_detected:
-                        break
-                    time.sleep(1)
-
-                self.last_active_time = time.time()
-                if success_detected:
-                    print("[OK] 文件上传成功")
-                    return True
-                elif error_detected:
-                    print("[FAIL] 文件上传失败(检测到错误提示)")
-                    return False
-                else:
-                    # 超时未检测到明确信号 → 检查上传对话框是否已关闭（间接验证）
+                    # 1) 检查提交按钮是否已消失（对话框关闭的最可靠信号）
                     try:
-                        dialog_still_open = self.driver.find_elements(
-                            By.CSS_SELECTOR, ".el-dialog__wrapper:not([style*='display: none'])"
+                        submit_btn.is_enabled()  # 触发 StaleElementReferenceException 如果按钮已脱离DOM
+                        if not submit_btn.is_displayed():
+                            result = True
+                            break
+                    except StaleElementReferenceException:
+                        result = True
+                        break
+
+                    # 2) 检查表单校验错误（如"请选择年级"等）
+                    try:
+                        form_errors = self.driver.find_elements(
+                            By.CSS_SELECTOR, ".el-form-item__error"
                         )
-                        if not dialog_still_open:
-                            print("[OK] 上传对话框已关闭，视为上传成功")
-                            return True
+                        visible_errors = [e for e in form_errors if e.is_displayed() and e.text.strip()]
+                        if visible_errors:
+                            error_text = "; ".join(e.text.strip() for e in visible_errors)
+                            self._log(f"[FAIL] 表单校验错误: {error_text}")
+                            result = False
+                            break
                     except Exception:
                         pass
-                    print("[FAIL] 上传超时，未检测到成功或失败提示")
-                    return False
-            except Exception:
-                print("[FAIL] 上传验证异常")
-                self.last_active_time = time.time()
+
+                    # 3) 检查成功/错误 toast
+                    try:
+                        success_toasts = self.driver.find_elements(
+                            By.CSS_SELECTOR, ".el-message--success, .el-notification--success"
+                        )
+                        if any(el.is_displayed() for el in success_toasts):
+                            result = True
+                            break
+                    except Exception:
+                        pass
+
+                    try:
+                        error_toasts = self.driver.find_elements(
+                            By.CSS_SELECTOR, ".el-message--error, .el-notification--error"
+                        )
+                        visible = [e for e in error_toasts if e.is_displayed() and e.text.strip()]
+                        if visible:
+                            error_text = "; ".join(e.text.strip() for e in visible)
+                            self._log(f"[FAIL] 检测到错误提示: {error_text}")
+                            result = False
+                            break
+                    except Exception:
+                        pass
+
+                    time.sleep(1)
+            finally:
+                self.driver.implicitly_wait(10)  # 恢复隐式等待
+
+            self.last_active_time = time.time()
+
+            if result is True:
+                # 对话框已关闭或检测到成功toast → 最后确认无残留错误
+                time.sleep(0.5)
+                lingering = self.driver.find_elements(
+                    By.CSS_SELECTOR, ".el-message--error, .el-form-item__error"
+                )
+                if lingering:
+                    err_text = " ".join(e.text.strip() for e in lingering if e.text.strip())
+                    if err_text:
+                        self._log(f"[FAIL] 上传失败: {err_text}")
+                        return False
+                self._log("[OK] 文件上传成功")
+                return True
+            elif result is False:
+                self._log(f"[FAIL] 文件上传失败: {error_text}")
+                return False
+            else:
+                # 超时：提交按钮始终可见 → 可能上传大文件耗时较长，或页面卡住
+                self._log(f"[FAIL] 上传超时({upload_timeout}秒)，提交按钮未消失")
                 return False
         
         except Exception as e:
-            print(f"错误: 文件上传失败 - {e}")
+            self._log(f"错误: 文件上传失败 - {e}")
             return False
     
     def check_browser_status(self) -> bool:

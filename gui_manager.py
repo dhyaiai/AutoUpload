@@ -7,12 +7,13 @@ GUI管理界面模块
 import os
 import shutil
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import ttk, messagebox, scrolledtext, filedialog
 from queue import Queue, Empty
 from threading import Thread
 from typing import Optional
 from db_manager import DatabaseManager
 from config_manager import ConfigManager
+from file_merger import FileMerger
 
 
 class MainApplication:
@@ -46,6 +47,10 @@ class MainApplication:
         self._folder_data = {}  # iid -> (folder_path, folder_name)
         self._failed_data = {}  # iid -> (record_id, file_path, retry_count)
 
+        # 合并文件相关
+        self.question_file_path = None  # 试题文件路径
+        self.answer_file_path = None    # 答案文件路径
+
         # 系统托盘相关
         self.tray_icon = None
         self.tray_thread = None
@@ -53,7 +58,29 @@ class MainApplication:
         
         # 设置窗口属性
         self.root.title("作业自动上传管理工具")
-        self.root.geometry("900x700")
+        self.root.geometry("900x750")
+        self.root.minsize(700, 500)
+
+        # 可滚动画布（状态栏固定在底部不滚动）
+        self._canvas = tk.Canvas(self.root, highlightthickness=0)
+        self._scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=self._canvas.yview)
+        self.content_frame = ttk.Frame(self._canvas)
+
+        self.content_frame.bind("<Configure>",
+            lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
+        self._canvas_window = self._canvas.create_window(
+            (0, 0), window=self.content_frame, anchor="nw")
+
+        # 画布宽度跟随窗口变化时同步内容宽度
+        self._canvas.bind("<Configure>", self._on_canvas_configure)
+        # 鼠标滚轮滚动
+        self._canvas.bind("<Enter>", self._bind_mousewheel)
+        self._canvas.bind("<Leave>", self._unbind_mousewheel)
+
+        self._canvas.configure(yscrollcommand=self._scrollbar.set)
+
+        self._canvas.pack(side="left", fill="both", expand=True)
+        self._scrollbar.pack(side="right", fill="y")
         
         # 创建界面组件
         self._create_widgets()
@@ -73,7 +100,7 @@ class MainApplication:
         按照设计文档的布局结构实现
         """
         # === 1. 创建文件夹区域 ===
-        create_frame = ttk.LabelFrame(self.root, text="【创建新文件夹】", padding=10)
+        create_frame = ttk.LabelFrame(self.content_frame, text="【创建新文件夹】", padding=10)
         create_frame.pack(fill="x", padx=10, pady=5)
         
         # 学校名称输入
@@ -93,8 +120,52 @@ class MainApplication:
         create_btn = ttk.Button(create_frame, text="创建", command=self._create_folder)
         create_btn.grid(row=0, column=4, padx=10)
         
-        # === 2. 文件夹列表区域 ===
-        folder_frame = ttk.LabelFrame(self.root, text="文件夹列表:", padding=10)
+        # === 2. 合并文件区域 ===
+        merge_frame = ttk.LabelFrame(self.content_frame, text="【合并文件】", padding=10)
+        merge_frame.pack(fill="x", padx=10, pady=5)
+
+        merge_frame.columnconfigure(0, weight=1)
+        merge_frame.columnconfigure(1, weight=1)
+        merge_frame.columnconfigure(2, weight=0)
+
+        # --- 左侧：上传试题 ---
+        question_sub = ttk.Frame(merge_frame)
+        question_sub.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+
+        self._question_status_label = tk.Label(
+            question_sub, text="上传试题：点击浏览或拖拽文件到下方区域",
+            bg="white", relief="sunken", anchor="center", height=3,
+            fg="gray"
+        )
+        self._question_status_label.pack(fill="x", pady=(0, 2))
+        self._question_status_label.bind('<Button-1>', lambda e: self._browse_question_file())
+        self._register_drop_target(self._question_status_label, self._on_question_drop)
+
+        ttk.Button(question_sub, text="浏览...",
+                   command=self._browse_question_file).pack()
+
+        # --- 中间：上传答案 ---
+        answer_sub = ttk.Frame(merge_frame)
+        answer_sub.grid(row=0, column=1, sticky="nsew", padx=(5, 5))
+
+        self._answer_status_label = tk.Label(
+            answer_sub, text="上传答案：点击浏览或拖拽文件到下方区域",
+            bg="white", relief="sunken", anchor="center", height=3,
+            fg="gray"
+        )
+        self._answer_status_label.pack(fill="x", pady=(0, 2))
+        self._answer_status_label.bind('<Button-1>', lambda e: self._browse_answer_file())
+        self._register_drop_target(self._answer_status_label, self._on_answer_drop)
+
+        ttk.Button(answer_sub, text="浏览...",
+                   command=self._browse_answer_file).pack()
+
+        # --- 右侧：合并按钮 ---
+        merge_btn = ttk.Button(merge_frame, text="合  并", command=self._on_merge_click, width=10)
+        merge_btn.grid(row=0, column=2, padx=(5, 0), sticky="ns")
+
+        # === 3. 文件夹列表区域 ===
+        folder_frame = ttk.LabelFrame(self.content_frame, text="文件夹列表:", padding=10)
         folder_frame.pack(fill="both", expand=True, padx=10, pady=5)
         
         # 创建Treeview显示文件夹列表
@@ -127,8 +198,8 @@ class MainApplication:
         # 刷新文件夹列表
         self._refresh_folder_list()
         
-        # === 3. 上传失败文件列表 ===
-        failed_frame = ttk.LabelFrame(self.root, text="⚠️ 上传失败文件(需处理):", padding=10)
+        # === 4. 上传失败文件列表 ===
+        failed_frame = ttk.LabelFrame(self.content_frame, text="⚠️ 上传失败文件(需处理):", padding=10)
         failed_frame.pack(fill="both", expand=True, padx=10, pady=5)
         
         # 创建Treeview显示失败文件
@@ -167,8 +238,8 @@ class MainApplication:
         # 初始加载失败列表
         self._load_failed_records()
         
-        # === 4. 日志区域 ===
-        log_frame = ttk.LabelFrame(self.root, text="运行日志:", padding=10)
+        # === 5. 日志区域 ===
+        log_frame = ttk.LabelFrame(self.content_frame, text="运行日志:", padding=10)
         log_frame.pack(fill="both", expand=True, padx=10, pady=5)
         
         # 创建滚动文本框
@@ -180,14 +251,275 @@ class MainApplication:
         self.log_text.tag_configure("success", foreground="green")
         self.log_text.tag_configure("info", foreground="blue")
         
-        # === 5. 状态栏 ===
+        # === 6. 状态栏 ===
         status_frame = ttk.Frame(self.root)
         status_frame.pack(fill="x", padx=10, pady=5)
         
         self.status_label = ttk.Label(status_frame, text="浏览器状态: 🔴 未启动 (等待文件...)",
                                       font=("Arial", 10), foreground="gray")
         self.status_label.pack(side="left")
+
+    def _on_canvas_configure(self, event):
+        """画布宽度变化时同步内容帧宽度，确保内容填满画布"""
+        self._canvas.itemconfig(self._canvas_window, width=event.width)
+
+    def _bind_mousewheel(self, event):
+        """鼠标进入画布时绑定滚轮"""
+        self._canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+
+    def _unbind_mousewheel(self, event):
+        """鼠标离开画布时解绑滚轮"""
+        self._canvas.unbind_all("<MouseWheel>")
+
+    def _on_mousewheel(self, event):
+        """鼠标滚轮滚动画布"""
+        self._canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
     
+    # ==================== 合并文件相关方法 ====================
+
+    @staticmethod
+    def _register_drop_target(widget, callback):
+        """为控件注册拖拽放下目标，失败时静默忽略（DnD 库不可用时回退到点击上传）"""
+        try:
+            widget.drop_target_register('*')
+            widget.dnd_bind('<<Drop>>', callback)
+        except Exception:
+            pass
+
+    def _browse_question_file(self):
+        """浏览选择试题文件"""
+        path = filedialog.askopenfilename(
+            title="选择试题文件",
+            filetypes=[("文档文件", "*.doc *.docx *.pdf"),
+                       ("Word文档", "*.doc *.docx"),
+                       ("PDF文件", "*.pdf"),
+                       ("所有文件", "*.*")]
+        )
+        if path:
+            self._set_question_file(path)
+
+    def _browse_answer_file(self):
+        """浏览选择答案文件"""
+        path = filedialog.askopenfilename(
+            title="选择答案文件",
+            filetypes=[("文档文件", "*.doc *.docx *.pdf"),
+                       ("Word文档", "*.doc *.docx"),
+                       ("PDF文件", "*.pdf"),
+                       ("所有文件", "*.*")]
+        )
+        if path:
+            self._set_answer_file(path)
+
+    def _on_question_drop(self, event):
+        """拖拽放下试题文件"""
+        path = self._parse_drop_path(event.data)
+        if path:
+            self._set_question_file(path)
+
+    def _on_answer_drop(self, event):
+        """拖拽放下答案文件"""
+        path = self._parse_drop_path(event.data)
+        if path:
+            self._set_answer_file(path)
+
+    @staticmethod
+    def _parse_drop_path(data: str) -> Optional[str]:
+        """
+        解析拖拽事件中的文件路径。
+        tkinterdnd2 格式: "{C:/path/file.ext}" 或 "{path1} {path2} ..."
+        取第一个文件路径返回。
+        """
+        if not data:
+            return None
+        data = data.strip()
+        # 按 } { 分割多文件路径
+        parts = data.split('} {')
+        first = parts[0].strip()
+        # 去掉首尾花括号
+        if first.startswith('{'):
+            first = first[1:]
+        if first.endswith('}'):
+            first = first[:-1]
+        return first if first else None
+
+    def _set_question_file(self, path: str):
+        """设置试题文件路径并更新UI"""
+        if not os.path.isfile(path):
+            messagebox.showwarning("警告", f"文件不存在: {path}")
+            return
+        ext = FileMerger.get_format(path)
+        if ext not in FileMerger.SUPPORTED_EXTENSIONS:
+            messagebox.showwarning("警告",
+                f"不支持的文件格式 ({ext})\n仅支持: {', '.join(FileMerger.SUPPORTED_EXTENSIONS)}")
+            return
+        self.question_file_path = path
+        display = os.path.basename(path)
+        # 截断过长文件名
+        if len(display) > 50:
+            display = display[:47] + "..."
+        self._question_status_label.config(text=display, fg="black")
+
+    def _set_answer_file(self, path: str):
+        """设置答案文件路径并更新UI"""
+        if not os.path.isfile(path):
+            messagebox.showwarning("警告", f"文件不存在: {path}")
+            return
+        ext = FileMerger.get_format(path)
+        if ext not in FileMerger.SUPPORTED_EXTENSIONS:
+            messagebox.showwarning("警告",
+                f"不支持的文件格式 ({ext})\n仅支持: {', '.join(FileMerger.SUPPORTED_EXTENSIONS)}")
+            return
+        self.answer_file_path = path
+        display = os.path.basename(path)
+        if len(display) > 50:
+            display = display[:47] + "..."
+        self._answer_status_label.config(text=display, fg="black")
+
+    def _on_merge_click(self):
+        """点击合并按钮 — 校验文件 → 弹窗选目录 → 执行合并"""
+        # 校验
+        if not self.question_file_path:
+            messagebox.showwarning("提示", "请先选择试题文件")
+            return
+        if not self.answer_file_path:
+            messagebox.showwarning("提示", "请先选择答案文件")
+            return
+        if not os.path.isfile(self.question_file_path):
+            messagebox.showerror("错误", f"试题文件不存在: {self.question_file_path}")
+            return
+        if not os.path.isfile(self.answer_file_path):
+            messagebox.showerror("错误", f"答案文件不存在: {self.answer_file_path}")
+            return
+
+        q_fmt = FileMerger.get_format(self.question_file_path)
+        a_fmt = FileMerger.get_format(self.answer_file_path)
+        if q_fmt != a_fmt:
+            messagebox.showerror("错误",
+                f"试题和答案文件格式不一致，无法合并。\n试题: {q_fmt}  答案: {a_fmt}")
+            return
+
+        # 弹出子目录选择对话框
+        target_dir = self._show_subdir_dialog()
+        if not target_dir:
+            return  # 用户取消
+
+        # 输出文件名 = 试题文件名
+        output_name = os.path.basename(self.question_file_path)
+        output_path = os.path.join(target_dir, output_name)
+
+        # 目标文件已存在则询问
+        if os.path.exists(output_path):
+            if not messagebox.askyesno("确认覆盖",
+                    f"目标文件已存在，是否覆盖？\n{output_path}"):
+                return
+
+        # 在后台线程执行合并，避免阻塞 GUI
+        thread = Thread(target=self._do_merge, args=(output_path, target_dir), daemon=True)
+        thread.start()
+
+    def _show_subdir_dialog(self) -> Optional[str]:
+        """
+        弹出子目录选择对话框。
+        显示 ROOT_DIR 下所有子文件夹，用户选择一个。
+        返回完整路径，取消返回 None。
+        """
+        root_dir = self.config.root_dir
+        if not os.path.exists(root_dir):
+            messagebox.showerror("错误", f"根目录不存在:\n{root_dir}")
+            return None
+
+        subdirs = sorted([
+            d for d in os.listdir(root_dir)
+            if os.path.isdir(os.path.join(root_dir, d))
+        ])
+        if not subdirs:
+            messagebox.showwarning("提示",
+                f"根目录下没有子文件夹，请先在「创建新文件夹」区域创建。\n{root_dir}")
+            return None
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("选择保存目录")
+        dialog.geometry("420x380")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        # 居中
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - 420) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - 380) // 2
+        dialog.geometry(f"+{x}+{y}")
+
+        result = {"path": None}
+
+        ttk.Label(dialog, text="请选择保存的子目录:", font=("", 10)).pack(pady=(15, 5))
+        ttk.Label(dialog, text=root_dir, foreground="gray", font=("", 8)).pack()
+
+        # 列表
+        list_frame = ttk.Frame(dialog)
+        list_frame.pack(fill="both", expand=True, padx=15, pady=10)
+
+        listbox = tk.Listbox(list_frame, font=("", 10))
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        listbox.configure(yscrollcommand=scrollbar.set)
+
+        for d in subdirs:
+            listbox.insert("end", d)
+
+        listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # 按钮区
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(fill="x", padx=15, pady=(0, 15))
+
+        def on_confirm():
+            sel = listbox.curselection()
+            if not sel:
+                messagebox.showwarning("提示", "请选择一个子目录", parent=dialog)
+                return
+            result["path"] = os.path.join(root_dir, subdirs[sel[0]])
+            dialog.destroy()
+
+        def on_cancel():
+            dialog.destroy()
+
+        ttk.Button(btn_frame, text="确定", command=on_confirm).pack(side="right", padx=5)
+        ttk.Button(btn_frame, text="取消", command=on_cancel).pack(side="right", padx=5)
+
+        # 双击确定
+        listbox.bind("<Double-Button-1>", lambda e: on_confirm())
+
+        dialog.wait_window()
+        return result["path"]
+
+    def _do_merge(self, output_path: str, target_dir: str):
+        """在后台线程中执行文件合并"""
+        try:
+            self._log_to_gui("=" * 50, "info")
+            self._log_to_gui(f"开始合并文件...", "info")
+            self._log_to_gui(f"  试题: {self.question_file_path}", "info")
+            self._log_to_gui(f"  答案: {self.answer_file_path}", "info")
+            self._log_to_gui(f"  输出: {output_path}", "info")
+
+            FileMerger.merge(
+                self.question_file_path,
+                self.answer_file_path,
+                output_path
+            )
+
+            self._log_to_gui(f"合并成功！文件已保存到: {output_path}", "success")
+            self.root.after(0, lambda: messagebox.showinfo(
+                "合并完成", f"文件已保存到:\n{output_path}"))
+
+            # 将合并后的文件加入上传队列，触发自动上传
+            self.task_queue.put(output_path)
+            self._log_to_gui(f"已将合并文件加入上传队列: {os.path.basename(output_path)}", "info")
+
+        except Exception as e:
+            err_msg = str(e)
+            self._log_to_gui(f"合并失败: {err_msg}", "error")
+            self.root.after(0, lambda: messagebox.showerror(
+                "合并失败", f"{err_msg}"))
+
     def _create_folder(self):
         """
         创建新文件夹
