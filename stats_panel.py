@@ -3,8 +3,10 @@
 功能: 提供数据复制、柱状图、折线图、上传记录表、失败记录表及Excel导出
 技术: tkinter + matplotlib + openpyxl
 """
+import os
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+from datetime import datetime, timedelta
 
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -87,14 +89,83 @@ class StatsPanel:
         self._refresh_failed_table()
 
     def _create_action_bar(self):
-        """数据管理区: 状态提示"""
+        """数据管理区: 状态提示 + 分析报告按钮"""
         frame = ttk.LabelFrame(self._inner_frame, text="【数据管理】", padding=10)
         frame.pack(fill="x", padx=10, pady=5)
 
+        # 左侧状态提示
         self._sync_status_label = ttk.Label(frame,
             text="✓ 上传成功自动同步到分析表，数据持久保留不受上传记录清理影响",
             foreground="green")
         self._sync_status_label.pack(side="left", padx=5)
+
+        # 右侧分析报告按钮组
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(side="right", padx=5)
+
+        self._report_daily_btn = ttk.Button(btn_frame, text="今日报告",
+                                            command=lambda: self._generate_report('daily'))
+        self._report_daily_btn.pack(side="left", padx=2)
+
+        self._report_weekly_btn = ttk.Button(btn_frame, text="近7天报告",
+                                             command=lambda: self._generate_report('weekly'))
+        self._report_weekly_btn.pack(side="left", padx=2)
+
+        self._report_monthly_btn = ttk.Button(btn_frame, text="近30天报告",
+                                              command=lambda: self._generate_report('monthly'))
+        self._report_monthly_btn.pack(side="left", padx=2)
+
+        self._report_open_dir_btn = ttk.Button(btn_frame, text="打开报告目录",
+                                               command=self._open_reports_dir)
+        self._report_open_dir_btn.pack(side="left", padx=(10, 2))
+
+    def _generate_report(self, period: str):
+        """
+        生成失败分析报告
+
+        Args:
+            period: 'daily' 今日 / 'weekly' 近7天 / 'monthly' 近30天
+        """
+        # 延迟导入避免循环依赖
+        from failure_analysis_agent import FailureAnalysisAgent
+
+        today = datetime.now()
+        if period == 'daily':
+            start = today.strftime('%Y-%m-%d')
+            end = today.strftime('%Y-%m-%d')
+            report_type = 'daily'
+        elif period == 'weekly':
+            start = (today - timedelta(days=7)).strftime('%Y-%m-%d')
+            end = today.strftime('%Y-%m-%d')
+            report_type = 'weekly'
+        elif period == 'monthly':
+            start = (today - timedelta(days=30)).strftime('%Y-%m-%d')
+            end = today.strftime('%Y-%m-%d')
+            report_type = 'custom'
+        else:
+            return
+
+        try:
+            agent = FailureAnalysisAgent()
+            path = agent.generate_report(start, end, report_type)
+            if path:
+                messagebox.showinfo("报告生成成功",
+                                    f"分析报告已生成：\n{path}\n\n是否打开报告？")
+                os.startfile(path)
+            else:
+                messagebox.showwarning("报告生成失败",
+                                       "报告中无数据或生成过程出错，请检查日志")
+        except Exception as e:
+            messagebox.showerror("错误", f"生成报告时发生异常：\n{e}")
+
+    def _open_reports_dir(self):
+        """打开报告目录"""
+        from failure_analysis_agent import FailureAnalysisAgent
+        try:
+            agent = FailureAnalysisAgent()
+            path = agent.open_reports_dir()
+        except Exception as e:
+            messagebox.showerror("错误", f"打开报告目录失败：\n{e}")
 
     def _create_bar_chart_section(self):
         """柱状图区: 作业上传数量图"""
@@ -163,8 +234,8 @@ class StatsPanel:
         ttk.Button(btn_frame, text="📥 导出到Excel",
                    command=self._export_failed_table).pack(side="right", padx=5)
 
-        columns = ("file_name", "school", "grade", "subject", "upload_time", "error_message")
-        headers = ("作业名称", "学校", "年级", "科目", "上传时间", "失败原因")
+        columns = ("file_name", "school", "grade", "subject", "upload_time", "error_message", "agent_retry_success")
+        headers = ("作业名称", "学校", "年级", "科目", "上传时间", "失败原因", "Agent接管成功")
         failed_frame, self._failed_tree = self._create_treeview(frame, columns, headers, height=8)
         failed_frame.pack(fill="both", expand=True)
 
@@ -179,6 +250,9 @@ class StatsPanel:
             if col == "error_message":
                 width = 200
                 anchor = "w"
+            elif col == "agent_retry_success":
+                width = 70
+                anchor = "center"
             elif col == "file_name":
                 width = 200
                 anchor = "w"
@@ -334,10 +408,18 @@ class StatsPanel:
             self._failed_tree.delete(item)
         records = self.db.get_failed_records_for_stats()
         for r in records:
+            agent_result = r.get("agent_retry_success")
+            if agent_result == '是':
+                agent_display = '✅ 是'
+            elif agent_result == '否':
+                agent_display = '❌ 否'
+            else:
+                agent_display = '—'
             self._failed_tree.insert("", "end", values=(
                 r["file_name"], r["school"], r["grade"],
                 r["subject"], r["upload_time"],
-                r["error_message"] or ""
+                r["error_message"] or "",
+                agent_display
             ))
 
     # ==================== Excel导出 ====================
@@ -407,7 +489,7 @@ class StatsPanel:
             ws = wb.active
             ws.title = "失败记录"
 
-            headers = ["作业名称", "学校", "年级", "科目", "上传时间", "失败原因"]
+            headers = ["作业名称", "学校", "年级", "科目", "上传时间", "失败原因", "Agent接管成功"]
             header_fill = PatternFill(start_color="E74C3C", end_color="E74C3C", fill_type="solid")
             header_font = Font(bold=True, size=11, color="FFFFFF")
 
@@ -428,6 +510,7 @@ class StatsPanel:
             ws.column_dimensions['D'].width = 10
             ws.column_dimensions['E'].width = 22
             ws.column_dimensions['F'].width = 40
+            ws.column_dimensions['G'].width = 12
 
             wb.save(path)
             count = len(self._failed_tree.get_children())

@@ -1191,6 +1191,104 @@ class BrowserAutomation:
             self._log(f"错误: 文件上传失败 - {e}")
             return False
     
+    def reset_to_home(self) -> bool:
+        """
+        环境复位：将浏览器恢复到干净的首页状态
+        用于 AutoRetryAgent 重试前清理中间状态，避免二次失败
+
+        执行流程：
+        1. 发送 ESC 键关闭所有下拉/浮层
+        2. 关闭所有残留对话框（上传框、学校切换框、错误提示）
+        3. 导航回平台首页
+        4. 校验登录状态，异常则触发重启
+
+        Returns:
+            True表示复位成功, False表示浏览器已不可用
+        """
+        try:
+            if not self.driver:
+                self._log("reset_to_home: 浏览器未启动，跳过复位")
+                return False
+
+            self._log("开始环境复位...")
+
+            # 1. 发送 ESC 关闭所有下拉/浮层/弹窗
+            for _ in range(3):
+                try:
+                    webdriver.ActionChains(self.driver).send_keys(Keys.ESCAPE).perform()
+                    time.sleep(0.3)
+                except Exception:
+                    break
+
+            # 2. 关闭残留对话框
+            close_selectors = [
+                # Element UI dialog 关闭按钮
+                (By.CSS_SELECTOR, ".el-dialog__close"),
+                (By.CSS_SELECTOR, ".el-dialog__headerbtn"),
+                # 上传对话框关闭
+                (By.CSS_SELECTOR, ".el-dialog .el-icon-close"),
+                # 通用关闭按钮
+                (By.XPATH, "//button[contains(@class, 'el-dialog__close')]"),
+                # 取消按钮（关闭对话框）
+                (By.XPATH, "//button[contains(., '取 消') or contains(., '取消')]"),
+                # 遮罩层点击关闭
+                (By.CSS_SELECTOR, ".v-modal"),
+            ]
+            for by, selector in close_selectors:
+                try:
+                    elements = self.driver.find_elements(by, selector)
+                    for el in elements:
+                        try:
+                            if el.is_displayed():
+                                el.click()
+                                time.sleep(0.3)
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+
+            # 再发送一次 ESC 确保关闭残留
+            try:
+                webdriver.ActionChains(self.driver).send_keys(Keys.ESCAPE).perform()
+                time.sleep(0.3)
+            except Exception:
+                pass
+
+            # 3. 导航回平台首页
+            try:
+                current_url = self.driver.current_url
+                # 如果不在首页，导航回去
+                if "login" not in current_url.lower():
+                    base_url = self.config.website_url.rstrip('/')
+                    # 尝试直接跳转到首页
+                    self.driver.get(base_url)
+                    time.sleep(2)
+
+                    # 等待页面加载
+                    WebDriverWait(self.driver, 10).until(
+                        lambda d: d.execute_script("return document.readyState;") == "complete"
+                    )
+            except Exception as e:
+                self._log(f"reset_to_home: 导航回首页失败 - {e}")
+                # 不返回 False，继续尝试登录校验
+
+            # 4. 校验登录状态
+            if not self.check_login_status():
+                self._log("reset_to_home: 检测到登录失效，尝试重启浏览器")
+                if not self.restart_browser():
+                    self._log("reset_to_home: 浏览器重启失败")
+                    return False
+
+            self._log("环境复位完成")
+            self.update_activity_time()
+            return True
+
+        except Exception as e:
+            self._log(f"reset_to_home: 环境复位异常 - {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
     def check_browser_status(self) -> bool:
         """
         检查浏览器是否仍然可用

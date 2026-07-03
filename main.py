@@ -18,6 +18,7 @@ from file_monitor import FileMonitor
 from upload_processor import UploadProcessor
 from browser_automation import BrowserAutomation
 from gui_manager import MainApplication
+from auto_retry_agent import AutoRetryAgent
 
 
 def backend_worker(stop_event: threading.Event, task_queue: Queue,
@@ -52,6 +53,14 @@ def backend_worker(stop_event: threading.Event, task_queue: Queue,
         # 上传处理器会在收到第一个文件时自动启动浏览器
         processor_thread = threading.Thread(target=upload_processor.run, daemon=True)
         processor_thread.start()
+
+        # 步骤3.5: 启动失败自动接管 Agent（AutoRetryAgent）
+        auto_retry_agent = AutoRetryAgent(task_queue, stop_event, log_queue)
+        # 双向绑定：Agent ↔ UploadProcessor
+        auto_retry_agent.set_upload_processor(upload_processor)
+        upload_processor.set_agent(auto_retry_agent)
+        retry_agent_thread = threading.Thread(target=auto_retry_agent.run, daemon=True)
+        retry_agent_thread.start()
 
         # 步骤4: 进入主循环,仅在浏览器运行时检查其状态
         browser = BrowserAutomation(log_queue=log_queue)

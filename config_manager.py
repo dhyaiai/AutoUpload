@@ -64,7 +64,14 @@ class ConfigManager:
             "BROWSER_IDLE_TIMEOUT": 1800,                          # 浏览器空闲超时时间(秒)
             "MAX_RETRY_COUNT": 3,                                  # 最大重试次数
             "SLEEP_INTERVAL": 0.5,                                # 操作间隔时间(秒)
-            "MINIMIZE_TO_TRAY": True                              # 关闭窗口时最小化到托盘(False=直接退出)
+            "MINIMIZE_TO_TRAY": True,                              # 关闭窗口时最小化到托盘(False=直接退出)
+
+            # AutoRetryAgent 配置
+            "AUTO_RETRY_ENABLE": True,                              # 是否启用自动重试Agent
+            "AUTO_RETRY_SCAN_INTERVAL": 60,                         # 扫描间隔(秒)
+            "AUTO_RETRY_BACKOFF_SECONDS": [30, 120, 600],           # 指数退避间隔(秒)
+            "AUTO_RETRY_CIRCUIT_BREAKER_THRESHOLD": 10,             # 熔断阈值(5分钟内同类错误次数)
+            "AUTO_RETRY_CIRCUIT_BREAKER_DURATION": 1800,            # 熔断持续时间(秒，默认30分钟)
         }
 
         # 尝试加载配置文件
@@ -175,6 +182,31 @@ class ConfigManager:
     def sleep_interval(self) -> float:
         """获取操作间隔时间(秒)"""
         return self.get("SLEEP_INTERVAL", 0.5)
+
+    @property
+    def auto_retry_enable(self) -> bool:
+        """是否启用自动重试Agent"""
+        return self.get("AUTO_RETRY_ENABLE", True)
+
+    @property
+    def auto_retry_scan_interval(self) -> int:
+        """自动重试Agent扫描间隔(秒)"""
+        return self.get("AUTO_RETRY_SCAN_INTERVAL", 60)
+
+    @property
+    def auto_retry_backoff_seconds(self) -> list:
+        """自动重试指数退避间隔列表(秒)"""
+        return self.get("AUTO_RETRY_BACKOFF_SECONDS", [30, 120, 600])
+
+    @property
+    def auto_retry_circuit_breaker_threshold(self) -> int:
+        """熔断阈值(5分钟内同类错误次数)"""
+        return self.get("AUTO_RETRY_CIRCUIT_BREAKER_THRESHOLD", 10)
+
+    @property
+    def auto_retry_circuit_breaker_duration(self) -> int:
+        """熔断持续时间(秒)"""
+        return self.get("AUTO_RETRY_CIRCUIT_BREAKER_DURATION", 1800)
 
     def reload(self):
         """

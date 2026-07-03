@@ -240,19 +240,21 @@ class MainApplication:
         failed_frame.pack(fill="both", expand=True, padx=5, pady=2)
 
         # 创建Treeview显示失败文件
-        failed_columns = ("ID", "文件名", "失败原因", "重试次数", "重新上传", "忽略")
+        failed_columns = ("ID", "文件名", "失败原因", "重试次数", "Agent接管", "重新上传", "忽略")
         self.failed_tree = ttk.Treeview(failed_frame, columns=failed_columns, show="headings", height=6)
         self.failed_tree.heading("ID", text="ID")
         self.failed_tree.heading("文件名", text="文件名")
         self.failed_tree.heading("失败原因", text="失败原因")
         self.failed_tree.heading("重试次数", text="重试次数")
+        self.failed_tree.heading("Agent接管", text="Agent接管")
         self.failed_tree.heading("重新上传", text="重新上传")
         self.failed_tree.heading("忽略", text="忽略")
 
         self.failed_tree.column("ID", width=40, anchor="center")
-        self.failed_tree.column("文件名", width=160, anchor="w")
-        self.failed_tree.column("失败原因", width=220, anchor="w")
-        self.failed_tree.column("重试次数", width=60, anchor="center")
+        self.failed_tree.column("文件名", width=140, anchor="w")
+        self.failed_tree.column("失败原因", width=180, anchor="w")
+        self.failed_tree.column("重试次数", width=55, anchor="center")
+        self.failed_tree.column("Agent接管", width=70, anchor="center")
         self.failed_tree.column("重新上传", width=100, anchor="center")
         self.failed_tree.column("忽略", width=80, anchor="center")
 
@@ -750,7 +752,7 @@ class MainApplication:
 
         if not failed_records:
             # 无失败记录,显示提示
-            self.failed_tree.insert("", "end", values=("", "当前无失败文件", "", "", "", ""))
+            self.failed_tree.insert("", "end", values=("", "当前无失败文件", "", "", "", "", ""))
             return
 
         # 显示每条失败记录
@@ -758,6 +760,15 @@ class MainApplication:
             rid = record['id']
             retry_count = record['retry_count']
             file_path = record['file_path']
+
+            # Agent 接管结果展示
+            agent_result = record.get('agent_retry_success')
+            if agent_result == '是':
+                agent_display = '✅ 是'
+            elif agent_result == '否':
+                agent_display = '❌ 否'
+            else:
+                agent_display = '—'
 
             # 根据重试次数决定"重新上传"按钮状态
             if retry_count >= max_retry:
@@ -772,6 +783,7 @@ class MainApplication:
                 record['file_name'],
                 record['error_message'] or "未知错误",
                 retry_count,
+                agent_display,
                 retry_text,
                 "🗑️ 忽略"
             ), tags=("failed_row",))
@@ -830,22 +842,22 @@ class MainApplication:
         record_id, file_path, retry_count = self._failed_data[item]
         max_retry = self.config.max_retry_count
 
-        # 列 '#5' = 重新上传, '#6' = 忽略
-        if column == '#5':
+        # 列 '#6' = 重新上传, '#7' = 忽略
+        if column == '#6':
             if retry_count >= max_retry:
                 messagebox.showwarning("提示", f"已达到最大重试次数({max_retry})，无法继续重试")
                 return
             self._retry_upload(record_id, file_path)
-        elif column == '#6':
+        elif column == '#7':
             self._ignore_record(record_id)
 
     def _on_failed_tree_motion(self, event):
         """鼠标在失败列表上移动时切换光标样式"""
         column = self.failed_tree.identify_column(event.x)
         # 只有"重新上传"列(且非disabled状态)和"忽略"列显示手型
-        if column == '#6':
+        if column == '#7':
             self.failed_tree.configure(cursor="hand2")
-        elif column == '#5':
+        elif column == '#6':
             item = self.failed_tree.identify_row(event.y)
             if item in self._failed_data:
                 _, _, retry_count = self._failed_data[item]

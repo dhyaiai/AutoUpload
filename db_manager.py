@@ -68,7 +68,13 @@ class DatabaseManager:
                 status TEXT NOT NULL DEFAULT 'success', -- 状态:'success'成功 或 'failed'失败
                 error_message TEXT,                     -- 失败时的错误信息
                 retry_count INTEGER DEFAULT 0,          -- 重试次数
-                upload_time DATETIME DEFAULT CURRENT_TIMESTAMP  -- 上传时间,默认当前时间
+                upload_time DATETIME DEFAULT CURRENT_TIMESTAMP,  -- 上传时间,默认当前时间
+                fail_stage TEXT DEFAULT NULL,           -- 失败阶段(UploadStage枚举值)
+                error_category TEXT DEFAULT NULL,       -- 错误一级分类(ErrorCategory枚举值)
+                error_type TEXT DEFAULT NULL,           -- 错误二级类型(ErrorType枚举值)
+                error_context TEXT DEFAULT NULL,        -- 错误上下文JSON(页面URL/元素信息等)
+                retry_status TEXT DEFAULT 'pending',    -- 重试处理状态:pending/processing/finished
+                agent_retry_success TEXT DEFAULT NULL   -- Agent接管是否成功: '是'/'否'
             )
         ''')
         
@@ -98,8 +104,32 @@ class DatabaseManager:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_analysis_grade ON analysis_records(grade)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_analysis_upload_time ON analysis_records(upload_time)')
 
+        # 执行表结构迁移（兼容旧数据库，新增字段不存在时自动添加）
+        self._migrate_schema()
+
         # 提交事务
         self._connection.commit()
+
+    def _migrate_schema(self):
+        """
+        兼容旧数据库：检查并添加新增字段，缺失则自动 ALTER TABLE
+        """
+        new_columns = {
+            'fail_stage': 'TEXT DEFAULT NULL',
+            'error_category': 'TEXT DEFAULT NULL',
+            'error_type': 'TEXT DEFAULT NULL',
+            'error_context': 'TEXT DEFAULT NULL',
+            'retry_status': "TEXT DEFAULT 'pending'",
+            'agent_retry_success': 'TEXT DEFAULT NULL',
+        }
+        cursor = self._connection.cursor()
+        existing = {row[1] for row in cursor.execute("PRAGMA table_info(upload_records)").fetchall()}
+        for col_name, col_def in new_columns.items():
+            if col_name not in existing:
+                try:
+                    cursor.execute(f"ALTER TABLE upload_records ADD COLUMN {col_name} {col_def}")
+                except Exception as e:
+                    print(f"数据库迁移警告 (添加列 {col_name}): {e}")
     
     def add_record(self, file_name: str, file_path: str, folder_name: str,
                    school: str, grade: str, subject: str, 
@@ -327,7 +357,7 @@ class DatabaseManager:
         """获取失败记录的关键字段,用于统计面板显示"""
         cursor = self._connection.cursor()
         cursor.execute('''
-            SELECT file_name, school, grade, subject, upload_time, error_message
+            SELECT file_name, school, grade, subject, upload_time, error_message, agent_retry_success
             FROM upload_records WHERE status = 'failed'
             ORDER BY upload_time DESC
         ''')
@@ -388,6 +418,341 @@ class DatabaseManager:
         cursor = self._connection.cursor()
         cursor.execute("DELETE FROM analysis_records")
         self._connection.commit()
+
+    # ==================== Agent 相关新增接口 ====================
+
+    def add_failed_record_structured(self, file_name: str, file_path: str, folder_name: str,
+                                     school: str, grade: str, subject: str,
+                                     error_message: str = None,
+                                     fail_stage: str = None,
+                                     error_category: str = None,
+                                     error_type: str = None,
+                                     error_context: str = None) -> int:
+        """
+        结构化写入失败记录（含失败阶段、错误分类、上下文）
+
+        Args:
+            file_name: 文件名
+            file_path: 文件路径
+            folder_name: 文件夹名称
+            school: 学校
+            grade: 年级
+            subject: 科目
+            error_message: 错误描述
+            fail_stage: UploadStage 枚举值
+            error_category: ErrorCategory 枚举值
+            error_type: ErrorType 枚举值
+            error_context: JSON 格式的上下文信息
+
+        Returns:
+            新插入记录的ID
+        """
+        cursor = self._connection.cursor()
+        cursor.execute('''
+            INSERT INTO upload_records
+            (file_name, file_path, folder_name, school, grade, subject,
+             status, error_message, fail_stage, error_category, error_type,
+             error_context, retry_status, upload_time)
+            VALUES (?, ?, ?, ?, ?, ?, 'failed', ?, ?, ?, ?, ?, 'pending', ?)
+        ''', (file_name, file_path, folder_name, school, grade, subject,
+              error_message, fail_stage, error_category, error_type,
+              error_context, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+        self._connection.commit()
+        return cursor.lastrowid
+
+    def get_pending_failed_records(self, limit: int = 20) -> List[Dict]:
+        """
+        获取待处理的失败记录（retry_status='pending' 且 status='failed'）
+        按 upload_time 升序（先失败的先处理）
+
+        Args:
+            limit: 最大返回数量
+
+        Returns:
+            失败记录列表，每条记录是一个字典
+        """
+        cursor = self._connection.cursor()
+        cursor.execute('''
+            SELECT * FROM upload_records
+            WHERE status = 'failed' AND retry_status = 'pending'
+            ORDER BY upload_time ASC
+            LIMIT ?
+        ''', (limit,))
+        return [dict(row) for row in cursor.fetchall()]
+
+    def update_retry_status(self, record_id: int, status: str):
+        """
+        更新记录的重试处理状态
+
+        Args:
+            record_id: 记录ID
+            status: 'pending' / 'processing' / 'finished'
+        """
+        cursor = self._connection.cursor()
+        cursor.execute('''
+            UPDATE upload_records SET retry_status = ? WHERE id = ?
+        ''', (status, record_id))
+        self._connection.commit()
+
+    def update_record_structured_error(self, record_id: int,
+                                       error_message: str = None,
+                                       fail_stage: str = None,
+                                       error_category: str = None,
+                                       error_type: str = None,
+                                       error_context: str = None):
+        """
+        更新记录的失败阶段和错误分类信息
+        用于 retry 后更新错误详情
+
+        Args:
+            record_id: 记录ID
+            error_message: 新的错误信息
+            fail_stage: UploadStage 枚举值
+            error_category: ErrorCategory 枚举值
+            error_type: ErrorType 枚举值
+            error_context: JSON 格式上下文
+        """
+        cursor = self._connection.cursor()
+        updates = []
+        values = []
+        if error_message is not None:
+            updates.append("error_message = ?")
+            values.append(error_message)
+        if fail_stage is not None:
+            updates.append("fail_stage = ?")
+            values.append(fail_stage)
+        if error_category is not None:
+            updates.append("error_category = ?")
+            values.append(error_category)
+        if error_type is not None:
+            updates.append("error_type = ?")
+            values.append(error_type)
+        if error_context is not None:
+            updates.append("error_context = ?")
+            values.append(error_context)
+        if not updates:
+            return
+        values.append(record_id)
+        cursor.execute(f"UPDATE upload_records SET {', '.join(updates)} WHERE id = ?", values)
+        self._connection.commit()
+
+    def set_agent_retry_success(self, record_id: int, success: bool):
+        """
+        标记 Agent 接管重试是否成功
+
+        Args:
+            record_id: 记录ID
+            success: True=成功, False=失败
+        """
+        cursor = self._connection.cursor()
+        value = '是' if success else '否'
+        cursor.execute(
+            "UPDATE upload_records SET agent_retry_success = ? WHERE id = ?",
+            (value, record_id)
+        )
+        self._connection.commit()
+
+    def get_failed_stats_by_period(self, start_time: str, end_time: str) -> Dict:
+        """
+        按时间范围聚合失败统计数据
+
+        Args:
+            start_time: 起始时间 'YYYY-MM-DD HH:MM:SS'
+            end_time: 截止时间 'YYYY-MM-DD HH:MM:SS'
+
+        Returns:
+            包含各项统计指标的字典
+        """
+        cursor = self._connection.cursor()
+
+        # 总上传量
+        cursor.execute('''
+            SELECT COUNT(*) FROM upload_records
+            WHERE upload_time BETWEEN ? AND ?
+        ''', (start_time, end_time))
+        total_uploads = cursor.fetchone()[0]
+
+        # 失败数
+        cursor.execute('''
+            SELECT COUNT(*) FROM upload_records
+            WHERE upload_time BETWEEN ? AND ? AND status = 'failed'
+        ''', (start_time, end_time))
+        total_failed = cursor.fetchone()[0]
+
+        # Agent 挽回数（agent_retry_success='是'）
+        cursor.execute('''
+            SELECT COUNT(*) FROM upload_records
+            WHERE upload_time BETWEEN ? AND ?
+            AND status = 'success' AND agent_retry_success = '是'
+        ''', (start_time, end_time))
+        agent_recovered = cursor.fetchone()[0]
+
+        # 重试成功数（retry_count > 0 且最终 status='success'）
+        cursor.execute('''
+            SELECT COUNT(*) FROM upload_records
+            WHERE upload_time BETWEEN ? AND ?
+            AND status = 'success' AND retry_count > 0
+        ''', (start_time, end_time))
+        retry_success = cursor.fetchone()[0]
+
+        # 待人工处理数（retry_status='finished' 且 status='failed'）
+        cursor.execute('''
+            SELECT COUNT(*) FROM upload_records
+            WHERE upload_time BETWEEN ? AND ?
+            AND status = 'failed' AND retry_status = 'finished'
+        ''', (start_time, end_time))
+        manual_pending = cursor.fetchone()[0]
+
+        # 按 error_category 分布
+        cursor.execute('''
+            SELECT error_category, COUNT(*) as cnt FROM upload_records
+            WHERE upload_time BETWEEN ? AND ? AND status = 'failed'
+            GROUP BY error_category ORDER BY cnt DESC
+        ''', (start_time, end_time))
+        category_distribution = [dict(row) for row in cursor.fetchall()]
+
+        # 按 error_type 分布
+        cursor.execute('''
+            SELECT error_type, COUNT(*) as cnt FROM upload_records
+            WHERE upload_time BETWEEN ? AND ? AND status = 'failed'
+            GROUP BY error_type ORDER BY cnt DESC
+        ''', (start_time, end_time))
+        type_distribution = [dict(row) for row in cursor.fetchall()]
+
+        return {
+            'total_uploads': total_uploads,
+            'total_failed': total_failed,
+            'agent_recovered': agent_recovered,
+            'retry_success': retry_success,
+            'manual_pending': manual_pending,
+            'category_distribution': category_distribution,
+            'type_distribution': type_distribution,
+        }
+
+    def get_failed_records_by_period(self, start_time: str, end_time: str) -> List[Dict]:
+        """
+        获取指定周期的所有失败记录
+
+        Args:
+            start_time: 起始时间
+            end_time: 截止时间
+
+        Returns:
+            失败记录列表
+        """
+        cursor = self._connection.cursor()
+        cursor.execute('''
+            SELECT * FROM upload_records
+            WHERE upload_time BETWEEN ? AND ? AND status = 'failed'
+            ORDER BY upload_time DESC
+        ''', (start_time, end_time))
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_all_records_by_period(self, start_time: str, end_time: str) -> List[Dict]:
+        """
+        获取指定周期的所有上传记录（含成功和失败）
+
+        Args:
+            start_time: 起始时间
+            end_time: 截止时间
+
+        Returns:
+            记录列表
+        """
+        cursor = self._connection.cursor()
+        cursor.execute('''
+            SELECT * FROM upload_records
+            WHERE upload_time BETWEEN ? AND ?
+            ORDER BY upload_time DESC
+        ''', (start_time, end_time))
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_error_type_retry_stats(self, start_time: str = None, end_time: str = None) -> List[Dict]:
+        """
+        按错误类型统计重试效果（重试成功率、平均重试次数）
+
+        Args:
+            start_time: 可选的时间范围起始
+            end_time: 可选的时间范围截止
+
+        Returns:
+            [{error_type, total, retry_success_count, avg_retry_count}, ...]
+        """
+        cursor = self._connection.cursor()
+        where = "WHERE status = 'failed' OR retry_count > 0"
+        params = []
+        if start_time and end_time:
+            where += " AND upload_time BETWEEN ? AND ?"
+            params = [start_time, end_time]
+
+        cursor.execute(f'''
+            SELECT error_type,
+                   COUNT(*) as total,
+                   SUM(CASE WHEN status = 'success' AND retry_count > 0 THEN 1 ELSE 0 END) as retry_success_count,
+                   AVG(retry_count) as avg_retry_count
+            FROM upload_records {where}
+            GROUP BY error_type ORDER BY total DESC
+        ''', params)
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_failure_rate_by_school_grade(self, start_time: str, end_time: str) -> List[Dict]:
+        """按学校+年级统计失败率"""
+        cursor = self._connection.cursor()
+        cursor.execute('''
+            SELECT school, grade,
+                   COUNT(*) as total,
+                   SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
+            FROM upload_records
+            WHERE upload_time BETWEEN ? AND ?
+            GROUP BY school, grade ORDER BY failed DESC
+        ''', (start_time, end_time))
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_failure_rate_by_subject(self, start_time: str, end_time: str) -> List[Dict]:
+        """按科目统计失败率"""
+        cursor = self._connection.cursor()
+        cursor.execute('''
+            SELECT subject,
+                   COUNT(*) as total,
+                   SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
+            FROM upload_records
+            WHERE upload_time BETWEEN ? AND ?
+            GROUP BY subject ORDER BY failed DESC
+        ''', (start_time, end_time))
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_daily_failure_trend(self, start_time: str, end_time: str) -> List[Dict]:
+        """按天统计失败率趋势"""
+        cursor = self._connection.cursor()
+        cursor.execute('''
+            SELECT DATE(upload_time) as date_label,
+                   COUNT(*) as total,
+                   SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
+            FROM upload_records
+            WHERE upload_time BETWEEN ? AND ?
+            GROUP BY date_label ORDER BY date_label
+        ''', (start_time, end_time))
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_circuit_breaker_stats(self, error_type: str, minutes: int = 5) -> int:
+        """
+        获取指定时间窗口内某类错误的失败次数（用于熔断判断）
+
+        Args:
+            error_type: ErrorType 枚举值
+            minutes: 时间窗口（分钟）
+
+        Returns:
+            失败次数
+        """
+        cursor = self._connection.cursor()
+        cutoff = (datetime.now() - __import__('datetime').timedelta(minutes=minutes)).strftime(
+            '%Y-%m-%d %H:%M:%S')
+        cursor.execute('''
+            SELECT COUNT(*) FROM upload_records
+            WHERE error_type = ? AND upload_time >= ? AND status = 'failed'
+        ''', (error_type, cutoff))
+        return cursor.fetchone()[0]
 
     def close(self):
         """
