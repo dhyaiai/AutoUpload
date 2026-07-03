@@ -1,10 +1,10 @@
 """
-失败自动接管 Agent (AutoRetryAgent)
-功能: 后台常驻,自动扫描失败记录,精准定位失败阶段与根因,执行分级自愈策略
+失败自动接管 Agent (AutoRetryAgent) — AI Agent 版
+功能: 后台常驻,自动扫描失败记录,ReAct 循环驱动 LLM 自主诊断与自愈决策
 特点:
   - 独立后台线程,随程序启停
-  - 通过 task_queue 串行重试,不直接操作浏览器
-  - 交叉验证 + 熔断保护 + 指数退避
+  - ReAct (Thought→Action→Observation) 循环: LLM 自主调用工具完成诊断和决策
+  - 安全守护(熔断/重试上限)在工具层硬编码,LLM 无法绕过
   - 全程更新数据库状态,与手动重试兼容
 """
 import json
@@ -17,6 +17,8 @@ from datetime import datetime, timedelta
 from queue import Queue
 from typing import Dict, List, Optional, Set
 
+from deepseek_helper import DeepSeekHelper
+from react_loop import ReActLoop
 from db_manager import DatabaseManager
 from config_manager import ConfigManager
 from browser_automation import BrowserAutomation
@@ -88,10 +90,15 @@ class CircuitBreaker:
                 # 熔断期已过，解除
                 del self._tripped[error_type]
 
-        # 检查是否达到熔断阈值
-        recent_count = len(self._error_timestamps.get(error_type, []))
+        # 按时间窗口过滤后计数（修复：旧时间戳在 record_error 未被调用时也会过期）
+        now = time.time()
+        cutoff = now - self.duration_seconds
+        recent_count = sum(
+            1 for t in self._error_timestamps.get(error_type, [])
+            if t > cutoff
+        )
         if recent_count >= self.threshold:
-            self._tripped[error_type] = time.time() + self.duration_seconds
+            self._tripped[error_type] = now + self.duration_seconds
             return True
 
         return False
@@ -131,6 +138,23 @@ class CircuitBreaker:
                 del self._tripped[etype]
         return tripped
 
+    # ─── 公共属性（供外部安全读取状态，避免直接访问私有属性）───
+
+    @property
+    def error_counts(self) -> Dict[str, int]:
+        """各错误类型近期计数（只读快照）"""
+        return {et: len(ts) for et, ts in self._error_timestamps.items()}
+
+    @property
+    def global_tripped(self) -> bool:
+        """全量熔断状态"""
+        return self._global_tripped
+
+    @property
+    def browser_restart_count(self) -> int:
+        """浏览器连续重启计数"""
+        return self._browser_restart_count
+
 
 class AutoRetryAgent:
     """
@@ -151,6 +175,20 @@ class AutoRetryAgent:
 
         self.db = DatabaseManager()
         self.config = ConfigManager()
+
+        # LLM 提供商：优先 Qwen，否则 DeepSeek
+        qwen_key = self.config.qwen_api_key
+        if qwen_key:
+            self.deepseek = DeepSeekHelper(
+                api_url="https://llm-nwnb3n9ni4k5ebc2.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+                api_key=qwen_key,
+                model=self.config.qwen_model
+            )
+            self._log(f"AutoRetryAgent: 使用 Qwen/{self.config.qwen_model}")
+        else:
+            self.deepseek = DeepSeekHelper()
+            self._log("AutoRetryAgent: 使用 DeepSeek")
+
         # 复用全局浏览器单例（不传参避免覆盖已有实例的 log_queue）
         self.browser = BrowserAutomation()
 
@@ -167,6 +205,7 @@ class AutoRetryAgent:
 
         # 已提交重试的文件集合（防止重复入队）
         self._in_retry: Set[str] = set()
+        self._in_retry_lock = threading.Lock()  # 保护 _in_retry 的跨线程访问
 
         # UploadProcessor 引用（用于注册重试映射）
         self.upload_processor = None
@@ -211,6 +250,12 @@ class AutoRetryAgent:
         if not records:
             return
 
+        # 清理 _in_retry 中已不在待处理列表中的过期条目
+        # （UploadProcessor 早期返回时可能未触发 on_upload_result 回调）
+        pending_paths = {r.get('file_path', '') for r in records if r.get('file_path')}
+        with self._in_retry_lock:
+            self._in_retry = {fp for fp in self._in_retry if fp in pending_paths}
+
         tripped_types = self.circuit_breaker.get_tripped_types()
         self._log(f"AutoRetryAgent: 扫描到 {len(records)} 条待处理失败记录"
                   + (f", 熔断中: {tripped_types}" if tripped_types else ""))
@@ -232,7 +277,10 @@ class AutoRetryAgent:
 
     def _process_one_record(self, record: Dict, tripped_types: Set[str]):
         """
-        处理单条失败记录
+        AI Agent 主入口：ReAct 循环处理单条失败记录
+
+        流程: 预检查 → ReAct 循环(LLM自主决策) → 后处理(退避+入队)
+        安全守护(熔断/重试上限)在工具函数内部硬编码,LLM 无法绕过
 
         Args:
             record: 数据库记录字典
@@ -246,8 +294,11 @@ class AutoRetryAgent:
         error_type = record.get('error_type')
         error_category = record.get('error_category')
         error_message = record.get('error_message', '')
+        school = record.get('school', '')
+        grade = record.get('grade', '')
+        subject = record.get('subject', '')
 
-        # ---- 检查文件是否存在 ----
+        # ---- 预检查：文件是否存在（硬错误，LLM 无需参与）----
         if not os.path.exists(file_path):
             self._log(f"AutoRetryAgent: 文件不存在，标记人工处理 - {file_name}")
             self.db.update_record_structured_error(
@@ -260,7 +311,7 @@ class AutoRetryAgent:
             self.db.update_retry_status(record_id, 'finished')
             return
 
-        # ---- 交叉验证：推断缺失的结构化字段 ----
+        # ---- 预检查：交叉验证推断缺失的结构化字段 ----
         if not error_type or not fail_stage:
             inferred_category, inferred_type = classify_error(error_message, fail_stage)
             if not error_category:
@@ -269,103 +320,451 @@ class AutoRetryAgent:
                 error_type = inferred_type.value
             if not fail_stage:
                 fail_stage = UploadStage.SUBMIT_UPLOAD.value
-            # 更新数据库
             self.db.update_record_structured_error(
                 record_id,
                 fail_stage=fail_stage,
                 error_category=error_category,
                 error_type=error_type,
             )
+            # 回写 record 字典，确保 _rule_engine_decision 读到最新值
+            record['fail_stage'] = fail_stage
+            record['error_category'] = error_category
+            record['error_type'] = error_type
             self._log(f"AutoRetryAgent: 交叉验证推断 - stage={fail_stage}, type={error_type}")
 
-        # ---- 查询自愈策略 ----
+        # ---- 决策：AI ReAct 优先，规则引擎兜底 ----
+        decision = None  # {"retry_level": RetryLevel, "action": "enqueue"|"restart_browser"|"skip"|"manual"}
+
+        if self.config.ai_retry_agent_enable and self.deepseek.api_key:
+            decision = self._run_react_loop(record, tripped_types)
+            if decision is not None:
+                # ReAct 决策需要通过硬安全门禁校验
+                decision = self._validate_react_decision(decision, record, tripped_types)
+
+        if decision is None:
+            # 回退到规则引擎
+            decision = self._rule_engine_decision(record, tripped_types)
+
+        if decision is None:
+            return  # 规则引擎决定跳过
+
+        action = decision.get("action", "")
+        retry_level = decision.get("retry_level")
+
+        # ---- 执行决策 ----
+        if action == "manual":
+            self._log(f"AutoRetryAgent: 标记人工处理 - {file_name} ({error_type})")
+            self.db.update_retry_status(record_id, 'finished')
+            return
+
+        # 浏览器重启：ReAct 路径中 LLM 可能已通过 restart_browser 工具执行过，
+        # 此时 _browser_restarted 标记为 True，跳过重复重启
+        browser_restarted_in_react = decision.get("_browser_restarted", False)
+        if action == "restart_browser" and not browser_restarted_in_react:
+            if self.circuit_breaker.is_browser_tripped():
+                self._log(f"AutoRetryAgent: 浏览器熔断,标记finished - {file_name}")
+                self.db.update_retry_status(record_id, 'finished')
+                return
+            if self.upload_processor is not None and self.upload_processor.processing:
+                self._log(f"AutoRetryAgent: UploadProcessor 处理中,延迟 - {file_name}")
+                return
+
+            self._log(f"AutoRetryAgent: 重启浏览器 - {file_name}")
+            if self._do_restart_browser():
+                self._log("AutoRetryAgent: 浏览器重启成功")
+            else:
+                self._log("AutoRetryAgent: 浏览器重启失败，稍后重试")
+                self.db.update_retry_status(record_id, 'pending')
+                return
+
+        if action == "skip":
+            self._log(f"AutoRetryAgent: 跳过 - {file_name} ({decision.get('reason', '')})")
+            return
+
+        # ---- 后处理：退避等待 + 入队 ----
+        if action in ("enqueue", "restart_browser"):
+            backoff_idx = min(retry_count, len(self.backoff_seconds) - 1)
+            wait_seconds = self.backoff_seconds[backoff_idx]
+            if retry_count > 0:
+                self._log(f"AutoRetryAgent: 退避等待 {wait_seconds}s - {file_name} (第{retry_count+1}次重试)")
+                self.stop_event.wait(wait_seconds)
+                if self.stop_event.is_set():
+                    return
+
+            with self._in_retry_lock:
+                if file_path in self._in_retry:
+                    self._log(f"AutoRetryAgent: 文件已在重试队列中,跳过 - {file_name}")
+                    return
+                self._in_retry.add(file_path)
+
+            self.db.update_retry_status(record_id, 'processing')
+            self.db.increment_retry(record_id)
+
+            self._log(f"AutoRetryAgent: 入队重试 [{retry_level.value if retry_level else 'L1'}] - {file_name}")
+            if self.upload_processor is not None:
+                self.upload_processor.register_agent_retry(file_path, record_id, retry_level or RetryLevel.L1_LIGHT_RETRY)
+            self.task_queue.put(file_path)
+
+            if error_type:
+                self.circuit_breaker.record_error(error_type)
+
+    # ─── 共享工具方法 ───
+
+    def _do_restart_browser(self) -> bool:
+        """
+        执行浏览器重启流程（close → sleep → ensure_initialized），
+        供 tool_restart_browser 和 _process_one_record 共用。
+
+        Returns:
+            True=重启成功, False=重启失败
+        """
+        self.circuit_breaker.record_browser_restart()
+        if self.browser.is_initialized:
+            self.browser.close()
+            time.sleep(2)
+        if self.browser.ensure_initialized():
+            self.circuit_breaker.reset_browser_restart_count()
+            return True
+        return False
+
+    def _validate_react_decision(self, decision: Dict, record: Dict,
+                                 tripped_types: Set[str]) -> Optional[Dict]:
+        """
+        对 ReAct LLM 返回的决策进行硬安全门禁校验，
+        防止 LLM 绕过熔断/重试上限/L5 等保护。
+
+        所有门禁与 _rule_engine_decision 保持一致。
+
+        Returns:
+            校验后的决策（可能被覆写），返回 None 表示跳过该记录
+        """
+        record_id = record['id']
+        file_name = record.get('file_name', '')
+        retry_count = record.get('retry_count', 0)
+        fail_stage = record.get('fail_stage')
+        error_type = record.get('error_type')
+        action = decision.get("action", "")
+
+        # 获取该错误类型的自愈策略
+        strategy_level, strategy_max_retries = get_strategy(fail_stage, error_type)
+
+        # 门禁 1：全局最大重试次数
+        if retry_count >= self.config.max_retry_count:
+            self._log(f"AutoRetryAgent: 安全门禁-已达全局最大重试({self.config.max_retry_count}), "
+                      f"标记人工处理 - {file_name}")
+            self.db.update_retry_status(record_id, 'finished')
+            return None
+
+        # 门禁 2：每错误类型最大重试次数（L5 类型 max_retries=0，由门禁 4 处理）
+        if retry_count >= strategy_max_retries and strategy_level != RetryLevel.L5_MANUAL:
+            self._log(f"AutoRetryAgent: 安全门禁-已达该类型最大重试({strategy_max_retries}), "
+                      f"标记人工处理 - {file_name}({error_type})")
+            self.db.update_retry_status(record_id, 'finished')
+            return None
+
+        # 门禁 3：错误类型熔断
+        if error_type and error_type in tripped_types:
+            self._log(f"AutoRetryAgent: 安全门禁-{error_type}已熔断,跳过 - {file_name}")
+            return None
+
+        # 门禁 4：全量熔断（含 _global_tripped）
+        if self.circuit_breaker.is_tripped(error_type or 'unknown'):
+            self._log(f"AutoRetryAgent: 安全门禁-熔断保护,跳过 - {file_name}")
+            return None
+
+        # 门禁 5：L5 人工兜底 → 强制标记 finished
+        if strategy_level == RetryLevel.L5_MANUAL:
+            self._log(f"AutoRetryAgent: 安全门禁-策略为L5人工兜底,"
+                      f" 强制标记finished - {file_name} ({error_type})")
+            self.db.update_retry_status(record_id, 'finished')
+            return None
+
+        # 通过所有门禁
+        return decision
+
+    # ─── ReAct 循环 ───
+
+    REACT_SYSTEM_PROMPT = """你是一个作业上传系统的故障恢复 AI Agent。你拥有浏览器操作能力，可以直接观察页面状态、检查元素、甚至执行点击/输入操作来修复问题。
+
+## 可用工具
+
+### 诊断工具
+- check_file_exists: 检查文件是否还在磁盘上。参数: file_path=文件路径
+- query_error_history: 查询同类错误近期发生频率和熔断状态。参数: error_type=错误类型
+- check_circuit_breaker: 查看全局熔断/浏览器熔断/全量熔断状态。无参数
+- inspect_page: 读取浏览器当前页面的可见文本内容（前3000字符）。无参数
+- take_screenshot: 截取当前页面并保存为PNG文件。无参数
+- check_element: 检查指定元素是否存在/可见/可用/选中。参数: selector=选择器, selector_type=xpath或css(默认xpath)
+
+### 操作工具
+- browser_action: 在浏览器中执行操作。参数: action=click|type|select|scroll_down|refresh, selector=选择器, value=输入值(type时), selector_type=xpath或css
+- restart_browser: 重启浏览器并重新登录（L4级，受熔断保护）。无参数
+- enqueue_retry: 将文件加入重试队列。参数: file_path=文件路径, retry_level=L1|L2|L3
+- mark_manual_review: 标记为待人工处理。参数: reason=原因
+- skip_and_wait: 暂时跳过等待下次扫描。参数: reason=原因
+
+## 自愈策略
+
+- L1（轻量重试）：原地重试。适用于偶发超时、网络抖动。
+- L2（页面复位）：browser_action(refresh) → 重新进入上传流程。
+- L3（环境重置）：browser_action(refresh) → 重新校验学校。
+- L4（重启浏览器）：restart_browser
+
+## 工作流程
+
+1. 先诊断：读取错误信息 → 如果与页面相关，用 inspect_page 查看当前页面状态
+2. 定位问题：用 check_element 确认关键元素（表单字段、提交按钮等）是否存在
+3. 尝试修复：用 browser_action 执行点击/输入/刷新等操作
+4. 验证结果：再次 inspect_page 或 check_element 确认修复生效
+5. 做出最终决策：enqueue_retry（修复后重试）或 mark_manual_review（无法修复）
+
+## 输出格式
+
+Thought: [你的分析推理]
+Action: tool_name(key1=value1, key2=value2)
+
+任务完成时：
+Thought: [总结]
+Final: {"action": "enqueue"|"restart_browser"|"skip"|"manual", "retry_level": "L1"|"L2"|"L3"|"L4"|"L5", "reason": "..."}
+
+## 重要原则
+
+1. 能用浏览器工具修复的问题，先尝试修复再重试
+2. 页面卡住/弹窗遮挡 → inspect_page → 找到关闭按钮 → browser_action(click)
+3. 表单校验失败 → check_element 确认哪些字段有问题 → browser_action(type/select) 修正
+4. 页面加载异常 → browser_action(refresh) 或 restart_browser
+5. 工具返回 Error 时不要放弃，分析原因尝试替代方案
+6. file_path/file_name 等关键参数已通过上下文提供，不需要作为工具函数参数传递"""
+
+    def _run_react_loop(self, record: Dict, tripped_types: set) -> Optional[Dict]:
+        """
+        启动 ReAct 循环让 LLM 自主诊断和决策
+
+        Args:
+            record: 错误记录字典
+            tripped_types: 当前熔断类型集合
+
+        Returns:
+            {"action": str, "retry_level": RetryLevel, "reason": str} 或 None(失败)
+        """
+        # 提取记录字段，构建闭包捕获的变量
+        record_id = record['id']
+        file_path = record.get('file_path', '')
+        file_name = record.get('file_name', '')
+        error_type = record.get('error_type', '')
+        error_message = record.get('error_message', '')
+        retry_count = record.get('retry_count', 0)
+
+        # ── 构建工具（闭包捕获 self + 当前记录上下文）──
+
+        def tool_check_file_exists(file_path_arg=None):
+            path = file_path_arg or file_path
+            exists = os.path.exists(path)
+            return {"exists": exists, "path": path}
+
+        def tool_query_error_history(error_type_arg=None):
+            et = error_type_arg or error_type
+            recent = self.circuit_breaker.error_counts.get(et, 0)
+            tripped = self.circuit_breaker.is_tripped(et)
+            return {"error_type": et, "recent_count": recent, "is_tripped": tripped}
+
+        def tool_check_circuit_breaker():
+            return {
+                "tripped_types": list(self.circuit_breaker.get_tripped_types()),
+                "browser_tripped": self.circuit_breaker.is_browser_tripped(),
+                "global_tripped": self.circuit_breaker.global_tripped,
+                "browser_restart_count": self.circuit_breaker.browser_restart_count,
+            }
+
+        # mutable container: 用于标记 restart_browser 工具是否已执行过重启
+        _browser_restarted = [False]
+
+        def tool_restart_browser():
+            if self.circuit_breaker.is_browser_tripped():
+                return {"success": False, "error": "浏览器熔断保护：连续重启已达上限，拒绝操作"}
+            if self.upload_processor is not None and self.upload_processor.processing:
+                return {"success": False, "error": "UploadProcessor 正在处理中，无法重启浏览器"}
+
+            if self._do_restart_browser():
+                _browser_restarted[0] = True
+                return {"success": True, "message": "浏览器重启成功"}
+            else:
+                return {"success": False, "error": "浏览器重启失败"}
+
+        def tool_enqueue_retry(file_path_arg=None, retry_level="L1"):
+            # 安全守护：检查重试上限和熔断（软校验，硬门禁在 _validate_react_decision 中）
+            if retry_count >= self.config.max_retry_count:
+                return {"success": False, "error": f"已达全局最大重试次数({self.config.max_retry_count})，应转人工处理"}
+            if error_type and error_type in tripped_types:
+                return {"success": False, "error": f"错误类型 {error_type} 已熔断，应等待或转人工处理"}
+            path = file_path_arg or file_path
+            with self._in_retry_lock:
+                if path in self._in_retry:
+                    return {"success": False, "error": "文件已在重试队列中"}
+            return {"success": True, "message": f"准备以 {retry_level} 级别加入重试队列", "retry_level": retry_level}
+
+        def tool_mark_manual_review(reason=""):
+            self.db.update_retry_status(record_id, 'finished')
+            return {"success": True, "message": f"已标记人工处理: {reason}", "reason": reason}
+
+        def tool_skip_and_wait(reason=""):
+            return {"success": True, "message": f"已跳过: {reason}", "reason": reason}
+
+        # ── 浏览器交互工具 ──
+
+        def tool_inspect_page():
+            if not self.browser.is_initialized:
+                return {"success": False, "error": "浏览器未初始化，请先重启浏览器"}
+            return self.browser.get_page_text()
+
+        def tool_take_screenshot():
+            if not self.browser.is_initialized:
+                return {"success": False, "error": "浏览器未初始化"}
+            return self.browser.get_page_screenshot()
+
+        def tool_check_element(selector, selector_type="xpath"):
+            if not self.browser.is_initialized:
+                return {"success": False, "error": "浏览器未初始化"}
+            return self.browser.check_element(selector, selector_type)
+
+        def tool_browser_action(action, selector="", value="", selector_type="xpath"):
+            if not self.browser.is_initialized:
+                return {"success": False, "error": "浏览器未初始化，请先重启浏览器"}
+            return self.browser.execute_browser_action(action, selector, value, selector_type)
+
+        tools = {
+            "check_file_exists": tool_check_file_exists,
+            "query_error_history": tool_query_error_history,
+            "check_circuit_breaker": tool_check_circuit_breaker,
+            "inspect_page": tool_inspect_page,
+            "take_screenshot": tool_take_screenshot,
+            "check_element": tool_check_element,
+            "browser_action": tool_browser_action,
+            "restart_browser": tool_restart_browser,
+            "enqueue_retry": tool_enqueue_retry,
+            "mark_manual_review": tool_mark_manual_review,
+            "skip_and_wait": tool_skip_and_wait,
+        }
+
+        tool_descs = {
+            "check_file_exists": "检查文件是否还在磁盘上。参数: file_path=文件路径(可选)",
+            "query_error_history": "查询同类错误近期发生频率和熔断状态。参数: error_type=错误类型(可选)",
+            "check_circuit_breaker": "查看全局熔断/浏览器熔断/全量熔断状态列表。无参数",
+            "inspect_page": "读取浏览器当前页面的可见文本。用于观察页面状态、错误提示、弹窗内容。无参数",
+            "take_screenshot": "截取当前页面保存为PNG文件，返回文件路径供人工查看。无参数",
+            "check_element": "检查指定元素是否存在/可见/可用/选中。参数: selector=XPath或CSS选择器, selector_type=xpath或css(默认xpath)",
+            "browser_action": "在浏览器中执行操作。参数: action=click|type|select|scroll_down|refresh, selector=选择器, value=输入值(仅type需要), selector_type=xpath或css",
+            "restart_browser": "重启浏览器并重新登录(L4级)。受熔断保护。无参数",
+            "enqueue_retry": "将文件加入重试队列。参数: file_path=文件路径(可选), retry_level=L1|L2|L3",
+            "mark_manual_review": "标记为待人工处理。参数: reason=原因",
+            "skip_and_wait": "暂时跳过该记录。参数: reason=原因",
+        }
+
+        # 构建任务描述
+        task = f"""处理一条上传失败记录：
+
+- 文件名: {file_name}
+- 文件路径: {file_path}
+- 学校: {record.get('school', '')}
+- 年级: {record.get('grade', '')}
+- 科目: {record.get('subject', '')}
+- 失败阶段: {record.get('fail_stage', '未知')}
+- 错误类型: {error_type or '未知'}
+- 错误分类: {record.get('error_category', '未知')}
+- 错误信息: {error_message}
+- 当前重试次数: {retry_count}
+- 全局最大重试: {self.config.max_retry_count}
+
+请调用工具调查情况，然后做出恢复决策。"""
+
+        max_steps = self.config.get("AI_AGENT_MAX_STEPS", 10)
+        agent = ReActLoop(
+            llm=self.deepseek,
+            system_prompt=self.REACT_SYSTEM_PROMPT,
+            tools=tools,
+            tool_descriptions=tool_descs,
+            max_steps=max_steps,
+            log_fn=lambda msg: self._log(f"AutoRetryAgent ReAct: {msg}")
+        )
+
+        result = agent.run(task)
+        if result["success"] and result["result"]:
+            decision = result["result"]
+            action = decision.get("action", "skip")
+            level_str = decision.get("retry_level", "L1")
+            try:
+                retry_level = RetryLevel(level_str) if level_str else RetryLevel.L1_LIGHT_RETRY
+            except ValueError:
+                retry_level = RetryLevel.L1_LIGHT_RETRY
+
+            self._log(f"AutoRetryAgent: ReAct决策 [{action}] level={level_str} "
+                      f"(steps={result['steps']}, reason={decision.get('reason', '')})")
+            return {
+                "action": action,
+                "retry_level": retry_level,
+                "reason": decision.get("reason", ""),
+                "_browser_restarted": _browser_restarted[0],
+            }
+        else:
+            self._log(f"AutoRetryAgent: ReAct 失败(steps={result['steps']}), 回退规则引擎")
+            return None
+
+    # ─── 规则引擎兜底 ───
+
+    def _rule_engine_decision(self, record: Dict, tripped_types: Set[str]) -> Optional[Dict]:
+        """
+        传统规则引擎决策（AI 禁用或失败时的兜底）
+        保留原有的 get_strategy() + 全部安全检查逻辑
+        """
+        record_id = record['id']
+        file_name = record.get('file_name', '')
+        retry_count = record.get('retry_count', 0)
+        fail_stage = record.get('fail_stage')
+        error_type = record.get('error_type')
+
         retry_level, max_retries = get_strategy(fail_stage, error_type)
 
-        # ---- 检查重试次数上限 ----
+        # 检查重试次数上限
         if retry_count >= self.config.max_retry_count:
             self._log(f"AutoRetryAgent: 已达全局最大重试次数,标记人工处理 - {file_name}")
             self.db.update_retry_status(record_id, 'finished')
-            return
+            return None
 
         if retry_count >= max_retries and retry_level != RetryLevel.L5_MANUAL:
             self._log(f"AutoRetryAgent: 已达该错误类型最大重试次数,标记人工处理 - {file_name}({error_type})")
             self.db.update_retry_status(record_id, 'finished')
-            return
+            return None
 
-        # ---- 熔断检查 ----
+        # 熔断检查
         if error_type and error_type in tripped_types:
             self._log(f"AutoRetryAgent: {error_type} 已熔断,跳过 - {file_name}")
-            return
+            return None
 
         if self.circuit_breaker.is_tripped(error_type or 'unknown'):
             self._log(f"AutoRetryAgent: {error_type} 触发熔断,跳过 - {file_name}")
-            return
+            return None
 
-        # ---- L5 人工兜底 ----
+        # 决策映射
         if retry_level == RetryLevel.L5_MANUAL:
-            self._log(f"AutoRetryAgent: L5人工兜底,标记finished - {file_name} ({error_type})")
+            self._log(f"AutoRetryAgent: L5规则引擎决策,标记finished - {file_name}")
             self.db.update_retry_status(record_id, 'finished')
-            return
+            return None
 
-        # ---- L4 服务重启 ----
         if retry_level == RetryLevel.L4_SERVICE_RESTART:
             if self.circuit_breaker.is_browser_tripped():
-                self._log(f"AutoRetryAgent: 浏览器连续重启已达上限,跳过 - {file_name}")
+                self._log(f"AutoRetryAgent: 浏览器熔断,标记finished - {file_name}")
                 self.db.update_retry_status(record_id, 'finished')
-                return
-
-            # 检查 UploadProcessor 是否正在处理中，避免并发操作浏览器
+                return None
             if self.upload_processor is not None and self.upload_processor.processing:
-                self._log(f"AutoRetryAgent: UploadProcessor 处理中,延迟L4重启 - {file_name}")
-                return
+                self._log(f"AutoRetryAgent: UploadProcessor 处理中,延迟 - {file_name}")
+                return None
+            return {"action": "restart_browser", "retry_level": retry_level}
 
-            self._log(f"AutoRetryAgent: L4 重启浏览器 - {file_name}")
-            self.circuit_breaker.record_browser_restart()
-            if self.browser.is_initialized:
-                self.browser.close()
-                time.sleep(2)
-            if self.browser.ensure_initialized():
-                self.circuit_breaker.reset_browser_restart_count()
-                self._log("AutoRetryAgent: L4 浏览器重启成功")
-            else:
-                self._log("AutoRetryAgent: L4 浏览器重启失败，稍后重试")
-                self.db.update_retry_status(record_id, 'pending')
-                return
+        # L1/L2/L3
+        self._log(f"AutoRetryAgent: 规则引擎决策 [{retry_level.value}] - {file_name}")
+        return {"action": "enqueue", "retry_level": retry_level}
 
-        # ---- L3/L2/L1 ----
-        # L3 环境重置、L2 页面复位、L1 轻量重试均不在此处操作浏览器，
-        # 而是将 retry_level 传递给 UploadProcessor，由其在上传前单线程执行复位，
-        # 避免与正在进行的上传任务发生浏览器竞态。
-
-        # ---- 指数退避等待 ----
-        backoff_idx = min(retry_count, len(self.backoff_seconds) - 1)
-        wait_seconds = self.backoff_seconds[backoff_idx]
-        if retry_count > 0:
-            self._log(f"AutoRetryAgent: 退避等待 {wait_seconds}s - {file_name} (第{retry_count+1}次重试)")
-            self.stop_event.wait(wait_seconds)
-            if self.stop_event.is_set():
-                return
-
-        # ---- 防重复入队 ----
-        if file_path in self._in_retry:
-            self._log(f"AutoRetryAgent: 文件已在重试队列中,跳过 - {file_name}")
-            return
-        self._in_retry.add(file_path)
-
-        # ---- 更新数据库状态（入队前递增 retry_count，标记 processing）----
-        self.db.update_retry_status(record_id, 'processing')
-        self.db.increment_retry(record_id)
-
-        # ---- 入队重试 ----
-        self._log(f"AutoRetryAgent: 入队重试 [{retry_level.value}] - {file_name} (stage={fail_stage}, type={error_type})")
-        # 注册映射：让 UploadProcessor 知道这个文件是 Agent 触发的重试及对应的自愈级别
-        if self.upload_processor is not None:
-            self.upload_processor.register_agent_retry(file_path, record_id, retry_level)
-        self.task_queue.put(file_path)
-
-        # 记录错误用于熔断统计
-        if error_type:
-            self.circuit_breaker.record_error(error_type)
+    # ─── 上传结果回调 ───
 
     def on_upload_result(self, record_id: int, success: bool, file_path: str):
         """
@@ -378,7 +777,8 @@ class AutoRetryAgent:
             file_path: 文件路径
         """
         # 从重试集合中移除
-        self._in_retry.discard(file_path)
+        with self._in_retry_lock:
+            self._in_retry.discard(file_path)
 
         # 更新数据库
         self.db.set_agent_retry_success(record_id, success)

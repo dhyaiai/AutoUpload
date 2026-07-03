@@ -1362,6 +1362,121 @@ class BrowserAutomation:
         time.sleep(2)
         return self.initialize()
     
+    # ─── 页面检查工具（供 AI Agent ReAct 循环调用）───
+
+    def get_page_text(self) -> dict:
+        """
+        获取当前页面可见文本内容
+
+        Returns:
+            {"success": bool, "text": str} 或 {"success": False, "error": str}
+        """
+        try:
+            if not self.driver:
+                return {"success": False, "error": "浏览器未初始化"}
+            body = self.driver.find_element(By.TAG_NAME, "body")
+            text = body.text[:3000]
+            return {"success": True, "text": text, "length": len(text)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_page_screenshot(self) -> dict:
+        """
+        截取当前页面并保存到 screenshots/ 目录
+
+        Returns:
+            {"success": bool, "path": str} 或 {"success": False, "error": str}
+        """
+        try:
+            if not self.driver:
+                return {"success": False, "error": "浏览器未初始化"}
+            os.makedirs("screenshots", exist_ok=True)
+            from datetime import datetime as dt
+            filename = f"page_{dt.now().strftime('%Y%m%d_%H%M%S')}.png"
+            path = os.path.join("screenshots", filename)
+            self.driver.save_screenshot(path)
+            self._log(f"截图已保存: {path}")
+            return {"success": True, "path": os.path.abspath(path)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def check_element(self, selector: str, selector_type: str = "xpath") -> dict:
+        """
+        检查页面元素是否存在、可见、可用
+
+        Args:
+            selector: 元素选择器
+            selector_type: "xpath" 或 "css"
+
+        Returns:
+            {"exists": bool, "visible": bool, "enabled": bool, "text": str, "selected": bool}
+        """
+        try:
+            if not self.driver:
+                return {"exists": False, "visible": False, "error": "浏览器未初始化"}
+            by = By.XPATH if selector_type == "xpath" else By.CSS_SELECTOR
+            el = self.driver.find_element(by, selector)
+            result = {
+                "exists": True,
+                "visible": el.is_displayed(),
+                "enabled": el.is_enabled(),
+                "text": (el.text or "")[:200],
+            }
+            if el.tag_name in ("option", "input"):
+                result["selected"] = el.is_selected()
+            return result
+        except Exception as e:
+            return {"success": False, "exists": False, "visible": False,
+                    "enabled": False, "error": f"元素检查失败: {str(e)[:200]}"}
+
+    def execute_browser_action(self, action: str, selector: str = "",
+                               value: str = "", selector_type: str = "xpath") -> dict:
+        """
+        在浏览器中执行操作
+
+        Args:
+            action: "click" | "type" | "select" | "scroll_down" | "refresh"
+            selector: 目标元素选择器
+            value: 输入文本（action=type 时使用）
+            selector_type: "xpath" 或 "css"
+
+        Returns:
+            {"success": bool, "action": str}
+        """
+        try:
+            if not self.driver:
+                return {"success": False, "error": "浏览器未初始化"}
+
+            if action == "refresh":
+                self.driver.refresh()
+                return {"success": True, "action": "refresh"}
+
+            if action == "scroll_down":
+                self.driver.execute_script("window.scrollBy(0, 300)")
+                return {"success": True, "action": "scroll_down"}
+
+            if not selector:
+                return {"success": False, "error": "缺少 selector 参数"}
+
+            by = By.XPATH if selector_type == "xpath" else By.CSS_SELECTOR
+            el = self.driver.find_element(by, selector)
+
+            if action == "click":
+                el.click()
+            elif action == "type":
+                el.clear()
+                el.send_keys(value)
+            elif action == "select":
+                # 对 el-select 等 Vue 组件，用 JS click 触发
+                self.driver.execute_script("arguments[0].click();", el)
+            else:
+                return {"success": False, "error": f"未知操作: {action}"}
+
+            self._log(f"浏览器操作: {action} {selector[:60]}")
+            return {"success": True, "action": action}
+        except Exception as e:
+            return {"success": False, "error": str(e)[:300]}
+
     def close(self):
         """
         关闭浏览器,释放资源

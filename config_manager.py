@@ -72,6 +72,13 @@ class ConfigManager:
             "AUTO_RETRY_BACKOFF_SECONDS": [30, 120, 600],           # 指数退避间隔(秒)
             "AUTO_RETRY_CIRCUIT_BREAKER_THRESHOLD": 10,             # 熔断阈值(5分钟内同类错误次数)
             "AUTO_RETRY_CIRCUIT_BREAKER_DURATION": 1800,            # 熔断持续时间(秒，默认30分钟)
+
+            # AI Agent 配置
+            "AI_RETRY_AGENT_ENABLE": True,                           # 启用AI驱动的重试决策
+            "AI_ANALYSIS_AGENT_ENABLE": True,                        # 启用AI驱动的分析报告生成
+            "AI_AGENT_MAX_STEPS": 10,                                # ReAct循环最大步数
+            "QWEN_API_KEY": "",                                      # 通义千问 API Key
+            "QWEN_MODEL": "qwen3.7-plus",                           # 通义千问模型名
         }
 
         # 尝试加载配置文件
@@ -207,6 +214,26 @@ class ConfigManager:
     def auto_retry_circuit_breaker_duration(self) -> int:
         """熔断持续时间(秒)"""
         return self.get("AUTO_RETRY_CIRCUIT_BREAKER_DURATION", 1800)
+
+    @property
+    def ai_retry_agent_enable(self) -> bool:
+        """是否启用AI驱动的重试决策"""
+        return self.get("AI_RETRY_AGENT_ENABLE", True)
+
+    @property
+    def ai_analysis_agent_enable(self) -> bool:
+        """是否启用AI驱动的分析报告生成"""
+        return self.get("AI_ANALYSIS_AGENT_ENABLE", True)
+
+    @property
+    def qwen_api_key(self) -> str:
+        """通义千问 API Key"""
+        return self.get("QWEN_API_KEY", "")
+
+    @property
+    def qwen_model(self) -> str:
+        """通义千问模型名"""
+        return self.get("QWEN_MODEL", "qwen-plus")
 
     def reload(self):
         """

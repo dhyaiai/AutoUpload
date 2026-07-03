@@ -1,11 +1,11 @@
 """
-失败原因分析 Agent (FailureAnalysisAgent)
-功能: 按需/定时聚合失败数据,多维度归因分析,自动生成标准Markdown分析报告
+失败原因分析 Agent (FailureAnalysisAgent) — AI Agent 版
+功能: 按需触发,ReAct 循环驱动 LLM 自主探索数据、深度归因、生成 Markdown 分析报告
 特点:
-  - 支持手动触发 + 定时生成 + 阈值触发三种模式
-  - 多维度分析: 概览、错误分布、时间趋势、业务维度、重试效果
-  - 报告自动归档到 reports/ 目录
-  - 兼容历史无结构化字段的旧数据（关键词正则匹配兜底）
+  - 手动触发(点击按钮) → 启动一次 ReAct 分析会话
+  - LLM 自主决定分析路径: 发现异常→深挖→形成洞察→生成报告
+  - 数据采集全部通过工具调用,LLM 按需查询,避免不必要的数据收集
+  - 模板报告作为 AI 禁用/失败时的兜底
 """
 import os
 import re
@@ -16,6 +16,8 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
+from deepseek_helper import DeepSeekHelper
+from react_loop import ReActLoop
 from db_manager import DatabaseManager
 from config_manager import ConfigManager
 from error_types import (
@@ -38,6 +40,20 @@ class FailureAnalysisAgent:
         """
         self.db = DatabaseManager()
         self.config = ConfigManager()
+
+        # LLM 提供商：优先 Qwen，否则 DeepSeek
+        qwen_key = self.config.qwen_api_key
+        if qwen_key:
+            self.deepseek = DeepSeekHelper(
+                api_url="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+                api_key=qwen_key,
+                model=self.config.qwen_model
+            )
+            self._log(f"AnalysisAgent: 使用 Qwen/{self.config.qwen_model}")
+        else:
+            self.deepseek = DeepSeekHelper()
+            self._log("AnalysisAgent: 使用 DeepSeek")
+
         self.log_queue = log_queue
 
         # 报告输出目录
@@ -63,18 +79,17 @@ class FailureAnalysisAgent:
                         end_time: str,
                         report_type: str = "custom") -> Optional[str]:
         """
-        生成失败分析报告
+        生成失败分析报告（AI ReAct 优先，模板兜底）
 
         Args:
             start_time: 起始时间 'YYYY-MM-DD HH:MM:SS' 或 'YYYY-MM-DD'
             end_time: 截止时间 'YYYY-MM-DD HH:MM:SS' 或 'YYYY-MM-DD'
-            report_type: 报告类型 'daily' / 'weekly' / 'custom'
+            report_type: 'daily' / 'weekly' / 'custom'
 
         Returns:
             生成的报告文件路径, 失败返回 None
         """
         try:
-            # 标准化时间格式
             if ' ' not in start_time:
                 start_time = f"{start_time} 00:00:00"
             if ' ' not in end_time:
@@ -82,13 +97,19 @@ class FailureAnalysisAgent:
 
             self._log(f"开始生成失败分析报告 ({start_time} ~ {end_time})")
 
-            # 收集所有维度数据
-            report_data = self._collect_data(start_time, end_time)
+            # ── AI ReAct 分析 + 生成报告 ──
+            md_content = None
+            if self.config.ai_analysis_agent_enable and self.deepseek.api_key:
+                md_content = self._run_analysis_react_loop(start_time, end_time, report_type)
+                if md_content:
+                    self._log("AI Agent 分析报告生成成功")
 
-            # 生成 Markdown 内容
-            md_content = self._build_markdown(report_data, start_time, end_time, report_type)
+            # ── 兜底：模板生成 ──
+            if not md_content:
+                report_data = self._collect_data(start_time, end_time)
+                md_content = self._build_markdown(report_data, start_time, end_time, report_type)
+                self._log("使用模板生成分析报告（AI 未启用或失败）")
 
-            # 写入文件
             filepath = self._save_report(md_content, start_time, end_time, report_type)
             self._log(f"分析报告已生成: {filepath}")
             return filepath
@@ -101,22 +122,13 @@ class FailureAnalysisAgent:
     def generate_weekly_report(self) -> Optional[str]:
         """生成本周周报"""
         today = datetime.now()
-        # 本周一 00:00
         monday = today - timedelta(days=today.weekday())
         start_time = monday.strftime('%Y-%m-%d 00:00:00')
         end_time = today.strftime('%Y-%m-%d 23:59:59')
         return self.generate_report(start_time, end_time, 'weekly')
 
     def check_threshold_alert(self, threshold: float = 0.20) -> Optional[str]:
-        """
-        检查当日失败率是否超过阈值，超过则生成紧急报告
-
-        Args:
-            threshold: 失败率阈值（默认 20%）
-
-        Returns:
-            超过阈值时返回报告路径，否则返回 None
-        """
+        """检查当日失败率是否超过阈值"""
         today = datetime.now().strftime('%Y-%m-%d')
         start_time = f"{today} 00:00:00"
         end_time = f"{today} 23:59:59"
@@ -132,6 +144,228 @@ class FailureAnalysisAgent:
         if rate >= threshold:
             self._log(f"⚠ 当日失败率 {rate:.1%} 超过阈值 {threshold:.0%}，生成紧急报告")
             return self.generate_report(start_time, end_time, 'daily')
+        return None
+
+    # ─── AI Agent ReAct 分析 ───
+
+    REACT_ANALYSIS_SYSTEM_PROMPT = """你是一个作业上传系统的数据分析 AI Agent。你会收到一个统计周期，需要自主探索数据、发现模式、生成专业的 Markdown 分析报告。
+
+## 工作流程
+
+1. 先用 query_overview 了解全局
+2. 如果发现异常（如高失败率），用 query_error_distribution 查看错误分布
+3. 针对占比高的错误类型，用 drill_down_errors 深入分析具体案例
+4. 用 query_daily_trend 检查时间趋势，用 query_school_grade_stats 检查是否有特定学校/年级的问题
+5. 用 query_retry_effectiveness 评估自动重试的效果
+6. 收集到足够的洞察后，生成完整的 Markdown 报告，调用 save_report 保存
+
+## 报告要求
+
+报告必须包含以下六大部分：
+
+## 一、统计概览 — 总上传量、失败量、失败率、重试挽回数、待人工处理数
+## 二、错误类型分布 — 一级+二级分类表格，Top 3 深度分析
+## 三、分维度深度分析 — 3.1 时间趋势 3.2 学校年级分布 3.3 科目与文件格式
+## 四、根因分析与迭代建议 — 基于数据的具体根因和可落地建议（每条至少2条建议）
+## 五、待人工处理清单 — 表格形式
+## 六、附录 — 生成时间、数据来源、统计周期
+
+## 输出格式
+
+每轮输出：
+Thought: [分析推理]
+Action: tool_name(key1=value1)
+
+任务完成时：
+Thought: [总结]
+Final: {"status": "completed"}
+
+注意：
+- 先查询再得出结论，不要编造数据
+- 优化建议必须具体可执行，避免空话套话
+- Markdown 表格要对齐
+- 如果数据很少（无失败记录），生成简短的"无异常"报告即可"""
+
+    def _run_analysis_react_loop(self, start_time: str, end_time: str,
+                                  report_type: str) -> Optional[str]:
+        """
+        启动 ReAct 循环让 LLM 自主探索数据并生成报告
+
+        Returns:
+            生成的 Markdown 内容，失败返回 None
+        """
+        type_label = {'daily': '日报', 'weekly': '周报', 'custom': '自定义'}.get(report_type, '自定义')
+
+        # ── 构建工具（闭包捕获 self + start_time/end_time）──
+
+        def tool_query_overview():
+            stats = self.db.get_failed_stats_by_period(start_time, end_time)
+            total = stats['total_uploads']
+            failed = stats['total_failed']
+            rate = (failed / total * 100) if total > 0 else 0.0
+            return {
+                "total_uploads": total,
+                "total_failed": failed,
+                "failure_rate_pct": round(rate, 1),
+                "agent_recovered": stats['agent_recovered'],
+                "retry_success": stats['retry_success'],
+                "manual_pending": stats['manual_pending'],
+            }
+
+        def tool_query_error_distribution():
+            stats = self.db.get_failed_stats_by_period(start_time, end_time)
+            return {
+                "category_distribution": stats['category_distribution'],
+                "type_distribution": stats['type_distribution'][:10],
+            }
+
+        def tool_query_daily_trend():
+            trend = self.db.get_daily_failure_trend(start_time, end_time)
+            return [{
+                "date": d.get('date_label', ''),
+                "total": d['total'],
+                "failed": d['failed'],
+                "failure_rate_pct": round((d['failed'] / d['total'] * 100) if d['total'] > 0 else 0, 1)
+            } for d in trend[:30]]
+
+        def tool_query_school_grade_stats():
+            stats = self.db.get_failure_rate_by_school_grade(start_time, end_time)
+            result = []
+            for s in stats[:15]:
+                tot = s['total']
+                fail = s['failed']
+                result.append({
+                    "school": s.get('school', ''),
+                    "grade": s.get('grade', ''),
+                    "total": tot,
+                    "failed": fail,
+                    "failure_rate_pct": round((fail / tot * 100) if tot > 0 else 0, 1)
+                })
+            return result
+
+        def tool_query_subject_stats():
+            stats = self.db.get_failure_rate_by_subject(start_time, end_time)
+            result = []
+            for s in stats:
+                tot = s['total']
+                fail = s['failed']
+                result.append({
+                    "subject": s.get('subject', ''),
+                    "total": tot,
+                    "failed": fail,
+                    "failure_rate_pct": round((fail / tot * 100) if tot > 0 else 0, 1)
+                })
+            return result
+
+        def tool_query_retry_effectiveness():
+            stats = self.db.get_error_type_retry_stats(start_time, end_time)
+            return [{
+                "error_type": s.get('error_type', '未知'),
+                "total": s['total'],
+                "retry_success_count": s['retry_success_count'],
+                "avg_retry_count": round(s['avg_retry_count'], 1) if s['avg_retry_count'] else 0
+            } for s in stats[:10]]
+
+        def tool_drill_down_errors(error_type="", limit=10):
+            records = self.db.get_failed_records_by_period(start_time, end_time)
+            if error_type:
+                records = [r for r in records if r.get('error_type') == error_type]
+            records = records[:int(limit)]
+            return [{
+                "file_name": r.get('file_name', ''),
+                "school": r.get('school', ''),
+                "grade": r.get('grade', ''),
+                "subject": r.get('subject', ''),
+                "error_message": (r.get('error_message') or '')[:100],
+                "retry_count": r.get('retry_count', 0),
+                "upload_time": r.get('upload_time', ''),
+            } for r in records]
+
+        def tool_query_manual_pending(limit=20):
+            records = self.db.get_failed_records_by_period(start_time, end_time)
+            pending = [r for r in records
+                       if r.get('retry_status') == 'finished' and r.get('status') == 'failed']
+            pending = pending[:int(limit)]
+            return [{
+                "file_name": r.get('file_name', ''),
+                "school": r.get('school', ''),
+                "grade": r.get('grade', ''),
+                "subject": r.get('subject', ''),
+                "error_message": (r.get('error_message') or '')[:80],
+                "retry_count": r.get('retry_count', 0),
+            } for r in pending]
+
+        def tool_save_report(content=""):
+            """保存报告到文件"""
+            if not content or '#' not in content:
+                return {"success": False, "error": "报告内容为空或格式异常"}
+            filepath = self._save_report(content, start_time, end_time, report_type)
+            return {"success": True, "filepath": filepath}
+
+        tools = {
+            "query_overview": tool_query_overview,
+            "query_error_distribution": tool_query_error_distribution,
+            "query_daily_trend": tool_query_daily_trend,
+            "query_school_grade_stats": tool_query_school_grade_stats,
+            "query_subject_stats": tool_query_subject_stats,
+            "query_retry_effectiveness": tool_query_retry_effectiveness,
+            "drill_down_errors": tool_drill_down_errors,
+            "query_manual_pending": tool_query_manual_pending,
+            "save_report": tool_save_report,
+        }
+
+        tool_descs = {
+            "query_overview": "查询统计周期内的总体数据（总量、失败数、失败率、重试挽回数）。无参数",
+            "query_error_distribution": "查询错误一级分类和二级类型的分布。无参数",
+            "query_daily_trend": "查询按天的失败率趋势。无参数",
+            "query_school_grade_stats": "查询按学校+年级维度的失败率排行（Top 15）。无参数",
+            "query_subject_stats": "查询按科目维度的失败率。无参数",
+            "query_retry_effectiveness": "查询各错误类型的重试挽回效果。无参数",
+            "drill_down_errors": "深入查询某类错误的具体案例。参数: error_type=错误类型, limit=数量(默认10)",
+            "query_manual_pending": "查询待人工处理的记录清单。参数: limit=数量(默认20)",
+            "save_report": "保存最终 Markdown 报告到文件。参数: content=完整的Markdown报告内容",
+        }
+
+        task = f"""请分析 {type_label} 数据并生成报告。
+
+统计周期: {start_time} ~ {end_time}
+报告类型: {type_label}
+生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+请先用 query_overview 了解全局，然后根据数据特征自主决定需要深入查询哪些维度。
+收集到足够的洞察后，生成完整的 Markdown 报告并调用 save_report 保存。"""
+
+        max_steps = self.config.get("AI_AGENT_MAX_STEPS", 12)
+        agent = ReActLoop(
+            llm=self.deepseek,
+            system_prompt=self.REACT_ANALYSIS_SYSTEM_PROMPT,
+            tools=tools,
+            tool_descriptions=tool_descs,
+            max_steps=max_steps,
+            log_fn=lambda msg: self._log(f"AnalysisAgent ReAct: {msg}")
+        )
+
+        result = agent.run(task)
+        if result["success"]:
+            # 尝试从 save_report 的结果获取文件路径
+            self._log(f"AI 分析完成 (steps={result['steps']})")
+            # 检查 Final 或历史中是否有 save_report 的结果
+            for msg in reversed(result.get("history", [])):
+                content = msg.get("content", "")
+                if "save_report" in content and "filepath" in content:
+                    # 从 Observation 中提取路径
+                    match = re.search(r'"filepath":\s*"([^"]+)"', content)
+                    if match:
+                        saved_path = match.group(1)
+                        # 读取保存的报告内容
+                        try:
+                            with open(saved_path, 'r', encoding='utf-8') as f:
+                                return f.read()
+                        except Exception:
+                            pass
+            # save_report 未被调用 → 回退模板，不读取旧报告避免返回错误周期的数据
+
+        self._log(f"AI Agent 分析失败(steps={result['steps']}), 回退模板")
         return None
 
     # ─── 数据收集 ───
