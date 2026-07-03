@@ -151,7 +151,8 @@ class AutoRetryAgent:
 
         self.db = DatabaseManager()
         self.config = ConfigManager()
-        self.browser = BrowserAutomation(log_queue=log_queue)
+        # 复用全局浏览器单例（不传参避免覆盖已有实例的 log_queue）
+        self.browser = BrowserAutomation()
 
         # 从配置读取参数
         self.enabled = self.config.get("AUTO_RETRY_ENABLE", True)
@@ -313,6 +314,11 @@ class AutoRetryAgent:
                 self.db.update_retry_status(record_id, 'finished')
                 return
 
+            # 检查 UploadProcessor 是否正在处理中，避免并发操作浏览器
+            if self.upload_processor is not None and self.upload_processor.processing:
+                self._log(f"AutoRetryAgent: UploadProcessor 处理中,延迟L4重启 - {file_name}")
+                return
+
             self._log(f"AutoRetryAgent: L4 重启浏览器 - {file_name}")
             self.circuit_breaker.record_browser_restart()
             if self.browser.is_initialized:
@@ -326,24 +332,10 @@ class AutoRetryAgent:
                 self.db.update_retry_status(record_id, 'pending')
                 return
 
-        # ---- L3 环境重置 ----
-        if retry_level in (RetryLevel.L3_ENV_RESET,):
-            self._log(f"AutoRetryAgent: L3 环境重置 - {file_name}")
-            if not self.browser.reset_to_home():
-                self._log(f"AutoRetryAgent: L3 环境复位失败 - {file_name}")
-                self.db.update_retry_status(record_id, 'pending')
-                return
-
-        # ---- L2 页面复位 ----
-        if retry_level in (RetryLevel.L2_PAGE_RESET,):
-            self._log(f"AutoRetryAgent: L2 页面复位 - {file_name}")
-            if not self.browser.reset_to_home():
-                self._log(f"AutoRetryAgent: L2 页面复位失败 - {file_name}")
-                self.db.update_retry_status(record_id, 'pending')
-                return
-
-        # ---- L1 轻量重试 ----
-        # (L1 无特殊前置动作，直接重试)
+        # ---- L3/L2/L1 ----
+        # L3 环境重置、L2 页面复位、L1 轻量重试均不在此处操作浏览器，
+        # 而是将 retry_level 传递给 UploadProcessor，由其在上传前单线程执行复位，
+        # 避免与正在进行的上传任务发生浏览器竞态。
 
         # ---- 指数退避等待 ----
         backoff_idx = min(retry_count, len(self.backoff_seconds) - 1)
@@ -360,11 +352,15 @@ class AutoRetryAgent:
             return
         self._in_retry.add(file_path)
 
+        # ---- 更新数据库状态（入队前递增 retry_count，标记 processing）----
+        self.db.update_retry_status(record_id, 'processing')
+        self.db.increment_retry(record_id)
+
         # ---- 入队重试 ----
         self._log(f"AutoRetryAgent: 入队重试 [{retry_level.value}] - {file_name} (stage={fail_stage}, type={error_type})")
-        # 注册映射：让 UploadProcessor 知道这个文件是 Agent 触发的重试
+        # 注册映射：让 UploadProcessor 知道这个文件是 Agent 触发的重试及对应的自愈级别
         if self.upload_processor is not None:
-            self.upload_processor.register_agent_retry(file_path, record_id)
+            self.upload_processor.register_agent_retry(file_path, record_id, retry_level)
         self.task_queue.put(file_path)
 
         # 记录错误用于熔断统计
@@ -387,8 +383,11 @@ class AutoRetryAgent:
         # 更新数据库
         self.db.set_agent_retry_success(record_id, success)
         if success:
+            self.db.mark_record_success(record_id)
+            self.db.update_retry_status(record_id, 'finished')
             self._log(f"AutoRetryAgent: ✓ 自动重试成功 - {os.path.basename(file_path)}")
         else:
+            self.db.update_retry_status(record_id, 'pending')
             self._log(f"AutoRetryAgent: ✗ 自动重试失败 - {os.path.basename(file_path)}")
 
     def _log(self, message: str):

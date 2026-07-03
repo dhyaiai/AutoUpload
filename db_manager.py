@@ -5,7 +5,7 @@
 """
 import sqlite3
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 
 
@@ -679,10 +679,10 @@ class DatabaseManager:
             [{error_type, total, retry_success_count, avg_retry_count}, ...]
         """
         cursor = self._connection.cursor()
-        where = "WHERE status = 'failed' OR retry_count > 0"
         params = []
+        time_condition = ""
         if start_time and end_time:
-            where += " AND upload_time BETWEEN ? AND ?"
+            time_condition = " AND upload_time BETWEEN ? AND ?"
             params = [start_time, end_time]
 
         cursor.execute(f'''
@@ -690,7 +690,8 @@ class DatabaseManager:
                    COUNT(*) as total,
                    SUM(CASE WHEN status = 'success' AND retry_count > 0 THEN 1 ELSE 0 END) as retry_success_count,
                    AVG(retry_count) as avg_retry_count
-            FROM upload_records {where}
+            FROM upload_records
+            WHERE (status = 'failed' OR retry_count > 0){time_condition}
             GROUP BY error_type ORDER BY total DESC
         ''', params)
         return [dict(row) for row in cursor.fetchall()]
@@ -746,7 +747,7 @@ class DatabaseManager:
             失败次数
         """
         cursor = self._connection.cursor()
-        cutoff = (datetime.now() - __import__('datetime').timedelta(minutes=minutes)).strftime(
+        cutoff = (datetime.now() - timedelta(minutes=minutes)).strftime(
             '%Y-%m-%d %H:%M:%S')
         cursor.execute('''
             SELECT COUNT(*) FROM upload_records

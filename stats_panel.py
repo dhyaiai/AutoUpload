@@ -368,7 +368,7 @@ class StatsPanel:
 
         ax.set_xlabel("日期")
         ax.set_ylabel("上传数量")
-        ax.yaxis.set_major_locator(MultipleLocator(1))
+        ax.yaxis.set_major_locator(MultipleLocator(5))
         ax.set_title(f"作业上传趋势图 ({mode_title[self._line_mode]})")
 
         # 数值标注

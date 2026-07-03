@@ -1207,8 +1207,11 @@ class BrowserAutomation:
         """
         try:
             if not self.driver:
-                self._log("reset_to_home: 浏览器未启动，跳过复位")
-                return False
+                self._log("reset_to_home: 浏览器未启动，尝试重新初始化...")
+                if not self.ensure_initialized():
+                    self._log("reset_to_home: 浏览器重新初始化失败")
+                    return False
+                # 浏览器已恢复，继续执行复位流程
 
             self._log("开始环境复位...")
 

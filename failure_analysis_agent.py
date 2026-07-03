@@ -21,6 +21,7 @@ from config_manager import ConfigManager
 from error_types import (
     UploadStage, ErrorCategory, ErrorType,
     classify_error, ERROR_CLASSIFICATION_RULES,
+    ERROR_DESCRIPTIONS, ERROR_SUGGESTIONS,
 )
 
 
@@ -350,52 +351,13 @@ class FailureAnalysisAgent:
         type_dist = data['type_distribution']
         top_issues = type_dist[:2] if type_dist else []
 
-        issue_descriptions = {
-            'browser_start_fail': ('浏览器启动失败', 'Chrome驱动版本不匹配、系统资源不足或浏览器被安全软件拦截'),
-            'login_expired': ('登录态失效', '会话超时或Cookie过期，平台后端主动踢出登录'),
-            'element_timeout': ('元素操作超时', '页面加载慢、Vue渲染延迟或选择器未适配新版本页面'),
-            'page_load_timeout': ('页面加载超时', '网络不稳定或平台服务器响应慢'),
-            'school_switch_fail': ('学校切换失败', '页面DOM结构变化或学校列表接口异常'),
-            'school_not_found': ('学校不存在', '目标学校未在平台注册或名称不匹配'),
-            'upload_submit_timeout': ('上传提交超时', '文件过大、平台限流或表单校验未通过'),
-            'file_unreadable': ('文件无法读取', '文件损坏、加密或格式不兼容'),
-            'unsupported_format': ('文件格式不支持', '上传了平台不支持的文件类型'),
-            'api_timeout': ('AI API超时', 'DeepSeek服务繁忙或网络连接不稳定'),
-            'api_key_invalid': ('API密钥无效', '密钥过期或被吊销'),
-            'api_rate_limit': ('API频率限制', '请求过于频繁触发限流'),
-            'form_validate_fail': ('表单校验失败', '必填字段缺失或数据格式不符合平台要求'),
-            'subject_not_in_option': ('科目不在选项中', '平台科目列表变更或AI识别结果与平台不匹配'),
-            'permission_denied': ('权限不足', '当前账号无该学校/年级的上传权限'),
-            'network_error': ('网络错误', '网络连接不稳定、DNS解析失败或防火墙拦截'),
-            'database_error': ('数据库错误', 'SQLite文件损坏或磁盘空间不足'),
-        }
-        suggestions = {
-            'browser_start_fail': ['检查Chrome版本与ChromeDriver匹配性', '增加WebDriver自动更新机制', '添加系统资源预检（内存/磁盘）'],
-            'login_expired': ['延长登录态保持时间（定期心跳保活）', '增加登录态预检与自动续期'],
-            'element_timeout': ['增加选择器冗余（多套方案降级）', '延长等待超时阈值', '添加页面就绪状态检测'],
-            'page_load_timeout': ['增加网络质量预检', '添加请求重试机制'],
-            'school_switch_fail': ['检查学校列表接口是否有变更', '添加学校搜索的模糊匹配'],
-            'school_not_found': ['提供学校名称标准化映射表', '增加学校名称容错（去除空格/标点）'],
-            'upload_submit_timeout': ['优化大文件分片上传', '增加提交结果轮询间隔'],
-            'file_unreadable': ['添加文件完整性预检', '扩展更多文件格式支持'],
-            'unsupported_format': ['在文件监控阶段提前过滤不支持格式'],
-            'api_timeout': ['增加本地科目缓存（相同文件名/内容不重复请求AI）', '增加备用AI服务商'],
-            'api_key_invalid': ['添加API密钥有效性定期检查', '密钥过期时提前告警'],
-            'api_rate_limit': ['增加请求队列与频率控制', '本地缓存AI识别结果'],
-            'form_validate_fail': ['在提交前做本地表单数据预校验'],
-            'subject_not_in_option': ['建立AI识别科目 → 平台科目的映射表'],
-            'permission_denied': ['在文件监控阶段检查学校权限'],
-            'network_error': ['添加网络连通性预检', '增加离线队列功能'],
-            'database_error': ['添加数据库定期备份', '增加数据库完整性检查'],
-        }
-
         for i, issue in enumerate(top_issues, 1):
             etype = issue.get('error_type') or 'unknown'
             cnt = issue['cnt']
             pct = cnt / total_failed * 100
 
-            desc = issue_descriptions.get(etype, ('未知错误类型', '待进一步排查'))
-            sug = suggestions.get(etype, ['排查日志定位具体原因'])
+            desc = ERROR_DESCRIPTIONS.get(etype, ERROR_DESCRIPTIONS['unknown'])
+            sug = ERROR_SUGGESTIONS.get(etype, ERROR_SUGGESTIONS['unknown'])
 
             lines.append(f"### 4.{i} Top{i} 问题：{desc[0]}（占比 {pct:.1f}%）")
             lines.append("")

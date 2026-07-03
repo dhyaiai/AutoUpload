@@ -61,6 +61,9 @@ class ErrorType(str, Enum):
     NETWORK_ERROR = "network_error"
     DATABASE_ERROR = "database_error"
 
+    # 兜底
+    UNKNOWN = "unknown"
+
 
 class RetryLevel(str, Enum):
     """自愈策略级别"""
@@ -113,6 +116,9 @@ STRATEGY_MAP: Dict[Tuple[UploadStage, ErrorType], Tuple[RetryLevel, int]] = {
 
     # 全局网络错误（任意阶段）
     (None, ErrorType.NETWORK_ERROR): (RetryLevel.L1_LIGHT_RETRY, 3),
+
+    # 未知错误兜底（任意阶段/任意错误类型 → 人工处理）
+    (None, ErrorType.UNKNOWN): (RetryLevel.L5_MANUAL, 0),
 }
 
 
@@ -149,9 +155,12 @@ ERROR_CLASSIFICATION_RULES: List[tuple] = [
       "classify", "密钥", "key", "apikey"],
      ErrorCategory.AI_SERVICE_ERROR, ErrorType.API_TIMEOUT),
 
-    # 网络
-    (["网络", "network", "连接失败", "connection", "refused",
-      "DNS", "timeout", "超时"],
+    # 网络（避免使用 "timeout"/"超时" 以防与 ELEMENT_TIMEOUT 冲突）
+    (["网络错误", "网络超时", "网络异常", "网络故障", "网络不可达", "网络连接失败",
+      "network error", "network timeout", "network unreachable",
+      "connection refused", "connection reset", "connection timeout",
+      "DNS", "no internet", "ERR_", "无法访问", "连接超时",
+      "proxy", "代理", "connectivity"],
      ErrorCategory.SYSTEM_ENV_ERROR, ErrorType.NETWORK_ERROR),
 ]
 
@@ -169,7 +178,7 @@ def classify_error(error_message: str, fail_stage: Optional[str] = None) -> tupl
         (ErrorCategory, ErrorType) 元组
     """
     if not error_message:
-        return (ErrorCategory.UNKNOWN_ERROR, ErrorType.ELEMENT_TIMEOUT)
+        return (ErrorCategory.UNKNOWN_ERROR, ErrorType.UNKNOWN)
 
     msg_lower = error_message.lower()
 
@@ -178,7 +187,7 @@ def classify_error(error_message: str, fail_stage: Optional[str] = None) -> tupl
             if kw.lower() in msg_lower:
                 return (category, error_type)
 
-    return (ErrorCategory.UNKNOWN_ERROR, ErrorType.ELEMENT_TIMEOUT)
+    return (ErrorCategory.UNKNOWN_ERROR, ErrorType.UNKNOWN)
 
 
 def get_strategy(fail_stage: Optional[str], error_type: Optional[str]) -> Tuple[RetryLevel, int]:
@@ -211,3 +220,55 @@ def get_strategy(fail_stage: Optional[str], error_type: Optional[str]) -> Tuple[
 
     # 默认：人工兜底
     return (RetryLevel.L5_MANUAL, 0)
+
+
+# ─── 错误类型元数据（用于分析报告展示） ───
+
+ERROR_DESCRIPTIONS: Dict[str, Tuple[str, str]] = {
+    # (标题, 根因描述)
+    'browser_start_fail': ('浏览器启动失败', 'Chrome驱动版本不匹配、系统资源不足或浏览器被安全软件拦截'),
+    'login_expired': ('登录态失效', '会话超时或Cookie过期，平台后端主动踢出登录'),
+    'element_timeout': ('元素操作超时', '页面加载慢、Vue渲染延迟或选择器未适配新版本页面'),
+    'page_load_timeout': ('页面加载超时', '网络不稳定或平台服务器响应慢'),
+    'school_switch_fail': ('学校切换失败', '页面DOM结构变化或学校列表接口异常'),
+    'school_not_found': ('学校不存在', '目标学校未在平台注册或名称不匹配'),
+    'upload_submit_timeout': ('上传提交超时', '文件过大、平台限流或表单校验未通过'),
+    'file_not_exist': ('文件不存在', '文件已被删除、移动或路径变更'),
+    'file_unreadable': ('文件无法读取', '文件损坏、加密或格式不兼容'),
+    'file_corrupted': ('文件已损坏', '文件内容损坏无法解析，需重新获取源文件'),
+    'unsupported_format': ('文件格式不支持', '上传了平台不支持的文件类型'),
+    'api_timeout': ('AI API超时', 'DeepSeek服务繁忙或网络连接不稳定'),
+    'api_key_invalid': ('API密钥无效', '密钥过期或被吊销'),
+    'api_rate_limit': ('API频率限制', '请求过于频繁触发限流'),
+    'subject_empty': ('科目识别为空', 'AI未能从文件内容中识别出有效科目信息'),
+    'form_validate_fail': ('表单校验失败', '必填字段缺失或数据格式不符合平台要求'),
+    'subject_not_in_option': ('科目不在选项中', '平台科目列表变更或AI识别结果与平台不匹配'),
+    'permission_denied': ('权限不足', '当前账号无该学校/年级的上传权限'),
+    'network_error': ('网络错误', '网络连接不稳定、DNS解析失败或防火墙拦截'),
+    'database_error': ('数据库错误', 'SQLite文件损坏或磁盘空间不足'),
+    'unknown': ('未知错误类型', '待进一步排查'),
+}
+
+ERROR_SUGGESTIONS: Dict[str, List[str]] = {
+    'browser_start_fail': ['检查Chrome版本与ChromeDriver匹配性', '增加WebDriver自动更新机制', '添加系统资源预检（内存/磁盘）'],
+    'login_expired': ['延长登录态保持时间（定期心跳保活）', '增加登录态预检与自动续期'],
+    'element_timeout': ['增加选择器冗余（多套方案降级）', '延长等待超时阈值', '添加页面就绪状态检测'],
+    'page_load_timeout': ['增加网络质量预检', '添加请求重试机制'],
+    'school_switch_fail': ['检查学校列表接口是否有变更', '添加学校搜索的模糊匹配'],
+    'school_not_found': ['提供学校名称标准化映射表', '增加学校名称容错（去除空格/标点）'],
+    'upload_submit_timeout': ['优化大文件分片上传', '增加提交结果轮询间隔'],
+    'file_not_exist': ['检查文件路径是否变更', '确认源文件未被移动或重命名', '在文件监控阶段记录原始路径'],
+    'file_unreadable': ['添加文件完整性预检', '扩展更多文件格式支持'],
+    'file_corrupted': ['在文件监控阶段校验文件完整性', '要求重新提供原始文件'],
+    'unsupported_format': ['在文件监控阶段提前过滤不支持格式'],
+    'api_timeout': ['增加本地科目缓存（相同文件名/内容不重复请求AI）', '增加备用AI服务商'],
+    'api_key_invalid': ['添加API密钥有效性定期检查', '密钥过期时提前告警'],
+    'api_rate_limit': ['增加请求队列与频率控制', '本地缓存AI识别结果'],
+    'subject_empty': ['优化AI提示词提升识别率', '添加文件内容有效性预检（避免空壳文件）'],
+    'form_validate_fail': ['在提交前做本地表单数据预校验'],
+    'subject_not_in_option': ['建立AI识别科目 → 平台科目的映射表'],
+    'permission_denied': ['在文件监控阶段检查学校权限'],
+    'network_error': ['添加网络连通性预检', '增加离线队列功能'],
+    'database_error': ['添加数据库定期备份', '增加数据库完整性检查'],
+    'unknown': ['排查日志定位具体原因'],
+}
