@@ -282,7 +282,30 @@ class UploadProcessor:
             current_stage = UploadStage.SCHOOL_CHECK
             self._send_log(f"正在校验学校: {school}")
             if not self.browser.check_and_switch_school(school):
+                # 尝试从页面读取实际错误信息（如"账号在异地登录"等）
+                page_info = self.browser.get_page_text()
+                page_hint = ""
+                if page_info and page_info.get("success"):
+                    page_text = page_info.get("text", "")
+                    if "该校未开通数智作业服务" in page_text:
+                        error_msg = f"学校未开通数智作业服务: {school}"
+                        self._send_log(f"错误: {error_msg}")
+                        self._handle_failure(file_name, file_path, folder_name, school, grade, subject,
+                                             error_msg, current_stage,
+                                             ErrorCategory.PLATFORM_BIZ_ERROR, ErrorType.SCHOOL_NOT_ACTIVATED,
+                                             error_context, existing_record_id=agent_retry_record_id)
+                        return
+                    # 提取页面关键错误信息（toast/弹窗文本前100字）
+                    error_keywords = ["被迫下线", "异地登录", "登录失效", "重新登录",
+                                     "没有权限", "已过期", "账号异常"]
+                    for kw in error_keywords:
+                        if kw in page_text:
+                            idx = page_text.find(kw)
+                            page_hint = page_text[max(0, idx-20):idx+80].replace('\n', ' ')
+                            break
                 error_msg = f"学校校验/切换失败: {school}"
+                if page_hint:
+                    error_msg += f"（页面提示: {page_hint}）"
                 self._send_log(f"错误: {error_msg}")
                 self._handle_failure(file_name, file_path, folder_name, school, grade, subject,
                                      error_msg, current_stage,
@@ -334,12 +357,39 @@ class UploadProcessor:
         else:
             # 上传失败,记录失败信息
             current_stage = UploadStage.SUBMIT_UPLOAD
-            error_msg = "上传操作失败(详见浏览器日志)"
-            self._send_log(f"✗ 上传失败: {file_name} - {error_msg}")
-            self._handle_failure(file_name, file_path, folder_name, school, grade, subject,
-                                 error_msg, current_stage,
-                                 ErrorCategory.BROWSER_ERROR, ErrorType.UPLOAD_SUBMIT_TIMEOUT,
-                                 error_context, existing_record_id=agent_retry_record_id)
+            last_error = getattr(self.browser, 'last_upload_error', '')
+            if self._is_school_not_activated_error(last_error):
+                error_msg = f"学校未开通数智作业服务: {school}"
+                self._send_log(f"✗ 上传失败: {file_name} - {error_msg}")
+                self._handle_failure(file_name, file_path, folder_name, school, grade, subject,
+                                     error_msg, current_stage,
+                                     ErrorCategory.PLATFORM_BIZ_ERROR, ErrorType.SCHOOL_NOT_ACTIVATED,
+                                     error_context, existing_record_id=agent_retry_record_id)
+            elif last_error and last_error.strip():
+                # 优先使用浏览器捕获的网页实际错误信息，而非笼统提示
+                error_msg = self._clean_error_marker(last_error)
+                self._send_log(f"✗ 上传失败: {file_name} - 页面错误: {error_msg}")
+                self._handle_failure(file_name, file_path, folder_name, school, grade, subject,
+                                     error_msg, current_stage,
+                                     ErrorCategory.BROWSER_ERROR, ErrorType.UPLOAD_SUBMIT_TIMEOUT,
+                                     error_context, existing_record_id=agent_retry_record_id)
+            else:
+                error_msg = "上传操作失败(详见浏览器日志)"
+                self._send_log(f"✗ 上传失败: {file_name} - {error_msg}")
+                self._handle_failure(file_name, file_path, folder_name, school, grade, subject,
+                                     error_msg, current_stage,
+                                     ErrorCategory.BROWSER_ERROR, ErrorType.UPLOAD_SUBMIT_TIMEOUT,
+                                     error_context, existing_record_id=agent_retry_record_id)
+
+    @staticmethod
+    def _is_school_not_activated_error(error_text: str) -> bool:
+        """检查错误文本是否为'学校未开通数智作业服务'"""
+        return "[SCHOOL_NOT_ACTIVATED]" in error_text or "该校未开通数智作业服务" in error_text
+
+    @staticmethod
+    def _clean_error_marker(error_text: str) -> str:
+        """清理内部标记前缀（如 [SCHOOL_NOT_ACTIVATED]），对外展示用"""
+        return error_text.replace("[SCHOOL_NOT_ACTIVATED] ", "") if error_text else ""
 
     def _handle_failure(self, file_name: str, file_path: str, folder_name: str,
                        school: str, grade: str, subject: str, error_message: str,
@@ -491,13 +541,24 @@ class UploadProcessor:
         # 校验学校(每次上传前都实际检查网页上的学校)
         current_stage = UploadStage.SCHOOL_CHECK
         if not self.browser.check_and_switch_school(school):
-            error_msg = "学校校验/切换失败"
-            self.db.update_record_structured_error(
-                record_id, error_message=error_msg,
-                fail_stage=current_stage.value,
-                error_category=ErrorCategory.BROWSER_ERROR.value,
-                error_type=ErrorType.SCHOOL_SWITCH_FAIL.value)
-            self.db.update_retry_status(record_id, 'pending')
+            # 检查是否因学校未开通导致
+            page_info = self.browser.get_page_text()
+            if page_info and page_info.get("success") and "该校未开通数智作业服务" in str(page_info.get("text", "")):
+                error_msg = f"学校未开通数智作业服务: {school}"
+                self.db.update_record_structured_error(
+                    record_id, error_message=error_msg,
+                    fail_stage=current_stage.value,
+                    error_category=ErrorCategory.PLATFORM_BIZ_ERROR.value,
+                    error_type=ErrorType.SCHOOL_NOT_ACTIVATED.value)
+                self.db.update_retry_status(record_id, 'finished')
+            else:
+                error_msg = "学校校验/切换失败"
+                self.db.update_record_structured_error(
+                    record_id, error_message=error_msg,
+                    fail_stage=current_stage.value,
+                    error_category=ErrorCategory.BROWSER_ERROR.value,
+                    error_type=ErrorType.SCHOOL_SWITCH_FAIL.value)
+                self.db.update_retry_status(record_id, 'pending')
             self._send_log(f"错误: {error_msg}")
             self._send_log("REFRESH_FAILED_LIST")
             return
@@ -522,14 +583,25 @@ class UploadProcessor:
             )
             self._send_log(f"✓ 重新上传成功: {file_name}")
         else:
-            # 更新错误信息
-            error_msg = "重新上传失败"
-            self.db.update_record_structured_error(
-                record_id, error_message=error_msg,
-                fail_stage=current_stage.value,
-                error_category=ErrorCategory.BROWSER_ERROR.value,
-                error_type=ErrorType.UPLOAD_SUBMIT_TIMEOUT.value)
-            self.db.update_retry_status(record_id, 'pending')
+            # 更新错误信息，检查是否为学校未开通错误
+            last_error = getattr(self.browser, 'last_upload_error', '')
+            if self._is_school_not_activated_error(last_error):
+                error_msg = f"学校未开通数智作业服务: {school}"
+                self.db.update_record_structured_error(
+                    record_id, error_message=error_msg,
+                    fail_stage=current_stage.value,
+                    error_category=ErrorCategory.PLATFORM_BIZ_ERROR.value,
+                    error_type=ErrorType.SCHOOL_NOT_ACTIVATED.value)
+                self.db.update_retry_status(record_id, 'finished')
+            else:
+                # 优先使用网页实际错误信息
+                error_msg = self._clean_error_marker(last_error) if last_error and last_error.strip() else "重新上传失败"
+                self.db.update_record_structured_error(
+                    record_id, error_message=error_msg,
+                    fail_stage=current_stage.value,
+                    error_category=ErrorCategory.BROWSER_ERROR.value,
+                    error_type=ErrorType.UPLOAD_SUBMIT_TIMEOUT.value)
+                self.db.update_retry_status(record_id, 'pending')
             self._send_log(f"✗ 重新上传失败: {file_name} - {error_msg}")
 
         # 刷新失败列表

@@ -56,6 +56,7 @@ class ErrorType(str, Enum):
     FORM_VALIDATE_FAIL = "form_validate_fail"
     SUBJECT_NOT_OPTION = "subject_not_in_option"
     PERMISSION_DENIED = "permission_denied"
+    SCHOOL_NOT_ACTIVATED = "school_not_activated"  # 学校未开通数智作业服务
 
     # 系统环境类
     NETWORK_ERROR = "network_error"
@@ -108,11 +109,15 @@ STRATEGY_MAP: Dict[Tuple[UploadStage, ErrorType], Tuple[RetryLevel, int]] = {
     (UploadStage.FORM_FILL, ErrorType.SUBJECT_NOT_OPTION):    (RetryLevel.L5_MANUAL, 0),
     (UploadStage.FORM_FILL, ErrorType.FORM_VALIDATE_FAIL):    (RetryLevel.L2_PAGE_RESET, 1),
 
+    # SCHOOL_CHECK 阶段 — 学校未开通（平台业务错误，不能通过重试修复）
+    (UploadStage.SCHOOL_CHECK, ErrorType.SCHOOL_NOT_ACTIVATED): (RetryLevel.L5_MANUAL, 0),
+
     # SUBMIT_UPLOAD 阶段
     (UploadStage.SUBMIT_UPLOAD, ErrorType.LOGIN_EXPIRED):          (RetryLevel.L4_SERVICE_RESTART, 1),
     (UploadStage.SUBMIT_UPLOAD, ErrorType.UPLOAD_SUBMIT_TIMEOUT):  (RetryLevel.L2_PAGE_RESET, 2),
     (UploadStage.SUBMIT_UPLOAD, ErrorType.FORM_VALIDATE_FAIL):     (RetryLevel.L2_PAGE_RESET, 1),
     (UploadStage.SUBMIT_UPLOAD, ErrorType.PERMISSION_DENIED):      (RetryLevel.L5_MANUAL, 0),
+    (UploadStage.SUBMIT_UPLOAD, ErrorType.SCHOOL_NOT_ACTIVATED):   (RetryLevel.L5_MANUAL, 0),
 
     # 全局网络错误（任意阶段）
     (None, ErrorType.NETWORK_ERROR): (RetryLevel.L1_LIGHT_RETRY, 3),
@@ -142,6 +147,8 @@ ERROR_CLASSIFICATION_RULES: List[tuple] = [
      ErrorCategory.BROWSER_ERROR, ErrorType.SCHOOL_SWITCH_FAIL),
     (["学校不存在", "school not found", "未找到学校"],
      ErrorCategory.PLATFORM_BIZ_ERROR, ErrorType.SCHOOL_NOT_FOUND),
+    (["该校未开通", "数智作业服务", "未开通数智作业", "school not activated"],
+     ErrorCategory.PLATFORM_BIZ_ERROR, ErrorType.SCHOOL_NOT_ACTIVATED),
     (["上传", "upload", "提交", "submit", "确认"],
      ErrorCategory.BROWSER_ERROR, ErrorType.UPLOAD_SUBMIT_TIMEOUT),
 
@@ -244,6 +251,7 @@ ERROR_DESCRIPTIONS: Dict[str, Tuple[str, str]] = {
     'form_validate_fail': ('表单校验失败', '必填字段缺失或数据格式不符合平台要求'),
     'subject_not_in_option': ('科目不在选项中', '平台科目列表变更或AI识别结果与平台不匹配'),
     'permission_denied': ('权限不足', '当前账号无该学校/年级的上传权限'),
+    'school_not_activated': ('学校未开通服务', '目标学校未开通数智作业服务，需联系平台管理员开通'),
     'network_error': ('网络错误', '网络连接不稳定、DNS解析失败或防火墙拦截'),
     'database_error': ('数据库错误', 'SQLite文件损坏或磁盘空间不足'),
     'unknown': ('未知错误类型', '待进一步排查'),
@@ -268,6 +276,7 @@ ERROR_SUGGESTIONS: Dict[str, List[str]] = {
     'form_validate_fail': ['在提交前做本地表单数据预校验'],
     'subject_not_in_option': ['建立AI识别科目 → 平台科目的映射表'],
     'permission_denied': ['在文件监控阶段检查学校权限'],
+    'school_not_activated': ['联系平台管理员开通数智作业服务', '更换已开通服务的学校作为目标学校'],
     'network_error': ['添加网络连通性预检', '增加离线队列功能'],
     'database_error': ['添加数据库定期备份', '增加数据库完整性检查'],
     'unknown': ['排查日志定位具体原因'],

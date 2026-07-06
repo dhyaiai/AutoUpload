@@ -370,8 +370,21 @@ class AutoRetryAgent:
                 return
 
             self._log(f"AutoRetryAgent: 重启浏览器 - {file_name}")
-            if self._do_restart_browser():
+            restart_result = self._do_restart_browser(school=school)
+            if restart_result["success"]:
                 self._log("AutoRetryAgent: 浏览器重启成功")
+                if not restart_result.get("school_verified", True):
+                    # 学校验证失败 → 标记人工处理，避免上传到错误学校
+                    self._log(f"AutoRetryAgent: 重启后学校验证失败，标记人工处理 - {file_name}")
+                    self.db.update_record_structured_error(
+                        record_id,
+                        error_message=restart_result.get("error", "重启后学校验证失败"),
+                        fail_stage=UploadStage.SCHOOL_CHECK.value,
+                        error_category=ErrorCategory.PLATFORM_BIZ_ERROR.value,
+                        error_type=ErrorType.SCHOOL_NOT_ACTIVATED.value,
+                    )
+                    self.db.update_retry_status(record_id, 'finished')
+                    return
             else:
                 self._log("AutoRetryAgent: 浏览器重启失败，稍后重试")
                 self.db.update_retry_status(record_id, 'pending')
@@ -410,13 +423,22 @@ class AutoRetryAgent:
 
     # ─── 共享工具方法 ───
 
-    def _do_restart_browser(self) -> bool:
+    def _do_restart_browser(self, school: str = None) -> dict:
         """
         执行浏览器重启流程（close → sleep → ensure_initialized），
+        如果提供了学校参数，重启后验证当前学校是否匹配并自动切换。
+
         供 tool_restart_browser 和 _process_one_record 共用。
 
+        Args:
+            school: 目标学校名称。如果提供，重启后自动验证并切换学校。
+
         Returns:
-            True=重启成功, False=重启失败
+            {"success": bool, "school_verified": bool, "school": str, "error": str}
+            - success: 浏览器启动是否成功
+            - school_verified: 学校是否匹配（仅 school 参数不为空时有效，school为空时默认True）
+            - school: 当前页面学校名称
+            - error: 错误描述
         """
         self.circuit_breaker.record_browser_restart()
         if self.browser.is_initialized:
@@ -424,8 +446,46 @@ class AutoRetryAgent:
             time.sleep(2)
         if self.browser.ensure_initialized():
             self.circuit_breaker.reset_browser_restart_count()
-            return True
-        return False
+
+            # 学校验证（重启后给页面一点渲染稳定时间）
+            if school:
+                time.sleep(2)
+                # 先轻量读取当前学校
+                school_info = self.browser.get_current_school()
+                if school_info.get("success"):
+                    current = school_info.get("school", "")
+                    if current == school:
+                        self._log(f"[OK] 重启后学校验证通过: {current}")
+                        return {"success": True, "school_verified": True,
+                                "school": current, "error": ""}
+                    else:
+                        self._log(f"[WARN] 重启后学校不匹配: 目标={school}, 当前={current}，尝试切换...")
+                        # 学校不匹配 → 调用完整切换流程
+                        if self.browser.check_and_switch_school(school):
+                            self._log(f"[OK] 已切换到目标学校: {school}")
+                            return {"success": True, "school_verified": True,
+                                    "school": school, "error": ""}
+                        else:
+                            self._log(f"[FAIL] 学校切换失败: {school}")
+                            return {"success": True, "school_verified": False,
+                                    "school": current,
+                                    "error": f"学校切换失败: {school}"}
+                else:
+                    self._log(f"[WARN] 重启后无法读取学校: {school_info.get('error', '')}")
+                    # 读取失败也尝试切换
+                    if self.browser.check_and_switch_school(school):
+                        self._log(f"[OK] 已切换到目标学校: {school}")
+                        return {"success": True, "school_verified": True,
+                                "school": school, "error": ""}
+                    else:
+                        return {"success": True, "school_verified": False,
+                                "school": "",
+                                "error": school_info.get("error", "读取学校失败")}
+
+            return {"success": True, "school_verified": True, "school": "", "error": ""}
+
+        return {"success": False, "school_verified": False, "school": "",
+                "error": "浏览器重启失败"}
 
     def _validate_react_decision(self, decision: Dict, record: Dict,
                                  tripped_types: Set[str]) -> Optional[Dict]:
@@ -495,10 +555,11 @@ class AutoRetryAgent:
 - inspect_page: 读取浏览器当前页面的可见文本内容（前3000字符）。无参数
 - take_screenshot: 截取当前页面并保存为PNG文件。无参数
 - check_element: 检查指定元素是否存在/可见/可用/选中。参数: selector=选择器, selector_type=xpath或css(默认xpath)
+- check_current_school: 读取浏览器右上角教师姓名下拉框中显示的当前学校名称，返回当前学校、目标学校和匹配结果。无参数
 
 ### 操作工具
 - browser_action: 在浏览器中执行操作。参数: action=click|type|select|scroll_down|refresh, selector=选择器, value=输入值(type时), selector_type=xpath或css
-- restart_browser: 重启浏览器并重新登录（L4级，受熔断保护）。无参数
+- restart_browser: 重启浏览器并重新登录（L4级，受熔断保护）。重启后会自动验证学校，如不匹配会在warning中提示。无参数
 - enqueue_retry: 将文件加入重试队列。参数: file_path=文件路径, retry_level=L1|L2|L3
 - mark_manual_review: 标记为待人工处理。参数: reason=原因
 - skip_and_wait: 暂时跳过等待下次扫描。参数: reason=原因
@@ -516,7 +577,8 @@ class AutoRetryAgent:
 2. 定位问题：用 check_element 确认关键元素（表单字段、提交按钮等）是否存在
 3. 尝试修复：用 browser_action 执行点击/输入/刷新等操作
 4. 验证结果：再次 inspect_page 或 check_element 确认修复生效
-5. 做出最终决策：enqueue_retry（修复后重试）或 mark_manual_review（无法修复）
+5. **重要：重启浏览器(restart_browser)后，必须调用 check_current_school 验证学校是否匹配目标学校。学校不匹配会导致作业上传到错误学校！**
+6. 做出最终决策：enqueue_retry（修复后重试）或 mark_manual_review（无法修复）
 
 ## 输出格式
 
@@ -533,8 +595,9 @@ Final: {"action": "enqueue"|"restart_browser"|"skip"|"manual", "retry_level": "L
 2. 页面卡住/弹窗遮挡 → inspect_page → 找到关闭按钮 → browser_action(click)
 3. 表单校验失败 → check_element 确认哪些字段有问题 → browser_action(type/select) 修正
 4. 页面加载异常 → browser_action(refresh) 或 restart_browser
-5. 工具返回 Error 时不要放弃，分析原因尝试替代方案
-6. file_path/file_name 等关键参数已通过上下文提供，不需要作为工具函数参数传递"""
+5. 重启浏览器后务必用 check_current_school 验证学校，学校不对会导致上传到错误的学校
+6. 工具返回 Error 时不要放弃，分析原因尝试替代方案
+7. file_path/file_name 等关键参数已通过上下文提供，不需要作为工具函数参数传递"""
 
     def _run_react_loop(self, record: Dict, tripped_types: set) -> Optional[Dict]:
         """
@@ -585,11 +648,19 @@ Final: {"action": "enqueue"|"restart_browser"|"skip"|"manual", "retry_level": "L
             if self.upload_processor is not None and self.upload_processor.processing:
                 return {"success": False, "error": "UploadProcessor 正在处理中，无法重启浏览器"}
 
-            if self._do_restart_browser():
+            restart_result = self._do_restart_browser(school=school)
+            if restart_result["success"]:
                 _browser_restarted[0] = True
-                return {"success": True, "message": "浏览器重启成功"}
+                result = {"success": True, "message": "浏览器重启成功"}
+                if not restart_result.get("school_verified", True):
+                    result["warning"] = (
+                        f"重启后学校不匹配: 目标={school}, "
+                        f"当前={restart_result.get('school', '?')}。"
+                        f"请调用 check_current_school 查看详情。"
+                    )
+                return result
             else:
-                return {"success": False, "error": "浏览器重启失败"}
+                return {"success": False, "error": restart_result.get("error", "浏览器重启失败")}
 
         def tool_enqueue_retry(file_path_arg=None, retry_level="L1"):
             # 安全守护：检查重试上限和熔断（软校验，硬门禁在 _validate_react_decision 中）
@@ -632,6 +703,22 @@ Final: {"action": "enqueue"|"restart_browser"|"skip"|"manual", "retry_level": "L
                 return {"success": False, "error": "浏览器未初始化，请先重启浏览器"}
             return self.browser.execute_browser_action(action, selector, value, selector_type)
 
+        def tool_check_current_school():
+            """读取浏览器当前登录的学校名称，用于验证学校是否匹配目标"""
+            if not self.browser.is_initialized:
+                return {"success": False, "error": "浏览器未初始化，请先重启浏览器"}
+            result = self.browser.get_current_school()
+            if result.get("success"):
+                current = result.get("school", "")
+                return {
+                    "success": True,
+                    "current_school": current,
+                    "target_school": school,
+                    "match": (current == school),
+                    "message": f"当前学校: {current}, 目标学校: {school}"
+                }
+            return {"success": False, "error": result.get("error", "读取学校失败")}
+
         tools = {
             "check_file_exists": tool_check_file_exists,
             "query_error_history": tool_query_error_history,
@@ -639,6 +726,7 @@ Final: {"action": "enqueue"|"restart_browser"|"skip"|"manual", "retry_level": "L
             "inspect_page": tool_inspect_page,
             "take_screenshot": tool_take_screenshot,
             "check_element": tool_check_element,
+            "check_current_school": tool_check_current_school,
             "browser_action": tool_browser_action,
             "restart_browser": tool_restart_browser,
             "enqueue_retry": tool_enqueue_retry,
@@ -653,8 +741,9 @@ Final: {"action": "enqueue"|"restart_browser"|"skip"|"manual", "retry_level": "L
             "inspect_page": "读取浏览器当前页面的可见文本。用于观察页面状态、错误提示、弹窗内容。无参数",
             "take_screenshot": "截取当前页面保存为PNG文件，返回文件路径供人工查看。无参数",
             "check_element": "检查指定元素是否存在/可见/可用/选中。参数: selector=XPath或CSS选择器, selector_type=xpath或css(默认xpath)",
+            "check_current_school": "读取浏览器右上角教师下拉框显示的当前学校名称。返回当前学校、目标学校和匹配结果。无参数",
             "browser_action": "在浏览器中执行操作。参数: action=click|type|select|scroll_down|refresh, selector=选择器, value=输入值(仅type需要), selector_type=xpath或css",
-            "restart_browser": "重启浏览器并重新登录(L4级)。受熔断保护。无参数",
+            "restart_browser": "重启浏览器并重新登录(L4级)。重启后会自动验证学校匹配，如不匹配会在warning中提示。受熔断保护。无参数",
             "enqueue_retry": "将文件加入重试队列。参数: file_path=文件路径(可选), retry_level=L1|L2|L3",
             "mark_manual_review": "标记为待人工处理。参数: reason=原因",
             "skip_and_wait": "暂时跳过该记录。参数: reason=原因",

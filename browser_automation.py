@@ -37,6 +37,7 @@ class BrowserAutomation:
             cls._instance.driver = None
             cls._instance.is_logged_in = False
             cls._instance.last_active_time = time.time()
+            cls._instance.last_upload_error = ""  # 最近一次 upload_file 的 error_text
         # 每次调用都更新 log_queue（允许后续调用者注入有效的日志队列）
         if log_queue is not None:
             cls._instance.log_queue = log_queue
@@ -799,7 +800,98 @@ class BrowserAutomation:
             import traceback
             self._log(traceback.format_exc())
             return False
-    
+
+    def get_current_school(self) -> dict:
+        """
+        轻量级只读方法：读取右上角教师下拉框中显示的当前学校名称。
+        不触发学校切换，读完即关闭下拉框。
+
+        Returns:
+            {"success": True, "school": str} 或 {"success": False, "error": str}
+        """
+        try:
+            self.update_activity_time()
+
+            # 步骤1: 查找教师下拉触发元素（与 check_and_switch_school 共用选择器级联）
+            teacher_dropdown = None
+            dropdown_selectors = [
+                (By.CSS_SELECTOR, ".info-user > .el-dropdown > .el-dropdown-link"),
+                (By.CSS_SELECTOR, ".info-user .el-dropdown-link"),
+                (By.CSS_SELECTOR, ".el-dropdown-link"),
+                (By.XPATH, "//span[contains(@class, 'el-dropdown-link')]"),
+                (By.XPATH, "//*[contains(@class, 'info-user')]//*[contains(@class, 'el-dropdown-link')]"),
+            ]
+            for by, selector in dropdown_selectors:
+                try:
+                    teacher_dropdown = WebDriverWait(self.driver, 3).until(
+                        EC.element_to_be_clickable((by, selector))
+                    )
+                    break
+                except TimeoutException:
+                    continue
+
+            if not teacher_dropdown:
+                return {"success": False, "error": "未找到教师下拉触发元素，可能未登录"}
+
+            # 步骤2: 打开下拉菜单（优先使用 Vue API，与 check_and_switch_school 一致）
+            menu_selector = "li.el-dropdown-menu__item.info-dropdown-item.info-school"
+
+            def _dropdown_visible():
+                try:
+                    el = self.driver.find_element(By.CSS_SELECTOR, menu_selector)
+                    return el.is_displayed()
+                except Exception:
+                    return False
+
+            if not _dropdown_visible():
+                # 方案1: Vue 组件 API 展开
+                try:
+                    self.driver.execute_script("""
+                        var dropdown = document.querySelector('.info-user > .el-dropdown');
+                        if (dropdown && dropdown.__vue__) {
+                            if (dropdown.__vue__.show) {
+                                dropdown.__vue__.show();
+                            } else if (dropdown.__vue__.visible !== undefined) {
+                                dropdown.__vue__.visible = true;
+                            }
+                        }
+                    """)
+                    WebDriverWait(self.driver, 2).until(
+                        EC.visibility_of_element_located((By.CSS_SELECTOR, menu_selector))
+                    )
+                except Exception:
+                    pass
+
+            if not _dropdown_visible():
+                # 方案2: JS click 降级
+                try:
+                    self.driver.execute_script("arguments[0].click();", teacher_dropdown)
+                    WebDriverWait(self.driver, 2).until(
+                        EC.visibility_of_element_located((By.CSS_SELECTOR, menu_selector))
+                    )
+                except Exception:
+                    pass
+
+            if not _dropdown_visible():
+                return {"success": False, "error": "无法打开教师下拉菜单"}
+
+            # 步骤3: 读取学校名称
+            school_li = self.driver.find_element(By.CSS_SELECTOR, menu_selector)
+            current_school = school_li.text.strip()
+
+            # 步骤4: 关闭下拉菜单（点击 body 空白处）
+            try:
+                self.driver.find_element(By.TAG_NAME, "body").click()
+            except Exception:
+                pass
+
+            self._log(f"[get_current_school] 当前学校: {current_school}")
+            return {"success": True, "school": current_school}
+
+        except Exception as e:
+            self._log(f"[get_current_school] 异常: {e}")
+            return {"success": False, "error": str(e)[:200]}
+
     def _read_select_value(self, label_text: str) -> Optional[str]:
         """
         读取上传对话框表单中el-select组件当前选中的显示文本
@@ -879,6 +971,7 @@ class BrowserAutomation:
             无需在Windows文件选择对话框中手动导航。
         """
         try:
+            self.last_upload_error = ""  # 每次上传前重置错误记录
             self._log(f"开始上传: {os.path.basename(file_path)} (学校={school}, 年级={grade}, 科目={subject})")
 
             # 步骤1: 点击"上传作业"按钮
@@ -1131,6 +1224,7 @@ class BrowserAutomation:
                         if visible_errors:
                             error_text = "; ".join(e.text.strip() for e in visible_errors)
                             self._log(f"[FAIL] 表单校验错误: {error_text}")
+                            self.last_upload_error = error_text
                             result = False
                             break
                     except Exception:
@@ -1154,7 +1248,13 @@ class BrowserAutomation:
                         visible = [e for e in error_toasts if e.is_displayed() and e.text.strip()]
                         if visible:
                             error_text = "; ".join(e.text.strip() for e in visible)
-                            self._log(f"[FAIL] 检测到错误提示: {error_text}")
+                            # 标记特定错误类型，供 upload_processor 细分 ErrorType
+                            if "该校未开通数智作业服务" in error_text or "未开通数智作业" in error_text:
+                                error_text = "[SCHOOL_NOT_ACTIVATED] " + error_text
+                                self._log(f"[FAIL] 学校未开通数智作业服务: {error_text}")
+                            else:
+                                self._log(f"[FAIL] 检测到错误提示: {error_text}")
+                            self.last_upload_error = error_text
                             result = False
                             break
                     except Exception:
@@ -1176,19 +1276,23 @@ class BrowserAutomation:
                     err_text = " ".join(e.text.strip() for e in lingering if e.text.strip())
                     if err_text:
                         self._log(f"[FAIL] 上传失败: {err_text}")
+                        self.last_upload_error = err_text
                         return False
                 self._log("[OK] 文件上传成功")
                 return True
             elif result is False:
                 self._log(f"[FAIL] 文件上传失败: {error_text}")
+                self.last_upload_error = error_text
                 return False
             else:
                 # 超时：提交按钮始终可见 → 可能上传大文件耗时较长，或页面卡住
                 self._log(f"[FAIL] 上传超时({upload_timeout}秒)，提交按钮未消失")
+                self.last_upload_error = f"上传超时({upload_timeout}秒)"
                 return False
         
         except Exception as e:
             self._log(f"错误: 文件上传失败 - {e}")
+            self.last_upload_error = str(e)[:500]
             return False
     
     def reset_to_home(self) -> bool:
