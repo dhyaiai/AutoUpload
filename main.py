@@ -78,17 +78,28 @@ def backend_worker(stop_event: threading.Event, task_queue: Queue,
                 continue
 
             # 上传完成后队列为空且无正在处理的任务，主动关闭浏览器
+            # 但有 Agent 待重试记录时不关闭，避免后续重试时需重新初始化浏览器
             if task_queue.empty() and not upload_processor.processing and browser.is_idle_for(30):
-                log_queue.put("上传完成,队列为空,正在关闭浏览器...")
-                browser.close()
-                browser_error_logged = False
+                pending_retry = db.count_pending_retry_records()
+                if pending_retry > 0:
+                    log_queue.put(f"队列空闲但有{pending_retry}条待重试记录,保持浏览器运行")
+                    browser.update_activity_time()
+                else:
+                    log_queue.put("上传完成,队列为空,正在关闭浏览器...")
+                    browser.close()
+                    browser_error_logged = False
                 continue
 
             # 检查浏览器空闲超时（空闲且无正在处理的任务才关闭）
             if not upload_processor.processing and browser.is_idle_timeout():
-                log_queue.put("检测到浏览器空闲超时,正在关闭...")
-                browser.close()
-                browser_error_logged = False
+                pending_retry = db.count_pending_retry_records()
+                if pending_retry > 0:
+                    log_queue.put(f"浏览器空闲超时但有{pending_retry}条待重试记录,保持运行")
+                    browser.update_activity_time()
+                else:
+                    log_queue.put("检测到浏览器空闲超时,正在关闭...")
+                    browser.close()
+                    browser_error_logged = False
 
             # 检查浏览器是否仍然可用
             elif not browser.check_browser_status():
@@ -101,12 +112,21 @@ def backend_worker(stop_event: threading.Event, task_queue: Queue,
                         browser_error_logged = True
                 # 队列为空且无处理任务 → 不重启，清理状态避免重复检查
                 elif task_queue.empty():
-                    if not browser_error_logged:
-                        log_queue.put("浏览器已关闭,队列为空,不重启")
-                        browser_error_logged = True
-                    # 清理内部状态，避免下次循环重复检测已失效的浏览器
-                    browser.driver = None
-                    browser.is_logged_in = False
+                    pending_retry = db.count_pending_retry_records()
+                    if pending_retry > 0:
+                        # 有待重试记录，主动重启浏览器以便 Agent 后续重试
+                        if not browser_error_logged:
+                            log_queue.put(f"浏览器已关闭但有{pending_retry}条待重试记录,尝试重启...")
+                            browser_error_logged = True
+                        if browser.restart_browser():
+                            browser_error_logged = False
+                    else:
+                        if not browser_error_logged:
+                            log_queue.put("浏览器已关闭,队列为空,不重启")
+                            browser_error_logged = True
+                        # 清理内部状态，避免下次循环重复检测已失效的浏览器
+                        browser.driver = None
+                        browser.is_logged_in = False
                 # 队列中有待处理文件 → 重启
                 else:
                     if not browser_error_logged:

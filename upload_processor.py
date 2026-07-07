@@ -132,11 +132,18 @@ class UploadProcessor:
         """
         主运行循环
         持续从任务队列中取出文件并处理,直到收到停止信号
+        Agent 忙碌时暂停消费新任务，等待恢复完成
         """
         print("上传处理器已启动")
-        
+
         while not self.stop_event.is_set():
             try:
+                # Agent 正在执行恢复操作时等待，避免在环境未修复时处理新任务
+                if (self.auto_retry_agent is not None
+                        and self.auto_retry_agent.agent_busy.is_set()):
+                    time.sleep(0.5)
+                    continue
+
                 # 从队列中获取任务(超时1秒,以便检查停止信号)
                 file_path = self.task_queue.get(timeout=1)
                 
@@ -215,10 +222,13 @@ class UploadProcessor:
             self._send_log(f"警告: {error_msg}")
             # 继续处理,但科目标记为"未知"
 
-        # 步骤4: 识别科目(优先从文件名匹配,否则AI识别)
+        # 标记处理中，防止后端在任务处理期间误关浏览器
+        self.processing = True
+
+        # 步骤4: AI识别科目(优先从文件名正则,失败则用AI从文件内容识别)
         current_stage = UploadStage.AI_CLASSIFY
         self._send_log("正在识别科目...")
-        subject = self.classifier.classify(file_content, file_name=file_name) if file_content else self.classifier.extract_subject_from_filename(file_name)
+        subject = self.classifier.classify(file_content, file_name=file_name)
 
         if not subject:
             subject = "未知"
@@ -226,8 +236,6 @@ class UploadProcessor:
         else:
             self._send_log(f"识别结果: {subject}")
 
-        # 标记处理中，防止后端在任务处理期间误关浏览器
-        self.processing = True
         upload_success = False
 
         # Agent 重试预处理：在单线程内执行浏览器复位（L2/L3），避免与正常上传并发操作浏览器
@@ -446,17 +454,18 @@ class UploadProcessor:
                 error_context=json.dumps(error_context, ensure_ascii=False) if error_context else None
             )
 
-        # 同步写入分析表，确保失败记录在数据统计面板的失败记录表中可见
-        self.db.add_analysis_record(
-            file_name=file_name,
-            file_path=file_path,
-            folder_name=folder_name,
-            school=school,
-            grade=grade,
-            subject=subject,
-            status='failed',
-            error_message=error_message
-        )
+        # 同步写入分析表（首次失败才写入，重试时避免重复记录）
+        if not existing_record_id:
+            self.db.add_analysis_record(
+                file_name=file_name,
+                file_path=file_path,
+                folder_name=folder_name,
+                school=school,
+                grade=grade,
+                subject=subject,
+                status='failed',
+                error_message=error_message
+            )
 
         # 向GUI发送刷新失败列表的信号
         self._send_log("REFRESH_FAILED_LIST")
@@ -515,7 +524,7 @@ class UploadProcessor:
         file_content = self.info_extractor.read_file_content(file_path)
 
         current_stage = UploadStage.AI_CLASSIFY
-        subject = self.classifier.classify(file_content, file_name=file_name) if file_content else self.classifier.extract_subject_from_filename(file_name)
+        subject = self.classifier.classify(file_content, file_name=file_name)
 
         if not subject:
             subject = "未知"

@@ -480,6 +480,22 @@ class DatabaseManager:
         ''', (limit,))
         return [dict(row) for row in cursor.fetchall()]
 
+    def count_pending_retry_records(self) -> int:
+        """
+        统计待处理的失败记录数量（retry_status='pending'）
+        用于判断是否有 Agent 重试任务挂起，避免浏览器空闲关闭
+
+        Returns:
+            待处理失败记录数
+        """
+        cursor = self._connection.cursor()
+        cursor.execute('''
+            SELECT COUNT(*) FROM upload_records
+            WHERE status = 'failed' AND retry_status = 'pending'
+        ''')
+        row = cursor.fetchone()
+        return row[0] if row else 0
+
     def update_retry_status(self, record_id: int, status: str):
         """
         更新记录的重试处理状态

@@ -207,6 +207,9 @@ class AutoRetryAgent:
         self._in_retry: Set[str] = set()
         self._in_retry_lock = threading.Lock()  # 保护 _in_retry 的跨线程访问
 
+        # Agent 忙碌标志：Agent 正在执行恢复操作时阻塞 UploadProcessor 消费新任务
+        self.agent_busy = threading.Event()
+
         # UploadProcessor 引用（用于注册重试映射）
         self.upload_processor = None
 
@@ -260,20 +263,25 @@ class AutoRetryAgent:
         self._log(f"AutoRetryAgent: 扫描到 {len(records)} 条待处理失败记录"
                   + (f", 熔断中: {tripped_types}" if tripped_types else ""))
 
-        for record in records:
-            if self.stop_event.is_set():
-                break
+        # 标记 Agent 忙碌，阻塞 UploadProcessor 消费新任务
+        self.agent_busy.set()
+        try:
+            for record in records:
+                if self.stop_event.is_set():
+                    break
 
-            try:
-                self._process_one_record(record, tripped_types)
-            except Exception as e:
-                self._log(f"AutoRetryAgent: 处理记录 {record.get('id')} 异常 - {e}")
-                traceback.print_exc()
-                # 标记为 pending 避免卡住
                 try:
-                    self.db.update_retry_status(record['id'], 'pending')
-                except Exception:
-                    pass
+                    self._process_one_record(record, tripped_types)
+                except Exception as e:
+                    self._log(f"AutoRetryAgent: 处理记录 {record.get('id')} 异常 - {e}")
+                    traceback.print_exc()
+                    # 标记为 pending 避免卡住
+                    try:
+                        self.db.update_retry_status(record['id'], 'pending')
+                    except Exception:
+                        pass
+        finally:
+            self.agent_busy.clear()
 
     def _process_one_record(self, record: Dict, tripped_types: Set[str]):
         """
@@ -416,6 +424,9 @@ class AutoRetryAgent:
             self._log(f"AutoRetryAgent: 入队重试 [{retry_level.value if retry_level else 'L1'}] - {file_name}")
             if self.upload_processor is not None:
                 self.upload_processor.register_agent_retry(file_path, record_id, retry_level or RetryLevel.L1_LIGHT_RETRY)
+            # 刷新浏览器活跃时间，防止刚入队就被空闲超时关闭
+            if self.browser.driver:
+                self.browser.update_activity_time()
             self.task_queue.put(file_path)
 
             if error_type:
@@ -425,23 +436,71 @@ class AutoRetryAgent:
 
     def _do_restart_browser(self, school: str = None) -> dict:
         """
-        执行浏览器重启流程（close → sleep → ensure_initialized），
-        如果提供了学校参数，重启后验证当前学校是否匹配并自动切换。
+        智能浏览器恢复流程：
+        1. 先尝试轻量 recover_session()（登录页→重新登录，角色选择→选角色，弹窗→关闭）
+        2. 轻量恢复失败才执行完整浏览器重启（close → ensure_initialized → login）
+        3. 如果提供了学校参数，恢复后验证当前学校是否匹配并自动切换。
 
         供 tool_restart_browser 和 _process_one_record 共用。
 
         Args:
-            school: 目标学校名称。如果提供，重启后自动验证并切换学校。
+            school: 目标学校名称。如果提供，恢复后自动验证并切换学校。
 
         Returns:
-            {"success": bool, "school_verified": bool, "school": str, "error": str}
-            - success: 浏览器启动是否成功
-            - school_verified: 学校是否匹配（仅 school 参数不为空时有效，school为空时默认True）
+            {"success": bool, "school_verified": bool, "school": str, "error": str,
+             "recovery_method": str}
+            - success: 浏览器恢复是否成功
+            - school_verified: 学校是否匹配（仅 school 参数不为空时有效）
             - school: 当前页面学校名称
             - error: 错误描述
+            - recovery_method: "lightweight" | "full_restart" | "none"
         """
+        # ── 策略1: 轻量恢复（不重启浏览器）──
+        if self.browser.driver:
+            self._log("AutoRetryAgent: 尝试轻量会话恢复...")
+            try:
+                recover_result = self.browser.recover_session()
+                if recover_result.get("success"):
+                    self._log(f"AutoRetryAgent: 轻量恢复成功 "
+                              f"(action={recover_result.get('action_taken')})")
+
+                    # 恢复后验证学校
+                    if school:
+                        time.sleep(2)
+                        school_info = self.browser.get_current_school()
+                        if school_info.get("success"):
+                            current = school_info.get("school", "")
+                            if current == school:
+                                self._log(f"[OK] 轻量恢复后学校验证通过: {current}")
+                                return {"success": True, "school_verified": True,
+                                        "school": current, "error": "",
+                                        "recovery_method": "lightweight"}
+                            else:
+                                self._log(f"[WARN] 轻量恢复后学校不匹配: "
+                                          f"目标={school}, 当前={current}，尝试切换...")
+                                if self.browser.check_and_switch_school(school):
+                                    self._log(f"[OK] 已切换到目标学校: {school}")
+                                    return {"success": True, "school_verified": True,
+                                            "school": school, "error": "",
+                                            "recovery_method": "lightweight"}
+                                else:
+                                    self._log("[WARN] 轻量恢复后学校切换失败，回退完整重启...")
+                        else:
+                            self._log("[WARN] 轻量恢复后无法读取学校，回退完整重启...")
+                    else:
+                        return {"success": True, "school_verified": True,
+                                "school": "", "error": "",
+                                "recovery_method": "lightweight"}
+                else:
+                    self._log(f"AutoRetryAgent: 轻量恢复失败 "
+                              f"({recover_result.get('error', '')})，回退完整重启...")
+            except Exception as e:
+                self._log(f"AutoRetryAgent: 轻量恢复异常 ({e})，回退完整重启...")
+
+        # ── 策略2: 完整浏览器重启 ──
+        self._log("AutoRetryAgent: 执行完整浏览器重启...")
         self.circuit_breaker.record_browser_restart()
-        if self.browser.is_initialized:
+        if self.browser.driver:
             self.browser.close()
             time.sleep(2)
         if self.browser.ensure_initialized():
@@ -455,37 +514,43 @@ class AutoRetryAgent:
                 if school_info.get("success"):
                     current = school_info.get("school", "")
                     if current == school:
-                        self._log(f"[OK] 重启后学校验证通过: {current}")
+                        self._log(f"[OK] 完整重启后学校验证通过: {current}")
                         return {"success": True, "school_verified": True,
-                                "school": current, "error": ""}
+                                "school": current, "error": "",
+                                "recovery_method": "full_restart"}
                     else:
-                        self._log(f"[WARN] 重启后学校不匹配: 目标={school}, 当前={current}，尝试切换...")
-                        # 学校不匹配 → 调用完整切换流程
+                        self._log(f"[WARN] 完整重启后学校不匹配: 目标={school}, "
+                                  f"当前={current}，尝试切换...")
                         if self.browser.check_and_switch_school(school):
                             self._log(f"[OK] 已切换到目标学校: {school}")
                             return {"success": True, "school_verified": True,
-                                    "school": school, "error": ""}
+                                    "school": school, "error": "",
+                                    "recovery_method": "full_restart"}
                         else:
                             self._log(f"[FAIL] 学校切换失败: {school}")
                             return {"success": True, "school_verified": False,
                                     "school": current,
-                                    "error": f"学校切换失败: {school}"}
+                                    "error": f"学校切换失败: {school}",
+                                    "recovery_method": "full_restart"}
                 else:
-                    self._log(f"[WARN] 重启后无法读取学校: {school_info.get('error', '')}")
-                    # 读取失败也尝试切换
+                    self._log(f"[WARN] 完整重启后无法读取学校: "
+                              f"{school_info.get('error', '')}")
                     if self.browser.check_and_switch_school(school):
                         self._log(f"[OK] 已切换到目标学校: {school}")
                         return {"success": True, "school_verified": True,
-                                "school": school, "error": ""}
+                                "school": school, "error": "",
+                                "recovery_method": "full_restart"}
                     else:
                         return {"success": True, "school_verified": False,
                                 "school": "",
-                                "error": school_info.get("error", "读取学校失败")}
+                                "error": school_info.get("error", "读取学校失败"),
+                                "recovery_method": "full_restart"}
 
-            return {"success": True, "school_verified": True, "school": "", "error": ""}
+            return {"success": True, "school_verified": True, "school": "", "error": "",
+                    "recovery_method": "full_restart"}
 
         return {"success": False, "school_verified": False, "school": "",
-                "error": "浏览器重启失败"}
+                "error": "浏览器重启失败", "recovery_method": "none"}
 
     def _validate_react_decision(self, decision: Dict, record: Dict,
                                  tripped_types: Set[str]) -> Optional[Dict]:
@@ -556,10 +621,12 @@ class AutoRetryAgent:
 - take_screenshot: 截取当前页面并保存为PNG文件。无参数
 - check_element: 检查指定元素是否存在/可见/可用/选中。参数: selector=选择器, selector_type=xpath或css(默认xpath)
 - check_current_school: 读取浏览器右上角教师姓名下拉框中显示的当前学校名称，返回当前学校、目标学校和匹配结果。无参数
+- detect_page_state: 检测浏览器当前页面状态（登录页/角色选择/首页/错误/上传对话框/学校切换对话框/未知）。无参数
 
 ### 操作工具
+- recover_session: 智能会话恢复。自动检测页面状态并执行轻量恢复——登录页自动登录，角色选择自动选角色，弹窗自动关闭。不会重启浏览器。无参数
 - browser_action: 在浏览器中执行操作。参数: action=click|type|select|scroll_down|refresh, selector=选择器, value=输入值(type时), selector_type=xpath或css
-- restart_browser: 重启浏览器并重新登录（L4级，受熔断保护）。重启后会自动验证学校，如不匹配会在warning中提示。无参数
+- restart_browser: 重启浏览器并重新登录（L4级，最后手段，受熔断保护）。优先尝试 recover_session。无参数
 - enqueue_retry: 将文件加入重试队列。参数: file_path=文件路径, retry_level=L1|L2|L3
 - mark_manual_review: 标记为待人工处理。参数: reason=原因
 - skip_and_wait: 暂时跳过等待下次扫描。参数: reason=原因
@@ -569,16 +636,50 @@ class AutoRetryAgent:
 - L1（轻量重试）：原地重试。适用于偶发超时、网络抖动。
 - L2（页面复位）：browser_action(refresh) → 重新进入上传流程。
 - L3（环境重置）：browser_action(refresh) → 重新校验学校。
-- L4（重启浏览器）：restart_browser
+- L4（重启浏览器）：restart_browser（最后手段，先尝试 recover_session）
+
+## 页面状态自适应恢复流程（核心！）
+
+上传失败往往是因为页面状态发生了变化（会话过期→跳转登录页、角色过期→回到角色选择页等）。
+你必须按照以下优先级处理，从最轻量到最重量：
+
+### 第一步：检测页面状态
+上传失败时，首先调用 detect_page_state 判断当前页面：
+- state="login" → 被踢到登录页，调用 recover_session 自动登录
+- state="role_select" → 回到角色选择，调用 recover_session 自动选角色
+- state="error" → 页面有错误弹窗，调用 recover_session 尝试关闭
+- state="upload_dialog" / "school_dialog" → 有残留对话框，调用 recover_session 关闭
+- state="home" → 已登录在首页，检查学校是否正确
+- state="unknown" → 调用 inspect_page 读取页面文本进一步判断
+
+### 第二步：轻量恢复（recover_session）
+如果 detect_page_state 返回 login/role_select/error/upload_dialog/school_dialog：
+1. 调用 recover_session 执行自动恢复
+2. 恢复成功后，调用 check_current_school 验证学校
+3. 学校正确 → enqueue_retry 重新上传
+4. 学校不对 → 如果是首页，调用 browser_action 配合页面元素切换学校
+
+### 第三步：针对性手动修复
+如果 recover_session 不适用，根据具体情况：
+- 页面卡住/弹窗遮挡 → inspect_page → 找到关闭按钮CSS选择器 → browser_action(click)
+- 表单校验失败 → check_element 确认哪些字段 → browser_action(type/select) 修正
+- 被踢到登录页但自动登录失败 → inspect_page看原因 → 还是失败就 restart_browser
+
+### 第四步：最后手段（restart_browser）
+只有在以下情况才调用 restart_browser：
+- recover_session 失败
+- detect_page_state 返回 unknown 且 inspect_page 也无法判断
+- 浏览器明显崩溃/无响应
+- 页面进入了无法自动恢复的状态
+restart_browser 后必须调用 check_current_school 验证学校！
 
 ## 工作流程
 
-1. 先诊断：读取错误信息 → 如果与页面相关，用 inspect_page 查看当前页面状态
-2. 定位问题：用 check_element 确认关键元素（表单字段、提交按钮等）是否存在
-3. 尝试修复：用 browser_action 执行点击/输入/刷新等操作
-4. 验证结果：再次 inspect_page 或 check_element 确认修复生效
-5. **重要：重启浏览器(restart_browser)后，必须调用 check_current_school 验证学校是否匹配目标学校。学校不匹配会导致作业上传到错误学校！**
-6. 做出最终决策：enqueue_retry（修复后重试）或 mark_manual_review（无法修复）
+1. 先诊断：分析错误信息 → 调用 detect_page_state 检测页面状态
+2. 页面异常时优先轻量恢复：recover_session → 验证 → 重试
+3. 页面正常时针对性修复：inspect_page → check_element → browser_action
+4. 验证结果：检测修复是否生效
+5. 做出最终决策：enqueue_retry（恢复后重试）或 mark_manual_review（无法修复）
 
 ## 输出格式
 
@@ -591,13 +692,14 @@ Final: {"action": "enqueue"|"restart_browser"|"skip"|"manual", "retry_level": "L
 
 ## 重要原则
 
-1. 能用浏览器工具修复的问题，先尝试修复再重试
-2. 页面卡住/弹窗遮挡 → inspect_page → 找到关闭按钮 → browser_action(click)
-3. 表单校验失败 → check_element 确认哪些字段有问题 → browser_action(type/select) 修正
-4. 页面加载异常 → browser_action(refresh) 或 restart_browser
-5. 重启浏览器后务必用 check_current_school 验证学校，学校不对会导致上传到错误的学校
-6. 工具返回 Error 时不要放弃，分析原因尝试替代方案
-7. file_path/file_name 等关键参数已通过上下文提供，不需要作为工具函数参数传递"""
+1. 上传失败先检测页面状态(detect_page_state)，再决定恢复策略
+2. 优先使用 recover_session 轻量恢复，避免不必要的浏览器重启
+3. recover_session 失败后再用 restart_browser 作为最后手段
+4. 页面卡住/弹窗遮挡 → inspect_page → 找到关闭按钮 → browser_action(click)
+5. 表单校验失败 → check_element 确认哪些字段 → browser_action(type/select) 修正
+6. 重启浏览器后务必用 check_current_school 验证学校，学校不对会导致上传到错误的学校
+7. 工具返回 Error 时不要放弃，分析原因尝试替代方案
+8. file_path/file_name 等关键参数已通过上下文提供，不需要作为工具函数参数传递"""
 
     def _run_react_loop(self, record: Dict, tripped_types: set) -> Optional[Dict]:
         """
@@ -683,30 +785,45 @@ Final: {"action": "enqueue"|"restart_browser"|"skip"|"manual", "retry_level": "L
 
         # ── 浏览器交互工具 ──
 
+        def _browser_busy():
+            """检查 UploadProcessor 是否正在使用浏览器，防止并发操作"""
+            return (self.upload_processor is not None
+                    and self.upload_processor.processing)
+
         def tool_inspect_page():
             if not self.browser.is_initialized:
                 return {"success": False, "error": "浏览器未初始化，请先重启浏览器"}
+            if _browser_busy():
+                return {"success": False, "error": "UploadProcessor 正在上传中，浏览器被占用"}
             return self.browser.get_page_text()
 
         def tool_take_screenshot():
             if not self.browser.is_initialized:
                 return {"success": False, "error": "浏览器未初始化"}
+            if _browser_busy():
+                return {"success": False, "error": "UploadProcessor 正在上传中，浏览器被占用"}
             return self.browser.get_page_screenshot()
 
         def tool_check_element(selector, selector_type="xpath"):
             if not self.browser.is_initialized:
                 return {"success": False, "error": "浏览器未初始化"}
+            if _browser_busy():
+                return {"success": False, "error": "UploadProcessor 正在上传中，浏览器被占用"}
             return self.browser.check_element(selector, selector_type)
 
         def tool_browser_action(action, selector="", value="", selector_type="xpath"):
             if not self.browser.is_initialized:
                 return {"success": False, "error": "浏览器未初始化，请先重启浏览器"}
+            if _browser_busy():
+                return {"success": False, "error": "UploadProcessor 正在上传中，浏览器被占用"}
             return self.browser.execute_browser_action(action, selector, value, selector_type)
 
         def tool_check_current_school():
             """读取浏览器当前登录的学校名称，用于验证学校是否匹配目标"""
             if not self.browser.is_initialized:
                 return {"success": False, "error": "浏览器未初始化，请先重启浏览器"}
+            if _browser_busy():
+                return {"success": False, "error": "UploadProcessor 正在上传中，浏览器被占用"}
             result = self.browser.get_current_school()
             if result.get("success"):
                 current = result.get("school", "")
@@ -719,6 +836,32 @@ Final: {"action": "enqueue"|"restart_browser"|"skip"|"manual", "retry_level": "L
                 }
             return {"success": False, "error": result.get("error", "读取学校失败")}
 
+        def tool_detect_page_state():
+            """检测浏览器当前页面状态（登录页/角色选择/首页/错误页等）"""
+            if not self.browser.driver:
+                return {"success": False, "state": "no_browser",
+                        "details": "浏览器未启动"}
+            if _browser_busy():
+                return {"success": False, "state": "busy",
+                        "details": "UploadProcessor 正在上传中，浏览器被占用"}
+            return self.browser.detect_page_state()
+
+        def tool_recover_session():
+            """
+            智能会话恢复：检测页面状态并自动执行轻量恢复。
+            登录页→自动登录，角色选择→自动选角色，弹窗→自动关闭。
+            如果轻量恢复失败，调用方应使用 restart_browser 进行完整重启。
+            """
+            if not self.browser.driver:
+                return {"success": False, "state_before": "no_browser",
+                        "action_taken": "none",
+                        "error": "浏览器未启动，请先调用 restart_browser"}
+            if _browser_busy():
+                return {"success": False, "state_before": "busy",
+                        "action_taken": "none",
+                        "error": "UploadProcessor 正在上传中，浏览器被占用"}
+            return self.browser.recover_session()
+
         tools = {
             "check_file_exists": tool_check_file_exists,
             "query_error_history": tool_query_error_history,
@@ -727,6 +870,8 @@ Final: {"action": "enqueue"|"restart_browser"|"skip"|"manual", "retry_level": "L
             "take_screenshot": tool_take_screenshot,
             "check_element": tool_check_element,
             "check_current_school": tool_check_current_school,
+            "detect_page_state": tool_detect_page_state,
+            "recover_session": tool_recover_session,
             "browser_action": tool_browser_action,
             "restart_browser": tool_restart_browser,
             "enqueue_retry": tool_enqueue_retry,
@@ -742,8 +887,10 @@ Final: {"action": "enqueue"|"restart_browser"|"skip"|"manual", "retry_level": "L
             "take_screenshot": "截取当前页面保存为PNG文件，返回文件路径供人工查看。无参数",
             "check_element": "检查指定元素是否存在/可见/可用/选中。参数: selector=XPath或CSS选择器, selector_type=xpath或css(默认xpath)",
             "check_current_school": "读取浏览器右上角教师下拉框显示的当前学校名称。返回当前学校、目标学校和匹配结果。无参数",
+            "detect_page_state": "检测浏览器当前页面状态，返回state(login/role_select/home/error/upload_dialog/school_dialog/unknown)和详情。无参数",
+            "recover_session": "智能会话恢复：自动检测页面状态并执行轻量恢复(登录页→重新登录, 角色选择→选角色, 弹窗→关闭)。失败时不会重启浏览器，由调用方按需调用restart_browser。无参数",
             "browser_action": "在浏览器中执行操作。参数: action=click|type|select|scroll_down|refresh, selector=选择器, value=输入值(仅type需要), selector_type=xpath或css",
-            "restart_browser": "重启浏览器并重新登录(L4级)。重启后会自动验证学校匹配，如不匹配会在warning中提示。受熔断保护。无参数",
+            "restart_browser": "重启浏览器并重新登录(L4级，最后手段)。重启后会自动验证学校匹配。优先尝试recover_session轻量恢复。受熔断保护。无参数",
             "enqueue_retry": "将文件加入重试队列。参数: file_path=文件路径(可选), retry_level=L1|L2|L3",
             "mark_manual_review": "标记为待人工处理。参数: reason=原因",
             "skip_and_wait": "暂时跳过该记录。参数: reason=原因",

@@ -183,14 +183,26 @@ class BrowserAutomation:
             # 查找账号输入框(通过placeholder定位)
             username_input = self.driver.find_element(By.CSS_SELECTOR, "input[placeholder='请输入您的账户']")
             username_input.clear()
-            username_input.send_keys(self.config.username)
+            # 用 JS 直接设值 + dispatch input 事件，绕过 send_keys 逐字符开销
+            # Element UI 的 v-model 监听 input 事件，手动 dispatch 即可触发响应
+            self.driver.execute_script("""
+                var el = arguments[0];
+                el.value = arguments[1];
+                el.dispatchEvent(new InputEvent('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+            """, username_input, self.config.username)
             time.sleep(self.config.sleep_interval)
             self._log("已输入账号")
-            
+
             # 查找密码输入框(通过placeholder定位)
             password_input = self.driver.find_element(By.CSS_SELECTOR, "input[placeholder='请输入您的密码']")
             password_input.clear()
-            password_input.send_keys(self.config.password)
+            self.driver.execute_script("""
+                var el = arguments[0];
+                el.value = arguments[1];
+                el.dispatchEvent(new InputEvent('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+            """, password_input, self.config.password)
             time.sleep(self.config.sleep_interval)
             self._log("已输入密码")
             
@@ -229,7 +241,7 @@ class BrowserAutomation:
                 # 方法1: 检查URL是否跳转到主页
                 current_url = self.driver.current_url
                 if "login" not in current_url.lower():
-                    print(f"登录成功,当前URL: {current_url}")
+                    self._log(f"登录成功,当前URL: {current_url}")
                     return True
                 
                 # 方法2: 检查是否有用户信息或主页元素
@@ -246,7 +258,7 @@ class BrowserAutomation:
                     for locator_type, locator_value in user_elements:
                         try:
                             self.driver.find_element(locator_type, locator_value)
-                            print("检测到用户信息元素,登录成功")
+                            self._log("检测到用户信息元素,登录成功")
                             return True
                         except NoSuchElementException:
                             continue
@@ -270,19 +282,19 @@ class BrowserAutomation:
                         continue
                 
                 if not has_error:
-                    print("未检测到错误信息,假设登录成功")
+                    self._log("未检测到错误信息,假设登录成功")
                     return True
                 else:
-                    print("警告: 检测到错误信息,登录可能失败")
+                    self._log("警告: 检测到错误信息,登录可能失败")
                     return False
-                    
+
             except Exception as e:
-                print(f"警告: 登录验证异常 - {e}")
+                self._log(f"警告: 登录验证异常 - {e}")
                 # 即使验证失败,也假设登录成功(避免误判)
                 return True
-        
+
         except Exception as e:
-            print(f"错误: 登录过程异常 - {e}")
+            self._log(f"错误: 登录过程异常 - {e}")
             import traceback
             traceback.print_exc()
             return False
@@ -302,17 +314,17 @@ class BrowserAutomation:
             
             # 如果页面包含"选择角色",说明需要选择角色
             if "选择角色" in page_source:
-                print("检测到角色选择界面")
+                self._log("检测到角色选择界面")
                 time.sleep(1)
-                
+
                 # 获取配置的角色,默认为"teacher"
                 role = self.config.get("ROLE", "teacher")
-                print(f"配置的角色: {role}")
-                
+                self._log(f"配置的角色: {role}")
+
                 # 根据角色点击对应的卡片
                 if role == "admin" or role == "administrator" or role == "超级管理员":
                     # 选择超级管理员
-                    print("正在选择: 超级管理员")
+                    self._log("正在选择: 超级管理员")
                     try:
                         # 方法1: 通过ID直接定位(最可靠)
                         admin_card = self.driver.find_element(By.ID, "changeRole_0")
@@ -331,10 +343,10 @@ class BrowserAutomation:
                             )
                     
                     admin_card.click()
-                    print("已选择超级管理员角色")
+                    self._log("已选择超级管理员角色")
                 else:
                     # 选择老师
-                    print("正在选择: 老师")
+                    self._log("正在选择: 老师")
                     try:
                         # 方法1: 通过ID定位(第二个role-item通常是老师)
                         teacher_card = self.driver.find_element(By.ID, "changeRole_1")
@@ -353,10 +365,10 @@ class BrowserAutomation:
                             )
                     
                     teacher_card.click()
-                    print("已选择老师角色")
-                
+                    self._log("已选择老师角色")
+
                 time.sleep(self.config.sleep_interval)
-                
+
                 # 点击确定按钮
                 try:
                     # 方法1: 通过ID直接定位(最可靠)
@@ -376,22 +388,22 @@ class BrowserAutomation:
                         )
                 
                 confirm_btn.click()
-                print("已点击确定按钮")
-                
+                self._log("已点击确定按钮")
+
                 # 等待角色切换完成
                 time.sleep(5)
-                
+
                 return True
             else:
                 # 没有角色选择界面,直接返回成功
-                print("未检测到角色选择界面,跳过")
+                self._log("未检测到角色选择界面,跳过")
                 return True
-        
+
         except NoSuchElementException as e:
-            print(f"警告: 未找到角色选择元素 - {e}")
+            self._log(f"警告: 未找到角色选择元素 - {e}")
             return False
         except Exception as e:
-            print(f"错误: 角色选择过程异常 - {e}")
+            self._log(f"错误: 角色选择过程异常 - {e}")
             import traceback
             traceback.print_exc()
             return False
@@ -570,7 +582,7 @@ class BrowserAutomation:
             self._log(f"当前学校: {current_school}")
 
             # 3. 判断是否一致
-            if current_school == target_school or target_school in current_school or current_school in target_school:
+            if current_school == target_school:
                 self._log("[OK] 学校一致，无需切换")
                 # 关闭下拉菜单
                 self.driver.find_element(By.TAG_NAME, "body").click()
@@ -784,11 +796,13 @@ class BrowserAutomation:
                     return False
             except Exception as e:
                 self._log(f"警告: 验证学校切换时出错 - {e}")
-                # 连接断开类异常说明浏览器已不可用，不能假设成功
+                # 连接断开类异常说明浏览器已不可用
                 if any(kw in str(e).lower() for kw in ('connection', 'disconnected', 'timeout', 'closed')):
                     self.is_logged_in = False
                     return False
-                return True  # 其他非关键异常（如元素查找失败）假设切换成功
+                # 非关键异常（如元素查找失败）也视为切换未验证成功
+                self._log(f"学校切换验证失败，无法确认当前学校: {e}")
+                return False
         
         except NoSuchElementException as e:
             self._log(f"错误: 未找到学校切换相关元素 - {e}")
@@ -891,6 +905,262 @@ class BrowserAutomation:
         except Exception as e:
             self._log(f"[get_current_school] 异常: {e}")
             return {"success": False, "error": str(e)[:200]}
+
+    def detect_page_state(self) -> dict:
+        """
+        检测浏览器当前所在的页面状态，用于 Agent 智能决策恢复策略。
+
+        通过分析页面 URL 和关键元素来判断当前处于哪个页面。
+
+        Returns:
+            {"success": True, "state": str, "details": str}
+            state 取值:
+              - "login"       : 登录页面
+              - "role_select" : 角色选择页面
+              - "home"        : 平台首页（已登录）
+              - "upload_dialog": 上传对话框已打开
+              - "school_dialog": 学校切换对话框已打开
+              - "error"       : 页面显示错误信息
+              - "unknown"     : 无法判断
+        """
+        try:
+            if not self.driver:
+                return {"success": False, "state": "unknown",
+                        "details": "浏览器未启动"}
+
+            current_url = self.driver.current_url
+
+            # 1. 检测登录页面
+            if "login" in current_url.lower():
+                return {"success": True, "state": "login",
+                        "details": "当前在登录页面，URL包含login"}
+
+            # 通过页面元素判断
+            page_source = self.driver.page_source
+
+            # 2. 检测登录表单（即使URL不含login，也可能被踢到登录页）
+            try:
+                login_inputs = self.driver.find_elements(
+                    By.CSS_SELECTOR, "input[placeholder='请输入您的账户']"
+                )
+                if login_inputs and any(el.is_displayed() for el in login_inputs):
+                    return {"success": True, "state": "login",
+                            "details": "检测到登录表单（账号输入框可见）"}
+            except Exception:
+                pass
+
+            # 3. 检测角色选择页面
+            if "选择角色" in page_source:
+                return {"success": True, "state": "role_select",
+                        "details": "检测到角色选择界面"}
+
+            # 4. 检测上传对话框
+            try:
+                upload_dialog = self.driver.find_elements(
+                    By.CSS_SELECTOR, ".el-dialog__wrapper:not([style*='display: none'])"
+                )
+                if upload_dialog:
+                    dialog_text = " ".join(
+                        el.text[:200] for el in upload_dialog if el.is_displayed()
+                    )
+                    if "上传" in dialog_text or "作业" in dialog_text:
+                        return {"success": True, "state": "upload_dialog",
+                                "details": f"上传对话框已打开: {dialog_text[:100]}"}
+            except Exception:
+                pass
+
+            # 5. 检测学校切换对话框
+            if "切换学校" in page_source:
+                try:
+                    school_dialog = self.driver.find_elements(
+                        By.CSS_SELECTOR, ".el-dialog__body"
+                    )
+                    for d in school_dialog:
+                        if d.is_displayed() and "学校" in d.text:
+                            return {"success": True, "state": "school_dialog",
+                                    "details": "学校切换对话框已打开"}
+                except Exception:
+                    pass
+
+            # 6. 检测错误提示
+            try:
+                error_elements = self.driver.find_elements(
+                    By.CSS_SELECTOR,
+                    ".el-message--error, .el-notification--error, .el-alert--error"
+                )
+                visible_errors = [e for e in error_elements
+                                  if e.is_displayed() and e.text.strip()]
+                if visible_errors:
+                    error_text = "; ".join(e.text.strip()[:100] for e in visible_errors)
+                    return {"success": True, "state": "error",
+                            "details": f"页面显示错误: {error_text}"}
+            except Exception:
+                pass
+
+            # 7. 检测首页（已登录状态）
+            if "index" in current_url or "jobManager" in current_url or "home" in current_url:
+                return {"success": True, "state": "home",
+                        "details": f"已登录，URL: {current_url}"}
+
+            # 8. 尝试通过用户信息元素判断
+            try:
+                user_indicators = self.driver.find_elements(
+                    By.CSS_SELECTOR, ".info-user, .el-dropdown-link, .user-info"
+                )
+                if user_indicators and any(el.is_displayed() for el in user_indicators):
+                    return {"success": True, "state": "home",
+                            "details": "检测到用户信息元素，已登录"}
+            except Exception:
+                pass
+
+            return {"success": True, "state": "unknown",
+                    "details": f"无法判断页面状态, URL: {current_url}"}
+
+        except Exception as e:
+            return {"success": False, "state": "unknown",
+                    "details": f"检测异常: {str(e)[:200]}"}
+
+    def recover_session(self) -> dict:
+        """
+        智能会话恢复：检测当前页面状态并执行对应的恢复操作。
+        优先使用轻量恢复（登录/角色选择），失败才回退到浏览器重启。
+
+        恢复策略:
+          - 登录页面 → 重新登录
+          - 角色选择页面 → 重新选择角色
+          - 首页但登录失效 → 导航回首页后重试
+          - 其他 → 返回失败，由调用方决定是否重启浏览器
+
+        Returns:
+            {"success": bool, "state_before": str, "action_taken": str, "error": str}
+        """
+        MAX_ITERATIONS = 5  # 防止无限循环
+
+        try:
+            if not self.driver:
+                return {"success": False, "state_before": "no_driver",
+                        "action_taken": "none", "error": "浏览器未启动"}
+
+            iteration = 0
+            while iteration < MAX_ITERATIONS:
+                iteration += 1
+
+                # 先检测当前页面状态（不提前刷新，避免破坏对话框等可恢复状态）
+                page_state = self.detect_page_state()
+                state = page_state.get("state", "unknown")
+                self._log(f"[recover_session] 检测到页面状态: {state} (第{iteration}次)")
+
+                if not page_state.get("success"):
+                    return {"success": False, "state_before": state,
+                            "action_taken": "none",
+                            "error": page_state.get("details", "页面状态检测失败")}
+
+                # ── 按状态执行恢复 ──
+
+                if state == "login":
+                    self._log("[recover_session] 检测到登录页面，执行自动登录...")
+                    try:
+                        if self._login():
+                            self._log("[recover_session] 自动登录成功")
+                            return {"success": True, "state_before": "login",
+                                    "action_taken": "auto_login", "error": ""}
+                        else:
+                            self._log("[recover_session] 自动登录失败")
+                            return {"success": False, "state_before": "login",
+                                    "action_taken": "auto_login_failed",
+                                    "error": "自动登录失败，账号密码可能不正确"}
+                    except Exception as e:
+                        return {"success": False, "state_before": "login",
+                                "action_taken": "auto_login_error",
+                                "error": f"登录过程异常: {str(e)[:200]}"}
+
+                elif state == "role_select":
+                    self._log("[recover_session] 检测到角色选择页面，执行自动选择...")
+                    try:
+                        if self._handle_role_selection():
+                            self._log("[recover_session] 角色选择完成")
+                            time.sleep(3)
+                            return {"success": True, "state_before": "role_select",
+                                    "action_taken": "auto_role_select", "error": ""}
+                        else:
+                            self._log("[recover_session] 角色选择失败")
+                            return {"success": False, "state_before": "role_select",
+                                    "action_taken": "role_select_failed",
+                                    "error": "角色选择失败"}
+                    except Exception as e:
+                        return {"success": False, "state_before": "role_select",
+                                "action_taken": "role_select_error",
+                                "error": f"角色选择异常: {str(e)[:200]}"}
+
+                elif state in ("upload_dialog", "school_dialog"):
+                    # 有对话框打开，尝试关闭
+                    self._log(f"[recover_session] 检测到{state}，尝试关闭对话框...")
+                    try:
+                        close_btns = self.driver.find_elements(
+                            By.CSS_SELECTOR,
+                            ".el-dialog__close, .el-dialog__headerbtn, .el-icon-close"
+                        )
+                        for btn in close_btns:
+                            try:
+                                if btn.is_displayed():
+                                    btn.click()
+                                    time.sleep(1)
+                            except Exception:
+                                pass
+                        # 也尝试ESC
+                        webdriver.ActionChains(self.driver).send_keys(Keys.ESCAPE).perform()
+                        time.sleep(1)
+                        return {"success": True, "state_before": state,
+                                "action_taken": "close_dialog", "error": ""}
+                    except Exception:
+                        pass
+                    return {"success": True, "state_before": state,
+                            "action_taken": "close_dialog_attempted", "error": ""}
+
+                elif state == "home":
+                    self._log("[recover_session] 已在首页，无需恢复")
+                    return {"success": True, "state_before": "home",
+                            "action_taken": "none", "error": ""}
+
+                elif state == "error":
+                    # 页面有错误提示，尝试关闭弹窗并刷新
+                    self._log("[recover_session] 检测到错误提示，尝试关闭弹窗刷新...")
+                    try:
+                        webdriver.ActionChains(self.driver).send_keys(Keys.ESCAPE).perform()
+                        time.sleep(1)
+                        self.driver.refresh()
+                        time.sleep(2)
+                        # 刷新后继续循环重新检测
+                        continue
+                    except Exception:
+                        pass
+                    return {"success": False, "state_before": "error",
+                            "action_taken": "close_error_dialog_failed",
+                            "error": page_state.get("details", "页面错误无法自动恢复")}
+
+                else:  # unknown
+                    self._log("[recover_session] 未知页面状态，尝试刷新后重新检测...")
+                    try:
+                        self.driver.refresh()
+                        time.sleep(2)
+                        # 刷新后继续循环重新检测
+                        continue
+                    except Exception:
+                        pass
+                    return {"success": False, "state_before": "unknown",
+                            "action_taken": "refresh",
+                            "error": "未知页面状态，刷新后仍无法识别"}
+
+            # 超过最大迭代次数
+            return {"success": False, "state_before": "unknown",
+                    "action_taken": "max_iterations_exceeded",
+                    "error": f"恢复尝试超过{MAX_ITERATIONS}次，状态仍未稳定"}
+
+        except Exception as e:
+            self._log(f"[recover_session] 异常: {e}")
+            return {"success": False, "state_before": "unknown",
+                    "action_taken": "exception",
+                    "error": f"会话恢复异常: {str(e)[:200]}"}
 
     def _read_select_value(self, label_text: str) -> Optional[str]:
         """

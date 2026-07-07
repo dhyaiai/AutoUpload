@@ -48,16 +48,31 @@ class FileMonitorHandler(FileSystemEventHandler):
             return
         
         file_path = event.src_path
-        
+        file_name = os.path.basename(file_path)
+
+        # 过滤临时文件和系统文件
+        if file_name.startswith('~$'):          # Office 锁文件 (~$xxx.docx)
+            return
+        if file_name.startswith('.'):           # 隐藏文件 (.DS_Store 等)
+            return
+        if file_name in ('Thumbs.db', 'desktop.ini'):  # Windows 系统文件
+            return
+
+        # 过滤不支持的文件扩展名（只接受文档格式）
+        _, ext = os.path.splitext(file_name)
+        if ext.lower() not in ('.docx', '.doc', '.pdf', '.txt'):
+            print(f"忽略不支持的文件类型: {file_path}")
+            return
+
         # 过滤根目录下的直接文件(只处理子文件夹中的文件)
         root_dir = os.path.abspath(self.config.root_dir)
         file_dir = os.path.dirname(os.path.abspath(file_path))
-        
+
         # 如果文件直接在根目录下,跳过
         if file_dir == root_dir:
             print(f"忽略根目录下的文件: {file_path}")
             return
-        
+
         print(f"检测到新文件: {file_path}")
         
         # 延迟等待文件写入完成(避免读取未完成的文件)
