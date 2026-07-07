@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.ticker import MultipleLocator
+from matplotlib.ticker import MaxNLocator
 import matplotlib.pyplot as plt
 
 
@@ -322,13 +322,10 @@ class StatsPanel:
         ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
         ax.set_xlabel(x_label)
         ax.set_ylabel("上传数量")
-        ax.yaxis.set_major_locator(MultipleLocator(1))
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
         ax.set_title(title)
 
         # 柱顶数值标签
-        for bar, count in zip(bars, counts):
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
-                    str(count), ha="center", va="bottom", fontsize=8)
         for bar, count in zip(bars, counts):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
                     str(count), ha="center", va="bottom", fontsize=8)
@@ -368,7 +365,7 @@ class StatsPanel:
 
         ax.set_xlabel("日期")
         ax.set_ylabel("上传数量")
-        ax.yaxis.set_major_locator(MultipleLocator(5))
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
         ax.set_title(f"作业上传趋势图 ({mode_title[self._line_mode]})")
 
         # 数值标注
