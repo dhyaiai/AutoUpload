@@ -61,8 +61,11 @@ class UploadProcessor:
         self._session_lost = threading.Event()
 
     def _on_session_lost(self):
-        """会话丢失时置位标志，Agent 主循环检测到后自动切换为 5s 快速轮询"""
+        """会话丢失时置位标志，Agent 主循环检测到后自动切换为 5s 快速轮询。
+        同时立即释放 processing 锁，让 Agent 可以接管浏览器执行恢复，
+        避免死锁：UploadProcessor 等浏览器响应 → Agent 等 UploadProcessor 释放锁。"""
         self._session_lost.set()
+        self.processing = False  # 立即释放浏览器锁，让 Agent 可以恢复
 
     def set_agent(self, agent):
         """
@@ -154,12 +157,19 @@ class UploadProcessor:
                     continue
 
                 # 会话失效时暂停消费新任务，等待Agent恢复登录
-                if self._session_lost.is_set():
+                # 同时检查 is_logged_in 作为兜底（detect_page_state 未覆盖到的边界情况）
+                if self._session_lost.is_set() or (
+                    self.browser.driver and not self.browser.is_logged_in
+                ):
                     # 检查浏览器是否已恢复登录
                     if self.browser.driver and self.browser.is_logged_in:
-                        self._send_log("检测到浏览器会话已恢复，继续处理任务")
-                        self._session_lost.clear()
+                        if self._session_lost.is_set():
+                            self._send_log("检测到浏览器会话已恢复，继续处理任务")
+                            self._session_lost.clear()
                     else:
+                        if not self._session_lost.is_set():
+                            self._send_log("检测到浏览器未登录(is_logged_in=False)，暂停消费新任务")
+                            self._session_lost.set()
                         time.sleep(2)
                         continue
 
@@ -320,42 +330,69 @@ class UploadProcessor:
             current_stage = UploadStage.SCHOOL_CHECK
             self._send_log(f"正在校验学校: {school}")
             if not self.browser.check_and_switch_school(school):
-                # 尝试从页面读取实际错误信息（如"账号在异地登录"等）
-                page_info = self.browser.get_page_text()
-                page_hint = ""
-                if page_info and page_info.get("success"):
-                    page_text = page_info.get("text", "")
-                    if "该校未开通数智作业服务" in page_text:
-                        error_msg = f"学校未开通数智作业服务: {school}"
-                        self._send_log(f"错误: {error_msg}")
-                        self._handle_failure(file_name, file_path, folder_name, school, grade, subject,
-                                             error_msg, current_stage,
-                                             ErrorCategory.PLATFORM_BIZ_ERROR, ErrorType.SCHOOL_NOT_ACTIVATED,
-                                             error_context, existing_record_id=agent_retry_record_id)
-                        return
-                    # 提取页面关键错误信息（toast/弹窗文本前100字）
-                    error_keywords = ["被迫下线", "异地登录", "登录失效", "重新登录",
-                                     "没有权限", "已过期", "账号异常"]
-                    for kw in error_keywords:
-                        if kw in page_text:
-                            idx = page_text.find(kw)
-                            page_hint = page_text[max(0, idx-20):idx+80].replace('\n', ' ')
-                            break
-                error_msg = f"学校校验/切换失败: {school}"
-                if page_hint:
-                    error_msg += f"（页面提示: {page_hint}）"
-                self._send_log(f"错误: {error_msg}")
-                # 检测会话丢失：页面提示中包含被迫下线/异地登录等关键词
+                # ── 分层检测：优先 detect_page_state，再回退到关键词/页面文本 ──
                 school_error_type = ErrorType.SCHOOL_SWITCH_FAIL
-                if page_hint and self._is_session_lost_error(page_hint):
-                    school_error_type = ErrorType.LOGIN_EXPIRED
-                    self._on_session_lost()
-                # 也检查浏览器是否已标记登录失效（check_and_switch_school 内部已检测到登录页）
-                if not page_hint and not self.browser.is_logged_in:
-                    school_error_type = ErrorType.LOGIN_EXPIRED
-                    self._on_session_lost()
+                error_msg = f"学校校验/切换失败: {school}"
+                is_session_lost = False
+
+                # 第0层：check_and_switch_school 内部已检测到登录页URL
+                if not self.browser.is_logged_in:
+                    is_session_lost = True
                     error_msg = f"学校校验/切换失败: 会话丢失(页面已跳转到登录页，账号被踢下线)"
-                    self._send_log(f"错误: {error_msg}")
+
+                # 第1层：detect_page_state 全面检测页面状态（比关键词匹配更可靠）
+                if not is_session_lost:
+                    try:
+                        page_state = self.browser.detect_page_state()
+                        if page_state.get("success"):
+                            state = page_state.get("state", "unknown")
+                            self._send_log(f"学校校验失败-页面状态检测: {state}")
+                            if state == "login":
+                                is_session_lost = True
+                                error_msg = (f"学校校验/切换失败: 会话丢失"
+                                             f"(页面状态={state}, 账号被踢下线)")
+                            elif state == "role_select":
+                                is_session_lost = True
+                                error_msg = (f"学校校验/切换失败: 会话丢失"
+                                             f"(页面状态={state}, 需重新登录)")
+                    except Exception as e:
+                        self._send_log(f"页面状态检测异常(非致命): {e}")
+
+                # 第2层：页面文本关键词扫描（detect_page_state 未检测到时兜底）
+                page_hint = ""
+                if not is_session_lost:
+                    page_info = self.browser.get_page_text()
+                    if page_info and page_info.get("success"):
+                        page_text = page_info.get("text", "")
+                        if "该校未开通数智作业服务" in page_text:
+                            error_msg = f"学校未开通数智作业服务: {school}"
+                            self._send_log(f"错误: {error_msg}")
+                            self._handle_failure(file_name, file_path, folder_name, school, grade, subject,
+                                                 error_msg, current_stage,
+                                                 ErrorCategory.PLATFORM_BIZ_ERROR, ErrorType.SCHOOL_NOT_ACTIVATED,
+                                                 error_context, existing_record_id=agent_retry_record_id)
+                            return
+                        # 提取页面关键错误信息
+                        error_keywords = ["被迫下线", "异地登录", "登录失效", "重新登录",
+                                         "没有权限", "已过期", "账号异常"]
+                        for kw in error_keywords:
+                            if kw in page_text:
+                                idx = page_text.find(kw)
+                                page_hint = page_text[max(0, idx-20):idx+80].replace('\n', ' ')
+                                if self._is_session_lost_error(page_hint):
+                                    is_session_lost = True
+                                    error_msg = (f"学校校验/切换失败: {school}"
+                                                 f"（页面提示: {page_hint}）")
+                                break
+
+                # ── 统一处理会话丢失 ──
+                if is_session_lost:
+                    school_error_type = ErrorType.LOGIN_EXPIRED
+                    self._on_session_lost()
+                elif page_hint:
+                    error_msg += f"（页面提示: {page_hint}）"
+
+                self._send_log(f"错误: {error_msg}")
                 self._handle_failure(file_name, file_path, folder_name, school, grade, subject,
                                      error_msg, current_stage,
                                      ErrorCategory.BROWSER_ERROR, school_error_type,
@@ -380,6 +417,9 @@ class UploadProcessor:
             self._notify_agent_result(file_path, upload_success)
 
         if upload_success:
+            # 上传成功证明环境正常，通知Agent重置临时性错误的熔断器
+            if self.auto_retry_agent is not None:
+                self.auto_retry_agent.on_any_upload_success()
             # 上传成功,记录到数据库
             if not is_agent_retry:
                 # Agent 重试：原失败记录已由 on_upload_result 标记为 success，无需新建
@@ -392,6 +432,11 @@ class UploadProcessor:
                     subject=subject,
                     status='success'
                 )
+            # 清理该文件的旧失败记录（会话丢失等场景会导致同一文件先失败后成功，
+            # 旧 pending 记录若不清理，Agent 会反复扫描到它）
+            resolved = self.db.resolve_pending_by_file(file_name, folder_name)
+            if resolved > 0:
+                self._send_log(f"已清理 {resolved} 条旧失败记录: {file_name}")
             # 同步写入分析表，确保持久化统计（无论是否 Agent 重试均写入）
             self.db.add_analysis_record(
                 file_name=file_name,

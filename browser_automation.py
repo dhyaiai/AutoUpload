@@ -1431,19 +1431,35 @@ class BrowserAutomation:
             self._log(f"读取{label_text}选中值异常: {e}")
             return None
 
+    def _is_on_login_page(self) -> bool:
+        """
+        快速检测当前页面是否为登录页（仅检查URL，不等待任何元素）。
+        用于在各操作步骤间快速发现会话丢失，避免等待元素超时。
+
+        Returns:
+            True=当前在登录页面, False=不在登录页或无法判断
+        """
+        try:
+            if not self.driver:
+                return False
+            url = self.driver.current_url
+            return "login" in url.lower() or "/login" in url
+        except Exception:
+            return False
+
     def upload_file(self, file_path: str, grade: str, subject: str, school: str = None) -> bool:
         """
         执行文件上传操作
-        
+
         Args:
             file_path: 要上传的文件完整路径(已包含学校+年级信息)
             grade: 年级(如"高一")
             subject: 科目(如"数学")
             school: 学校名称(用于日志记录,实际不使用)
-        
+
         Returns:
             True表示上传成功,False表示失败
-        
+
         Note:
             Selenium的send_keys()方法可以直接指定文件完整路径,
             无需在Windows文件选择对话框中手动导航。
@@ -1451,6 +1467,14 @@ class BrowserAutomation:
         try:
             self.last_upload_error = ""  # 每次上传前重置错误记录
             self._log(f"开始上传: {os.path.basename(file_path)} (学校={school}, 年级={grade}, 科目={subject})")
+
+            # 0) 快速前置检查：是否已经在登录页（账号在上一步操作中被踢下线）
+            if self._is_on_login_page():
+                error_text = "会话丢失(上传前检测到登录页)，账号可能被异地登录踢下线"
+                self._log(f"[FAIL] {error_text}")
+                self.is_logged_in = False
+                self.last_upload_error = error_text
+                return False
 
             # 步骤1: 点击"上传作业"按钮
             try:
@@ -1478,7 +1502,15 @@ class BrowserAutomation:
             self.driver.execute_script("arguments[0].click();", upload_btn)
             time.sleep(self.config.sleep_interval)
             self._log("已打开上传作业对话框")
-            
+
+            # 快速检测：点击上传按钮后页面是否跳转到登录页
+            if self._is_on_login_page():
+                error_text = "会话丢失(打开上传对话框后检测到登录页)，账号可能被异地登录踢下线"
+                self._log(f"[FAIL] {error_text}")
+                self.is_logged_in = False
+                self.last_upload_error = error_text
+                return False
+
             # 步骤2: 定位文件输入框并直接发送完整文件路径
             # Selenium会自动处理Windows文件选择对话框,无需手动操作
             file_input = None
@@ -1502,6 +1534,14 @@ class BrowserAutomation:
             file_input.send_keys(file_path)
             time.sleep(self.config.sleep_interval)
             self._log(f"[OK] 已选择文件: {os.path.basename(file_path)}")
+
+            # 快速检测：选择文件后页面是否跳转到登录页
+            if self._is_on_login_page():
+                error_text = "会话丢失(选择文件后检测到登录页)，账号可能被异地登录踢下线"
+                self._log(f"[FAIL] {error_text}")
+                self.is_logged_in = False
+                self.last_upload_error = error_text
+                return False
 
             # 勾选年级+科目
             wait = WebDriverWait(self.driver, 10)

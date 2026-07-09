@@ -205,7 +205,7 @@ class DatabaseManager:
     def mark_record_success(self, record_id: int):
         """
         将某条失败记录标记为成功(用于重新上传成功后更新状态)
-        
+
         Args:
             record_id: 要更新的记录ID
         """
@@ -219,6 +219,34 @@ class DatabaseManager:
             WHERE id = ?
         ''', (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), record_id))
         self._connection.commit()
+
+    def resolve_pending_by_file(self, file_name: str, folder_name: str) -> int:
+        """
+        将指定文件的所有 pending 失败记录标记为 success+finished。
+        用于上传成功后清理旧失败记录，防止 Agent 重复扫描。
+
+        Args:
+            file_name: 文件名
+            folder_name: 文件夹名
+
+        Returns:
+            被清理的记录数量
+        """
+        cursor = self._connection.cursor()
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        cursor.execute('''
+            UPDATE upload_records
+            SET status = 'success',
+                retry_status = 'finished',
+                error_message = NULL,
+                retry_count = 0,
+                upload_time = ?
+            WHERE file_name = ? AND folder_name = ?
+              AND status = 'failed'
+              AND retry_status = 'pending'
+        ''', (now, file_name, folder_name))
+        self._connection.commit()
+        return cursor.rowcount
     
     def increment_retry(self, record_id: int) -> int:
         """

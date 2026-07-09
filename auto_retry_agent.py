@@ -224,12 +224,27 @@ class AutoRetryAgent:
         # 已提交重试的文件集合（防止重复入队）
         self._in_retry: Set[str] = set()
         self._in_retry_lock = threading.Lock()  # 保护 _in_retry 的跨线程访问
+        # 重试文件的错误类型映射（供 on_upload_result 失败时记录熔断统计）
+        self._retry_error_types: Dict[str, str] = {}
+        self._retry_error_lock = threading.Lock()
 
         # Agent 忙碌标志：Agent 正在执行恢复操作时阻塞 UploadProcessor 消费新任务
         self.agent_busy = threading.Event()
 
         # UploadProcessor 引用（用于注册重试映射）
         self.upload_processor = None
+
+        # 临时性错误类型：环境恢复后重试即可成功，成功上传后应重置其熔断
+        self._TRANSIENT_ERROR_TYPES = {
+            ErrorType.UPLOAD_SUBMIT_TIMEOUT.value,
+            ErrorType.FORM_VALIDATE_FAIL.value,
+            ErrorType.ELEMENT_TIMEOUT.value,
+            ErrorType.PAGE_LOAD_TIMEOUT.value,
+            ErrorType.SCHOOL_SWITCH_FAIL.value,
+            ErrorType.LOGIN_EXPIRED.value,
+            ErrorType.NETWORK_ERROR.value,
+            ErrorType.BROWSER_START_FAIL.value,
+        }
 
     def set_upload_processor(self, processor):
         """
@@ -281,10 +296,20 @@ class AutoRetryAgent:
         pending_paths = {r.get('file_path', '') for r in records if r.get('file_path')}
         with self._in_retry_lock:
             self._in_retry = {fp for fp in self._in_retry if fp in pending_paths}
+        with self._retry_error_lock:
+            self._retry_error_types = {
+                fp: et for fp, et in self._retry_error_types.items()
+                if fp in pending_paths
+            }
 
         tripped_types = self.circuit_breaker.get_tripped_types()
         self._log(f"AutoRetryAgent: 扫描到 {len(records)} 条待处理失败记录"
                   + (f", 熔断中: {tripped_types}" if tripped_types else ""))
+
+        # 熔断跳过统计（避免每个记录各打一条日志刷屏）
+        skipped_by_trip: Dict[str, list] = {}
+        processed = 0
+        skipped_trip_count = 0
 
         # 标记 Agent 忙碌，阻塞 UploadProcessor 消费新任务
         self.agent_busy.set()
@@ -293,11 +318,29 @@ class AutoRetryAgent:
                 if self.stop_event.is_set():
                     break
 
+                # 快速门禁：错误类型已熔断 → 跳过，由汇总日志统一报告
+                rec_error_type = record.get('error_type')
+                if rec_error_type and rec_error_type in tripped_types:
+                    skipped_trip_count += 1
+                    et = rec_error_type or 'unknown'
+                    if et not in skipped_by_trip:
+                        skipped_by_trip[et] = []
+                    skipped_by_trip[et].append(record.get('file_name', str(record.get('id'))))
+                    continue
+                if self.circuit_breaker.is_tripped(rec_error_type or 'unknown'):
+                    skipped_trip_count += 1
+                    et = rec_error_type or 'unknown'
+                    if et not in skipped_by_trip:
+                        skipped_by_trip[et] = []
+                    skipped_by_trip[et].append(record.get('file_name', str(record.get('id'))))
+                    continue
+
                 try:
                     # tripped_types 传入可变集合：_process_one_record 在
                     # full_recovery 成功后从中移除已恢复的错误类型，
                     # 使批次中后续记录的门禁检查能反映最新状态
                     self._process_one_record(record, tripped_types)
+                    processed += 1
                 except Exception as e:
                     self._log(f"AutoRetryAgent: 处理记录 {record.get('id')} 异常 - {e}")
                     traceback.print_exc()
@@ -306,6 +349,19 @@ class AutoRetryAgent:
                         self.db.update_retry_status(record['id'], 'pending')
                     except Exception:
                         pass
+
+            # ── 汇总日志 ──
+            if skipped_trip_count > 0:
+                parts = []
+                for et, names in skipped_by_trip.items():
+                    if len(names) <= 3:
+                        parts.append(f"{et}({', '.join(names)})")
+                    else:
+                        parts.append(f"{et}({len(names)}条: {names[0]} 等)")
+                self._log(f"AutoRetryAgent: 熔断跳过 {skipped_trip_count} 条 — "
+                          + "; ".join(parts))
+            if processed > 0:
+                self._log(f"AutoRetryAgent: 本轮实际处理 {processed} 条记录")
         finally:
             self.agent_busy.clear()
 
@@ -315,6 +371,10 @@ class AutoRetryAgent:
 
         流程: 预检查 → ReAct 循环(LLM自主决策) → 后处理(退避+入队)
         安全守护(熔断/重试上限)在工具函数内部硬编码,LLM 无法绕过
+
+        注意：调用方 _scan_and_retry 已在循环中做了熔断快速门禁检查，
+        传入此方法的 record 理论上不应该是已熔断类型。此处保留
+        _validate_react_decision 和 _rule_engine_decision 内部的二次门禁作为安全网。
 
         Args:
             record: 数据库记录字典
@@ -579,8 +639,8 @@ class AutoRetryAgent:
                 decision = self._validate_react_decision(decision, record, tripped_types)
 
         if decision is None:
-            # 回退到规则引擎
-            decision = self._rule_engine_decision(record, tripped_types)
+            # 回退到规则引擎（传入页面上下文，使其能做智能升级决策）
+            decision = self._rule_engine_decision(record, tripped_types, page_context)
 
         if decision is None:
             return  # 规则引擎决定跳过
@@ -652,7 +712,14 @@ class AutoRetryAgent:
                 self.browser.update_activity_time()
             self.task_queue.put(file_path)
 
+            # 记录 error_type 映射，供 on_upload_result 失败时熔断统计
             if error_type:
+                with self._retry_error_lock:
+                    self._retry_error_types[file_path] = error_type
+
+            # 记录错误供熔断器统计（仅在非 full_recovery 成功路径时；
+            # full_recovery 成功后的入队已在上面 reset_error，此处跳过避免重复计数）
+            if not decision.get("_full_recovery_succeeded") and error_type:
                 self.circuit_breaker.record_error(error_type)
 
     # ─── 恢复管线 ───
@@ -767,8 +834,11 @@ class AutoRetryAgent:
             if not ok:
                 return err
             browser_restarted = True
-            self._log("AutoRetryAgent: 恢复管线 - 浏览器重启成功，跳过状态恢复")
-            current = "home"  # 标记为home以便跳过下方状态分支
+            # 重启后必须检测实际页面状态，不能假设为"home"。
+            # 场景：登录成功但角色选择未完成/被踢下线 → 页面可能是 login 或 role_select
+            ps = self.browser.detect_page_state()
+            current = ps.get("state", "unknown") if ps.get("success") else "unknown"
+            self._log(f"AutoRetryAgent: 恢复管线 - 浏览器重启后页面状态: {current}")
         else:
             page_state = self.browser.detect_page_state()
             current = page_state.get("state", "unknown") if page_state.get("success") else "unknown"
@@ -782,108 +852,136 @@ class AutoRetryAgent:
                 if not ok:
                     return err
                 browser_restarted = True
-                self._log("AutoRetryAgent: 恢复管线 - 浏览器重启成功")
-                current = "home"
+                # 重启后检测实际页面状态
+                ps = self.browser.detect_page_state()
+                current = ps.get("state", "unknown") if ps.get("success") else "unknown"
+                self._log(f"AutoRetryAgent: 恢复管线 - 浏览器重启后页面状态: {current}")
 
-        # ── Step 3: 按状态分支恢复 ──
+        # ── Step 3: 按状态分支恢复（while 循环，状态变更后 continue 重新分发）──
+        # 设计要点：home 分支重启浏览器后页面可能变为 login/role_select，
+        # 通过 continue 回到循环开头重新判断，避免内联重复登录/角色选择代码。
 
-        if current == "login":
-            self._log("AutoRetryAgent: 恢复管线 - 检测到登录页，执行登录...")
-            try:
-                if not self.browser._login():
-                    return {"success": False, "school_verified": False,
-                            "browser_restarted": False,
-                            "error": "登录失败", "recovery_path": "login_failed"}
-                # _login() 内部已调用 _handle_role_selection()，无需重复
-                self.browser.is_logged_in = True
-                self._log("AutoRetryAgent: 恢复管线 - 登录成功")
-                time.sleep(0.5)
-            except Exception as e:
-                return {"success": False, "school_verified": False,
-                        "browser_restarted": False,
-                        "error": f"登录异常: {str(e)[:200]}",
-                        "recovery_path": "login_exception"}
+        _MAX_STATE_ITERATIONS = 5  # 防止死循环
 
-        elif current == "role_select":
-            self._log("AutoRetryAgent: 恢复管线 - 检测到角色选择页，执行角色选择...")
-            try:
-                if not self.browser._handle_role_selection():
-                    return {"success": False, "school_verified": False,
-                            "browser_restarted": False,
-                            "error": "角色选择失败", "recovery_path": "role_select_failed"}
-                self._log("AutoRetryAgent: 恢复管线 - 角色选择完成")
-                time.sleep(0.5)
-            except Exception as e:
-                return {"success": False, "school_verified": False,
-                        "browser_restarted": False,
-                        "error": f"角色选择异常: {str(e)[:200]}",
-                        "recovery_path": "role_select_exception"}
-
-        elif current in ("upload_dialog", "school_dialog", "error"):
-            self._log(f"AutoRetryAgent: 恢复管线 - 检测到{current}，执行reset_to_home...")
-            try:
-                reset_ok = self.browser.reset_to_home()
-            except Exception as e:
-                self._log(f"AutoRetryAgent: 恢复管线 - reset_to_home异常: {e}")
-                return {"success": False, "school_verified": False,
-                        "browser_restarted": browser_restarted,
-                        "error": f"reset_to_home异常: {str(e)[:200]}",
-                        "recovery_path": "reset_to_home_exception"}
-            if not reset_ok:
-                # reset_to_home 返回 False 说明浏览器重启也失败了，必须中止
-                self._log("AutoRetryAgent: 恢复管线 - reset_to_home失败(含浏览器重启)，"
-                          "中止恢复，稍后重试")
-                return {"success": False, "school_verified": False,
-                        "browser_restarted": browser_restarted,
-                        "error": "reset_to_home失败，浏览器重启未成功",
-                        "recovery_path": "reset_to_home_failed"}
-            # reset_to_home 成功 — 内部已自行处理浏览器状态（关闭弹窗/导航/重启），
-            # browser_restarted 无需在此处修改，该方法的返回值已足够表示最终状态
-            self._log("AutoRetryAgent: 恢复管线 - reset_to_home成功")
-            time.sleep(0.5)
-
-        elif current == "home":
-            # SPA 页面的 URL 不随会话丢失而变化（仍是 jobManager），
-            # 需额外检查 is_logged_in 标志和页面文本中的踢下线信号
-            need_restart = False
-            restart_reason = ""
-            if not self.browser.is_logged_in:
-                need_restart = True
-                restart_reason = "is_logged_in=False，会话已丢失"
-            elif self.browser._detect_session_lost_on_page():
-                need_restart = True
-                restart_reason = "检测到踢下线信号"
-
-            if need_restart:
-                self._log(f"AutoRetryAgent: 恢复管线 - 页面显示home但{restart_reason}，"
-                          "执行完整重启...")
-                ok, err = self._restart_browser()
-                if not ok:
-                    return err
-                browser_restarted = True
-            else:
-                self._log("AutoRetryAgent: 恢复管线 - 已在首页，跳过页面恢复")
-
-        else:  # unknown / no_browser
-            self._log("AutoRetryAgent: 恢复管线 - 未知状态，先尝试轻量恢复...")
-            try:
-                recover_result = self.browser.recover_session()
-                if recover_result.get("success"):
-                    self._log(f"AutoRetryAgent: 恢复管线 - 轻量恢复成功 "
-                              f"(action={recover_result.get('action_taken')})")
+        for _ in range(_MAX_STATE_ITERATIONS):
+            if current == "login":
+                self._log("AutoRetryAgent: 恢复管线 - 检测到登录页，执行登录...")
+                try:
+                    if not self.browser._login():
+                        return {"success": False, "school_verified": False,
+                                "browser_restarted": False,
+                                "error": "登录失败", "recovery_path": "login_failed"}
+                    # _login() 内部已调用 _handle_role_selection()，无需重复
+                    self.browser.is_logged_in = True
+                    self._log("AutoRetryAgent: 恢复管线 - 登录成功")
                     time.sleep(0.5)
-                else:
-                    # 轻量恢复失败 → 完整重启
-                    self._log("AutoRetryAgent: 恢复管线 - 轻量恢复失败，执行完整重启...")
+                except Exception as e:
+                    return {"success": False, "school_verified": False,
+                            "browser_restarted": False,
+                            "error": f"登录异常: {str(e)[:200]}",
+                            "recovery_path": "login_exception"}
+                break  # 登录完成，退出循环
+
+            elif current == "role_select":
+                self._log("AutoRetryAgent: 恢复管线 - 检测到角色选择页，执行角色选择...")
+                try:
+                    if not self.browser._handle_role_selection():
+                        return {"success": False, "school_verified": False,
+                                "browser_restarted": False,
+                                "error": "角色选择失败", "recovery_path": "role_select_failed"}
+                    self._log("AutoRetryAgent: 恢复管线 - 角色选择完成")
+                    time.sleep(0.5)
+                except Exception as e:
+                    return {"success": False, "school_verified": False,
+                            "browser_restarted": False,
+                            "error": f"角色选择异常: {str(e)[:200]}",
+                            "recovery_path": "role_select_exception"}
+                break  # 角色选择完成，退出循环
+
+            elif current in ("upload_dialog", "school_dialog", "error"):
+                self._log(f"AutoRetryAgent: 恢复管线 - 检测到{current}，执行reset_to_home...")
+                try:
+                    reset_ok = self.browser.reset_to_home()
+                except Exception as e:
+                    self._log(f"AutoRetryAgent: 恢复管线 - reset_to_home异常: {e}")
+                    return {"success": False, "school_verified": False,
+                            "browser_restarted": browser_restarted,
+                            "error": f"reset_to_home异常: {str(e)[:200]}",
+                            "recovery_path": "reset_to_home_exception"}
+                if not reset_ok:
+                    self._log("AutoRetryAgent: 恢复管线 - reset_to_home失败(含浏览器重启)，"
+                              "中止恢复，稍后重试")
+                    return {"success": False, "school_verified": False,
+                            "browser_restarted": browser_restarted,
+                            "error": "reset_to_home失败，浏览器重启未成功",
+                            "recovery_path": "reset_to_home_failed"}
+                self._log("AutoRetryAgent: 恢复管线 - reset_to_home成功")
+                time.sleep(0.5)
+                break  # 弹窗已关闭，退出循环
+
+            elif current == "home":
+                # SPA 页面的 URL 不随会话丢失而变化（仍是 jobManager），
+                # 需额外检查 is_logged_in 标志和页面文本中的踢下线信号
+                need_restart = False
+                restart_reason = ""
+                if not self.browser.is_logged_in:
+                    need_restart = True
+                    restart_reason = "is_logged_in=False，会话已丢失"
+                elif self.browser._detect_session_lost_on_page():
+                    need_restart = True
+                    restart_reason = "检测到踢下线信号"
+
+                if need_restart:
+                    self._log(f"AutoRetryAgent: 恢复管线 - 页面显示home但{restart_reason}，"
+                              "执行完整重启...")
                     ok, err = self._restart_browser()
                     if not ok:
                         return err
                     browser_restarted = True
-            except Exception as e:
-                return {"success": False, "school_verified": False,
-                        "browser_restarted": False,
-                        "error": f"恢复异常: {str(e)[:200]}",
-                        "recovery_path": "recovery_exception"}
+                    # 重启后检测实际页面状态（可能变为 login/role_select），
+                    # 更新 current 并 continue 回到循环开头重新分发
+                    ps = self.browser.detect_page_state()
+                    current = ps.get("state", "unknown") if ps.get("success") else "unknown"
+                    self._log(f"AutoRetryAgent: 恢复管线 - 浏览器重启后页面状态: {current}")
+                    continue  # ← 回到循环开头，按新状态重新分发
+                else:
+                    self._log("AutoRetryAgent: 恢复管线 - 已在首页，跳过页面恢复")
+                    break  # 无需恢复，退出循环
+
+            else:  # unknown / no_browser
+                self._log("AutoRetryAgent: 恢复管线 - 未知状态，先尝试轻量恢复...")
+                try:
+                    recover_result = self.browser.recover_session()
+                    if recover_result.get("success"):
+                        self._log(f"AutoRetryAgent: 恢复管线 - 轻量恢复成功 "
+                                  f"(action={recover_result.get('action_taken')})")
+                        time.sleep(0.5)
+                        break
+                    else:
+                        # 轻量恢复失败 → 完整重启
+                        self._log("AutoRetryAgent: 恢复管线 - 轻量恢复失败，执行完整重启...")
+                        ok, err = self._restart_browser()
+                        if not ok:
+                            return err
+                        browser_restarted = True
+                        # 重启后检测实际页面状态，continue 重新分发
+                        ps = self.browser.detect_page_state()
+                        current = ps.get("state", "unknown") if ps.get("success") else "unknown"
+                        self._log(f"AutoRetryAgent: 恢复管线 - 重启后页面状态: {current}")
+                        continue
+                except Exception as e:
+                    return {"success": False, "school_verified": False,
+                            "browser_restarted": False,
+                            "error": f"恢复异常: {str(e)[:200]}",
+                            "recovery_path": "recovery_exception"}
+        else:
+            # for 循环正常结束（未 break）→ 超过最大迭代次数
+            self._log(f"AutoRetryAgent: 恢复管线 - 状态恢复超过{_MAX_STATE_ITERATIONS}次迭代,"
+                      f" 中止(current={current})")
+            return {"success": False, "school_verified": False,
+                    "browser_restarted": browser_restarted,
+                    "error": f"状态恢复迭代超限({_MAX_STATE_ITERATIONS}次), 最后状态={current}",
+                    "recovery_path": "state_loop_exceeded"}
 
         # ── Step 4: 验证学校（加重试，会话已恢复但页面可能尚未就绪）──
         if school:
@@ -1166,9 +1264,15 @@ Final: {"action": "enqueue"|"manual"|"skip", "retry_level": "L1"|"L2"|"L3", "rea
             }
 
         def _browser_busy():
-            """检查 UploadProcessor 是否正在使用浏览器，防止并发操作"""
-            return (self.upload_processor is not None
-                    and self.upload_processor.processing)
+            """检查 UploadProcessor 是否正在使用浏览器，防止并发操作。
+            但如果 UploadProcessor 已检测到会话丢失（_session_lost 已置位），
+            说明它已暂停上传等待恢复，Agent 可以安全接管浏览器。"""
+            if self.upload_processor is None:
+                return False
+            # 会话丢失时 UploadProcessor 已暂停，Agent 可接管浏览器恢复
+            if self.upload_processor._session_lost.is_set():
+                return False
+            return self.upload_processor.processing
 
         def tool_capture_page_error():
             """
@@ -1374,10 +1478,15 @@ Final: {"action": "enqueue"|"manual"|"skip", "retry_level": "L1"|"L2"|"L3", "rea
 
     # ─── 规则引擎兜底 ───
 
-    def _rule_engine_decision(self, record: Dict, tripped_types: Set[str]) -> Optional[Dict]:
+    def _rule_engine_decision(self, record: Dict, tripped_types: Set[str],
+                               page_context: Dict = None) -> Optional[Dict]:
         """
         传统规则引擎决策（AI 禁用或失败时的兜底）
         保留原有的 get_strategy() + 全部安全检查逻辑
+
+        2.0 增强：接收页面状态上下文，对 L2/L3 策略做智能升级：
+        - 页面在登录页 → 升级为 L4（完整恢复），避免盲目重试必然失败
+        - 页面状态与失败阶段不匹配 → 升级为 L4
         """
         record_id = record['id']
         file_name = record.get('file_name', '')
@@ -1407,6 +1516,21 @@ Final: {"action": "enqueue"|"manual"|"skip", "retry_level": "L1"|"L2"|"L3", "rea
             self._log(f"AutoRetryAgent: {error_type} 触发熔断,跳过 - {file_name}")
             return None
 
+        # ── 2.0 智能升级：页面状态感知 ──
+        # 当页面上下文显示状态不匹配或已在登录页时，
+        # 将 L1/L2/L3 升级为 L4（完整恢复），避免在错误页面上盲目重试
+        if page_context and retry_level in (RetryLevel.L1_LIGHT_RETRY,
+                                             RetryLevel.L2_PAGE_RESET,
+                                             RetryLevel.L3_ENV_RESET):
+            current_state = page_context.get("current_page_state", "")
+            if (page_context.get("state_mismatch")
+                    or current_state == "login"
+                    or current_state == "role_select"):
+                self._log(f"AutoRetryAgent: 规则引擎-页面状态不匹配"
+                          f"(state={current_state}, mismatch={page_context.get('state_mismatch')}), "
+                          f"策略从{retry_level.value}升级为L4 - {file_name}")
+                retry_level = RetryLevel.L4_SERVICE_RESTART
+
         # 决策映射
         if retry_level == RetryLevel.L5_MANUAL:
             self._log(f"AutoRetryAgent: L5规则引擎决策,标记finished - {file_name}")
@@ -1419,8 +1543,11 @@ Final: {"action": "enqueue"|"manual"|"skip", "retry_level": "L1"|"L2"|"L3", "rea
                 self.db.update_retry_status(record_id, 'finished')
                 return None
             if self.upload_processor is not None and self.upload_processor.processing:
-                self._log(f"AutoRetryAgent: UploadProcessor 处理中,延迟 - {file_name}")
-                return None
+                # 会话丢失时 UploadProcessor 已暂停（_on_session_lost 会立即释放 processing），
+                # 此时不应延迟，Agent 应接管浏览器执行恢复
+                if not self.upload_processor._session_lost.is_set():
+                    self._log(f"AutoRetryAgent: UploadProcessor 处理中,延迟 - {file_name}")
+                    return None
 
             # 通过恢复管线执行浏览器恢复
             school = record.get('school', '')
@@ -1451,11 +1578,28 @@ Final: {"action": "enqueue"|"manual"|"skip", "retry_level": "L1"|"L2"|"L3", "rea
                 self.db.update_retry_status(record_id, 'finished')
                 return None
 
-        # L1/L2/L3
+        # L1/L2/L3（未被升级的）
+        # 注意：L2/L3 的浏览器复位由 UploadProcessor._preprocess_agent_retry()
+        # 在消费队列时执行，此处不重复操作以免阻塞 Agent 扫描循环。
         self._log(f"AutoRetryAgent: 规则引擎决策 [{retry_level.value}] - {file_name}")
         return {"action": "enqueue", "retry_level": retry_level}
 
     # ─── 上传结果回调 ───
+
+    def on_any_upload_success(self):
+        """
+        由 UploadProcessor 在任意文件上传成功后调用（不限于Agent重试）。
+        成功上传证明浏览器/网络环境正常，重置临时性错误的熔断器，
+        避免之前级联失败触发的熔断继续拦截可恢复的待重试文件。
+        同时清除 _session_lost 标志（成功上传证明会话正常）。
+        """
+        for et in self._TRANSIENT_ERROR_TYPES:
+            self.circuit_breaker.reset_error(et)
+        self.circuit_breaker.reset_global_trip()
+        self._log("AutoRetryAgent: 上传成功，已重置临时性错误熔断（环境已恢复正常）")
+        # 成功上传证明会话正常，清除 session_lost 以避免阻塞后续任务
+        if self.upload_processor is not None:
+            self.upload_processor._session_lost.clear()
 
     def on_upload_result(self, record_id: int, success: bool, file_path: str):
         """
@@ -1471,6 +1615,10 @@ Final: {"action": "enqueue"|"manual"|"skip", "retry_level": "L1"|"L2"|"L3", "rea
         with self._in_retry_lock:
             self._in_retry.discard(file_path)
 
+        # 获取并清理 error_type 映射
+        with self._retry_error_lock:
+            retry_error_type = self._retry_error_types.pop(file_path, None)
+
         # 更新数据库
         self.db.set_agent_retry_success(record_id, success)
         if success:
@@ -1480,6 +1628,10 @@ Final: {"action": "enqueue"|"manual"|"skip", "retry_level": "L1"|"L2"|"L3", "rea
         else:
             self.db.update_retry_status(record_id, 'pending')
             self._log(f"AutoRetryAgent: ✗ 自动重试失败 - {os.path.basename(file_path)}")
+            # 重试失败时记录错误供熔断器统计（精确追踪真实失败，
+            # 替代入队时的预判计数，避免熔断器过早触发）
+            if retry_error_type:
+                self.circuit_breaker.record_error(retry_error_type)
 
     def _log(self, message: str):
         """通过日志队列发送消息"""
