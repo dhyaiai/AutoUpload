@@ -234,8 +234,8 @@ class StatsPanel:
         ttk.Button(btn_frame, text="📥 导出到Excel",
                    command=self._export_failed_table).pack(side="right", padx=5)
 
-        columns = ("file_name", "school", "grade", "subject", "upload_time", "error_message", "agent_retry_success")
-        headers = ("作业名称", "学校", "年级", "科目", "上传时间", "失败原因", "Agent接管成功")
+        columns = ("file_name", "school", "grade", "subject", "upload_time", "error_message")
+        headers = ("作业名称", "学校", "年级", "科目", "上传时间", "失败原因")
         failed_frame, self._failed_tree = self._create_treeview(frame, columns, headers, height=8)
         failed_frame.pack(fill="both", expand=True)
 
@@ -400,23 +400,15 @@ class StatsPanel:
             ))
 
     def _refresh_failed_table(self):
-        """刷新失败记录表"""
+        """刷新失败记录表（从分析表读取，数据持久保留不受上传记录清理影响）"""
         for item in self._failed_tree.get_children():
             self._failed_tree.delete(item)
         records = self.db.get_failed_records_for_stats()
         for r in records:
-            agent_result = r.get("agent_retry_success")
-            if agent_result == '是':
-                agent_display = '✅ 是'
-            elif agent_result == '否':
-                agent_display = '❌ 否'
-            else:
-                agent_display = '—'
             self._failed_tree.insert("", "end", values=(
                 r["file_name"], r["school"], r["grade"],
                 r["subject"], r["upload_time"],
-                r["error_message"] or "",
-                agent_display
+                r["error_message"] or ""
             ))
 
     # ==================== Excel导出 ====================

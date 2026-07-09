@@ -1008,29 +1008,33 @@ class MainApplication:
         self._perform_exit()
 
     def _perform_exit(self):
-        """统一的退出流程：设停止信号、等队列清空、销毁窗口"""
+        """统一的退出流程：设停止信号、等队列清空、在主线程中销毁窗口"""
         self.stop_event.set()
-        # 清理matplotlib资源
+        # 清理matplotlib资源（线程安全：在事件循环线程中执行）
         if hasattr(self, 'stats_panel'):
-            self.stats_panel.destroy()
-        if self.tray_icon:
-            self.tray_icon.stop()
-            self.tray_icon = None
-
-        def _wait_and_destroy():
             try:
-                self.task_queue.join()
+                self.stats_panel.destroy()
             except Exception:
                 pass
-            finally:
-                try:
-                    self.root.destroy()
-                except Exception:
-                    pass
+        if self.tray_icon:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+            self.tray_icon = None
 
         if not self.task_queue.empty():
             messagebox.showinfo("提示", "等待当前任务完成...")
-        Thread(target=_wait_and_destroy, daemon=True).start()
+
+        # 用 root.after 在主线程中延迟销毁窗口，给后台线程少量时间完成当前任务
+        # 避免 daemon 线程调用 tkinter destroy 导致的线程安全问题
+        def _safe_destroy():
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
+
+        self.root.after(2000, _safe_destroy)  # 2秒缓冲，后台线程在 stop_event 后最快退出
 
     def _log_to_gui(self, message: str, tag: str = "info"):
         """向GUI日志区域写入消息（线程安全）"""

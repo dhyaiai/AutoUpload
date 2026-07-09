@@ -57,6 +57,7 @@ class ErrorType(str, Enum):
     SUBJECT_NOT_OPTION = "subject_not_in_option"
     PERMISSION_DENIED = "permission_denied"
     SCHOOL_NOT_ACTIVATED = "school_not_activated"  # 学校未开通数智作业服务
+    PAGE_ERROR_PERSISTENT = "page_error_persistent"  # 页面显示不可恢复的业务错误
 
     # 系统环境类
     NETWORK_ERROR = "network_error"
@@ -118,6 +119,7 @@ STRATEGY_MAP: Dict[Tuple[UploadStage, ErrorType], Tuple[RetryLevel, int]] = {
     (UploadStage.SUBMIT_UPLOAD, ErrorType.FORM_VALIDATE_FAIL):     (RetryLevel.L2_PAGE_RESET, 1),
     (UploadStage.SUBMIT_UPLOAD, ErrorType.PERMISSION_DENIED):      (RetryLevel.L5_MANUAL, 0),
     (UploadStage.SUBMIT_UPLOAD, ErrorType.SCHOOL_NOT_ACTIVATED):   (RetryLevel.L5_MANUAL, 0),
+    (UploadStage.SUBMIT_UPLOAD, ErrorType.PAGE_ERROR_PERSISTENT):  (RetryLevel.L5_MANUAL, 0),
 
     # 全局网络错误（任意阶段）
     (None, ErrorType.NETWORK_ERROR): (RetryLevel.L1_LIGHT_RETRY, 3),
@@ -138,7 +140,9 @@ ERROR_CLASSIFICATION_RULES: List[tuple] = [
       "无法启动浏览器", "浏览器崩溃", "browser crash"],
      ErrorCategory.BROWSER_ERROR, ErrorType.BROWSER_START_FAIL),
     (["登录失效", "login expired", "未登录", "重新登录", "登录态",
-      "login status", "请先登录"],
+      "login status", "请先登录",
+      "已被迫下线", "异地登录", "另一个地点登录", "被迫下线", "账号在另一个地点",
+      "您的账号", "被踢下线", "账号被踢"],
      ErrorCategory.BROWSER_ERROR, ErrorType.LOGIN_EXPIRED),
     (["元素", "element", "超时", "timeout", "等待超时", "找不到",
       "not found", "not clickable", "不可点击", "stale"],
@@ -149,6 +153,13 @@ ERROR_CLASSIFICATION_RULES: List[tuple] = [
      ErrorCategory.PLATFORM_BIZ_ERROR, ErrorType.SCHOOL_NOT_FOUND),
     (["该校未开通", "数智作业服务", "未开通数智作业", "school not activated"],
      ErrorCategory.PLATFORM_BIZ_ERROR, ErrorType.SCHOOL_NOT_ACTIVATED),
+    (["只能上传一个文件", "上传文件数量超限"],
+     ErrorCategory.BROWSER_ERROR, ErrorType.FORM_VALIDATE_FAIL),
+    (["权限不足", "无权限", "permission denied", "没有权限", "无权操作",
+      "科目不匹配", "不在可选范围", "已被禁用", "账号异常", "已被锁定",
+      "文件格式错误", "不支持的文件类型", "文件大小超限", "文件已存在",
+      "重复提交", "该作业已提交", "已提交过"],
+     ErrorCategory.PLATFORM_BIZ_ERROR, ErrorType.PAGE_ERROR_PERSISTENT),
     (["上传", "upload", "提交", "submit", "确认"],
      ErrorCategory.BROWSER_ERROR, ErrorType.UPLOAD_SUBMIT_TIMEOUT),
 
@@ -252,6 +263,7 @@ ERROR_DESCRIPTIONS: Dict[str, Tuple[str, str]] = {
     'subject_not_in_option': ('科目不在选项中', '平台科目列表变更或AI识别结果与平台不匹配'),
     'permission_denied': ('权限不足', '当前账号无该学校/年级的上传权限'),
     'school_not_activated': ('学校未开通服务', '目标学校未开通数智作业服务，需联系平台管理员开通'),
+    'page_error_persistent': ('页面业务错误', '网页显示不可恢复的业务错误（权限/禁用/重复提交等），重试无法修复'),
     'network_error': ('网络错误', '网络连接不稳定、DNS解析失败或防火墙拦截'),
     'database_error': ('数据库错误', 'SQLite文件损坏或磁盘空间不足'),
     'unknown': ('未知错误类型', '待进一步排查'),
@@ -277,7 +289,56 @@ ERROR_SUGGESTIONS: Dict[str, List[str]] = {
     'subject_not_in_option': ['建立AI识别科目 → 平台科目的映射表'],
     'permission_denied': ['在文件监控阶段检查学校权限'],
     'school_not_activated': ['联系平台管理员开通数智作业服务', '更换已开通服务的学校作为目标学校'],
+    'page_error_persistent': ['查看网页错误详情定位具体业务原因', '确认账号权限和学校服务状态', '联系平台管理员处理业务限制'],
     'network_error': ['添加网络连通性预检', '增加离线队列功能'],
     'database_error': ['添加数据库定期备份', '增加数据库完整性检查'],
     'unknown': ['排查日志定位具体原因'],
 }
+
+# ─── 页面错误关键词分类 ───
+# 用于 capture_page_error() 快速判断页面错误是否可恢复
+# 格式: (关键词列表, ErrorType, is_permanent)
+# is_permanent=True 表示该错误无法通过重试修复，应直接转人工处理
+
+PAGE_ERROR_PATTERNS: List[tuple] = [
+    # 永久性业务错误（重试无法修复）
+    (["该校未开通数智作业服务", "未开通数智作业", "school not activated"],
+     ErrorType.SCHOOL_NOT_ACTIVATED, True),
+    (["权限不足", "无权限", "permission denied", "没有权限", "无权操作"],
+     ErrorType.PERMISSION_DENIED, True),
+    (["科目不匹配", "科目不在可选范围", "不在可选范围"],
+     ErrorType.SUBJECT_NOT_OPTION, True),
+    (["文件格式错误", "不支持的文件类型", "文件格式不支持"],
+     ErrorType.UNSUPPORTED_FORMAT, True),
+    (["文件大小超限", "文件过大"],
+     ErrorType.PAGE_ERROR_PERSISTENT, True),
+    (["重复提交", "该作业已提交", "已提交过", "请勿重复提交"],
+     ErrorType.PAGE_ERROR_PERSISTENT, True),
+    (["账号异常", "已被禁用", "已被锁定", "账号已过期"],
+     ErrorType.PAGE_ERROR_PERSISTENT, True),
+    (["文件已存在", "同名文件已上传"],
+     ErrorType.PAGE_ERROR_PERSISTENT, True),
+
+    # 可恢复错误（重试/恢复后可修复）
+    (["登录失效", "请重新登录", "登录过期", "会话过期", "login expired",
+      "已被迫下线", "异地登录", "另一个地点登录", "被迫下线", "账号在另一个地点",
+      "您的账号", "被踢下线", "账号被踢"],
+     ErrorType.LOGIN_EXPIRED, False),
+    (["网络超时", "网络异常", "连接超时", "请求超时", "network timeout"],
+     ErrorType.NETWORK_ERROR, False),
+    (["表单校验", "请选择", "必填", "格式不正确"],
+     ErrorType.FORM_VALIDATE_FAIL, False),
+    (["上传超时", "处理超时"],
+     ErrorType.UPLOAD_SUBMIT_TIMEOUT, False),
+    (["系统繁忙", "服务异常", "请稍后重试", "服务器错误"],
+     ErrorType.PAGE_ERROR_PERSISTENT, False),  # 临时性服务端错误，可重试
+]
+
+# ─── 会话丢失关键词 ───
+# 用于检测账号被踢下线/异地登录等会话失效场景
+# browser_automation.py 和 upload_processor.py 统一从此处导入
+
+SESSION_LOST_KEYWORDS = [
+    "已被迫下线", "被迫下线", "异地登录", "另一个地点登录",
+    "账号在另一个地点", "您的账号",
+]

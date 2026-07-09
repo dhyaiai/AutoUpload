@@ -173,25 +173,25 @@ class BrowserAutomation:
         """
         执行自动登录操作
         适配七天网络数智作业系统登录页面
-        
+
         Returns:
             True表示登录成功,False表示失败
         """
         try:
             self._log("正在执行登录操作...")
-            
+
             # 查找账号输入框(通过placeholder定位)
             username_input = self.driver.find_element(By.CSS_SELECTOR, "input[placeholder='请输入您的账户']")
             username_input.clear()
             # 用 JS 直接设值 + dispatch input 事件，绕过 send_keys 逐字符开销
             # Element UI 的 v-model 监听 input 事件，手动 dispatch 即可触发响应
+            # JS dispatchEvent 是同步的，无需 sleep
             self.driver.execute_script("""
                 var el = arguments[0];
                 el.value = arguments[1];
                 el.dispatchEvent(new InputEvent('input', {bubbles: true}));
                 el.dispatchEvent(new Event('change', {bubbles: true}));
             """, username_input, self.config.username)
-            time.sleep(self.config.sleep_interval)
             self._log("已输入账号")
 
             # 查找密码输入框(通过placeholder定位)
@@ -203,9 +203,8 @@ class BrowserAutomation:
                 el.dispatchEvent(new InputEvent('input', {bubbles: true}));
                 el.dispatchEvent(new Event('change', {bubbles: true}));
             """, password_input, self.config.password)
-            time.sleep(self.config.sleep_interval)
             self._log("已输入密码")
-            
+
             # 查找登录按钮(通过ID或包含'立即登录'文本的span)
             try:
                 # 方法1: 通过ID定位(最可靠)
@@ -217,12 +216,23 @@ class BrowserAutomation:
                 except NoSuchElementException:
                     # 方法3: 通过class定位
                     login_button = self.driver.find_element(By.CSS_SELECTOR, "button.login-btn.el-button--primary")
-            
+
             login_button.click()
             self._log("已点击登录按钮")
 
-            # 等待登录完成(可以根据实际情况调整等待条件)
-            time.sleep(3)
+            # 等待登录完成：URL跳转离开login页，或出现角色选择页，或出现登录错误
+            # 使用 innerText 替代 page_source 避免每次轮询下载完整HTML（~30次/15s）
+            try:
+                WebDriverWait(self.driver, 15).until(
+                    lambda d: (
+                        "login" not in d.current_url.lower()
+                        or "选择角色" in d.execute_script(
+                            "return document.body ? document.body.innerText : ''")
+                        or d.find_elements(By.CSS_SELECTOR, ".el-message--error, .el-form-item__error")
+                    )
+                )
+            except TimeoutException:
+                self._log("警告: 登录等待超时(15s)，继续检查状态...")
 
             # 检查是否需要选择角色
             if self._handle_role_selection():
@@ -230,31 +240,32 @@ class BrowserAutomation:
             else:
                 self._log("警告: 角色选择可能失败,继续执行")
 
-            # 等待页面跳转完毕
-            time.sleep(2)
-            ready = self.driver.execute_script("return document.readyState;")
-            self._log(f"登录后页面状态: {ready}, URL: {self.driver.current_url}")
+            # 等待页面就绪（最多10秒）
+            try:
+                WebDriverWait(self.driver, 10).until(
+                    lambda d: d.execute_script("return document.readyState;") == "complete"
+                )
+            except TimeoutException:
+                pass
+            self._log(f"登录后页面状态: URL={self.driver.current_url}")
 
             # 验证是否登录成功(检查URL是否变化或出现主页元素)
-            # TODO: 根据实际网站调整验证方式
             try:
                 # 方法1: 检查URL是否跳转到主页
                 current_url = self.driver.current_url
                 if "login" not in current_url.lower():
                     self._log(f"登录成功,当前URL: {current_url}")
                     return True
-                
+
                 # 方法2: 检查是否有用户信息或主页元素
-                # 可以尝试查找常见的首页元素,如导航栏、用户头像等
                 try:
-                    # 尝试查找可能的用户信息元素(需要根据实际页面调整)
                     user_elements = [
                         (By.CLASS_NAME, "user-info"),
                         (By.CLASS_NAME, "username"),
                         (By.ID, "user-name"),
                         (By.CSS_SELECTOR, ".header .user"),
                     ]
-                    
+
                     for locator_type, locator_value in user_elements:
                         try:
                             self.driver.find_element(locator_type, locator_value)
@@ -264,14 +275,14 @@ class BrowserAutomation:
                             continue
                 except:
                     pass
-                
+
                 # 如果以上方法都失败,简单判断没有错误提示也算成功
                 error_elements = [
                     (By.CLASS_NAME, "error"),
                     (By.CLASS_NAME, "error-message"),
                     (By.CSS_SELECTOR, ".ant-message-error"),
                 ]
-                
+
                 has_error = False
                 for locator_type, locator_value in error_elements:
                     try:
@@ -280,7 +291,7 @@ class BrowserAutomation:
                         break
                     except NoSuchElementException:
                         continue
-                
+
                 if not has_error:
                     self._log("未检测到错误信息,假设登录成功")
                     return True
@@ -303,7 +314,7 @@ class BrowserAutomation:
         """
         处理角色选择界面
         根据config.json中的ROLE配置自动选择对应角色(默认超级管理员)
-        
+
         Returns:
             True表示选择成功或无需选择,False表示选择失败
         """
@@ -311,11 +322,18 @@ class BrowserAutomation:
             # 检查是否出现角色选择界面
             # 通过检测页面标题或特定元素来判断
             page_source = self.driver.page_source
-            
+
             # 如果页面包含"选择角色",说明需要选择角色
             if "选择角色" in page_source:
                 self._log("检测到角色选择界面")
-                time.sleep(1)
+
+                # 等待角色卡片可点击（替代 time.sleep(1)）
+                try:
+                    WebDriverWait(self.driver, 5).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, ".role-item, [id^='changeRole_']"))
+                    )
+                except TimeoutException:
+                    self._log("警告: 等待角色卡片超时，继续尝试...")
 
                 # 获取配置的角色,默认为"teacher"
                 role = self.config.get("ROLE", "teacher")
@@ -341,7 +359,7 @@ class BrowserAutomation:
                                 By.XPATH,
                                 "//*[contains(text(), '超级管理员')]/ancestor::div[@class='role-item']"
                             )
-                    
+
                     admin_card.click()
                     self._log("已选择超级管理员角色")
                 else:
@@ -363,11 +381,24 @@ class BrowserAutomation:
                                 By.XPATH,
                                 "//*[contains(text(), '老师')]/ancestor::div[@class='role-item']"
                             )
-                    
+
                     teacher_card.click()
                     self._log("已选择老师角色")
 
-                time.sleep(self.config.sleep_interval)
+                # 等待确定按钮可点击（替代 time.sleep(self.config.sleep_interval)）
+                try:
+                    WebDriverWait(self.driver, 3).until(
+                        EC.element_to_be_clickable((By.ID, "changeRole_2"))
+                    )
+                except TimeoutException:
+                    try:
+                        WebDriverWait(self.driver, 3).until(
+                            EC.element_to_be_clickable(
+                                (By.XPATH, "//span[text()='确定']/parent::button")
+                            )
+                        )
+                    except TimeoutException:
+                        pass
 
                 # 点击确定按钮
                 try:
@@ -386,12 +417,18 @@ class BrowserAutomation:
                             By.CSS_SELECTOR,
                             "button.el-button--primary[type='button']"
                         )
-                
+
                 confirm_btn.click()
                 self._log("已点击确定按钮")
 
-                # 等待角色切换完成
-                time.sleep(5)
+                # 等待角色选择界面消失（替代 time.sleep(5)）
+                try:
+                    WebDriverWait(self.driver, 10).until(
+                        lambda d: "选择角色" not in d.page_source
+                    )
+                    self._log("角色选择界面已关闭")
+                except TimeoutException:
+                    self._log("警告: 等待角色选择界面关闭超时(10s)，继续执行")
 
                 return True
             else:
@@ -417,6 +454,18 @@ class BrowserAutomation:
             # 确保页面完全加载
             ready_state = self.driver.execute_script("return document.readyState;")
             self._log(f"document.readyState: {ready_state}")
+
+            # 0. 前置检查：如果当前在登录页，直接判定会话丢失
+            current_url = self.driver.current_url
+            if "login" in current_url.lower() or "/login" in current_url:
+                self._log(f"前置检测: 当前页面为登录页({current_url})，会话已丢失")
+                self.is_logged_in = False
+                return False
+
+            # 0.5 扫描页面文本中的会话丢失关键词（页面可能未跳转但显示了踢下线通知）
+            if self._detect_session_lost_on_page():
+                self._log("前置检测: 页面文本含会话丢失信号，中止学校校验")
+                return False
 
             # 1. 查找教师下拉触发元素（多选择器兜底）
             teacher_dropdown = None
@@ -592,7 +641,7 @@ class BrowserAutomation:
             # 4. 不一致：点击学校元素弹出切换对话框
             self._log("学校不一致，正在切换...")
             self.driver.execute_script("arguments[0].click();", school_li)
-            time.sleep(2)  # 等待对话框加载
+            time.sleep(1)  # 等待对话框加载
             
             # 检查是否出现"切换学校"对话框
             page_source = self.driver.page_source
@@ -760,7 +809,7 @@ class BrowserAutomation:
             
             # 步骤6: 等待学校切换完成
             self._log("等待学校切换完成...")
-            time.sleep(2)
+            time.sleep(1)
             
             # 步骤7: 验证学校是否切换成功
             # 重新定位教师下拉元素（之前的引用可能因页面刷新而失效）
@@ -1020,6 +1069,165 @@ class BrowserAutomation:
             return {"success": False, "state": "unknown",
                     "details": f"检测异常: {str(e)[:200]}"}
 
+    def capture_page_error(self) -> dict:
+        """
+        全面抓取页面当前显示的所有错误信息，供 Agent 在上传失败后分析根因。
+
+        与 detect_page_state 不同，本方法专注于提取错误文本内容，
+        并判断是否为不可恢复的永久性业务错误。
+
+        检测范围：
+          - Element UI 错误 toast (.el-message--error)
+          - Element UI 错误通知 (.el-notification--error)
+          - Element UI 错误警告 (.el-alert--error)
+          - 表单校验错误 (.el-form-item__error)
+          - 对话框内的错误文本 (.el-dialog__body 中的 error/警告文本)
+          - 页面正文中的错误提示（通用）
+
+        Returns:
+            {
+                "success": bool,
+                "has_error": bool,           # 页面是否显示任何错误
+                "errors": [                  # 所有捕获到的错误文本列表
+                    {"text": str, "source": str, "selector": str}
+                ],
+                "combined_text": str,        # 合并后的完整错误文本
+                "is_permanent": bool,        # 是否包含不可恢复的业务错误
+                "permanent_reason": str,     # 判定为永久错误的依据
+                "suggested_error_type": str, # 推断的 ErrorType
+                "page_state": str,           # 当前页面状态（辅助信息）
+            }
+        """
+        result = {
+            "success": False,
+            "has_error": False,
+            "errors": [],
+            "combined_text": "",
+            "is_permanent": False,
+            "permanent_reason": "",
+            "suggested_error_type": "",
+            "page_state": "unknown",
+        }
+
+        try:
+            if not self.driver:
+                result["page_state"] = "no_browser"
+                return result
+
+            # 先获取页面状态作为上下文
+            page_state_info = self.detect_page_state()
+            result["page_state"] = page_state_info.get("state", "unknown") if page_state_info.get("success") else "unknown"
+
+            # ── 按优先级检测各类错误元素 ──
+            error_selectors = [
+                # (CSS选择器, 来源标签, 是否需检查可见性)
+                (".el-message--error", "error_toast", True),
+                (".el-notification--error", "error_notification", True),
+                (".el-notification--warning", "warning_notification", True),
+                (".el-alert--error", "error_alert", True),
+                (".el-alert--warning", "warning_alert", True),
+                (".el-form-item__error", "form_validation", True),
+                # 对话框内的错误文本
+                (".el-dialog__body .el-alert--error", "dialog_alert", True),
+                (".el-dialog__body", "dialog_body", False),  # 需要额外过滤
+            ]
+
+            for selector, source, check_visible in error_selectors:
+                try:
+                    elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    for el in elements:
+                        try:
+                            if check_visible and not el.is_displayed():
+                                continue
+                            text = el.text.strip()
+                            if not text:
+                                continue
+                            # 对话框body需要过滤：只保留包含错误/警告关键词的文本
+                            if source == "dialog_body":
+                                error_keywords = ["错误", "失败", "异常", "error", "fail",
+                                                   "未开通", "权限", "不支持", "超限",
+                                                   "已存在", "重复", "禁用", "过期"]
+                                if not any(kw in text for kw in error_keywords):
+                                    continue
+                                # 截取关键部分（对话框可能包含大量无关文本）
+                                text_lines = text.split("\n")
+                                text = "\n".join(line for line in text_lines
+                                                  if any(kw in line for kw in error_keywords))
+                                if not text:
+                                    continue
+
+                            result["errors"].append({
+                                "text": text[:300],
+                                "source": source,
+                                "selector": selector,
+                            })
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+
+            # ── 额外检测：页面全局错误（非 Element UI 组件）──
+            try:
+                # 检测通用错误提示区域
+                generic_error_selectors = [
+                    ".error-message", ".error-text", ".err-msg",
+                    ".msg-error", ".tip-error",
+                ]
+                for gs in generic_error_selectors:
+                    try:
+                        els = self.driver.find_elements(By.CSS_SELECTOR, gs)
+                        for el in els:
+                            if el.is_displayed() and el.text.strip():
+                                text = el.text.strip()
+                                if len(text) > 3:  # 过滤太短的无意义文本
+                                    result["errors"].append({
+                                        "text": text[:200],
+                                        "source": "generic_error",
+                                        "selector": gs,
+                                    })
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            # ── 汇总 ──
+            if result["errors"]:
+                result["has_error"] = True
+                result["combined_text"] = " | ".join(
+                    e["text"] for e in result["errors"]
+                )
+
+            # ── 分类：判断是否永久性错误 ──
+            if result["has_error"]:
+                from error_types import PAGE_ERROR_PATTERNS, ErrorType
+                combined_lower = result["combined_text"].lower()
+                for keywords, error_type, is_permanent in PAGE_ERROR_PATTERNS:
+                    for kw in keywords:
+                        if kw.lower() in combined_lower:
+                            result["suggested_error_type"] = error_type.value
+                            result["is_permanent"] = is_permanent
+                            result["permanent_reason"] = (
+                                f"页面错误匹配关键词'{kw}' → "
+                                f"{'不可恢复的业务错误' if is_permanent else '可恢复错误'}"
+                            )
+                            break
+                    if result["suggested_error_type"]:
+                        break
+
+                # 未被规则匹配的默认处理：标记为未分类但可恢复
+                # 由上层 ReAct 循环和规则引擎根据上下文做最终决策
+                if not result["suggested_error_type"]:
+                    result["suggested_error_type"] = ErrorType.UNKNOWN.value
+                    result["is_permanent"] = False
+                    result["permanent_reason"] = "页面显示未分类的错误信息，交由 Agent 进一步判断"
+
+            result["success"] = True
+            return result
+
+        except Exception as e:
+            result["combined_text"] = f"捕获页面错误时异常: {str(e)[:200]}"
+            return result
+
     def recover_session(self) -> dict:
         """
         智能会话恢复：检测当前页面状态并执行对应的恢复操作。
@@ -1079,7 +1287,7 @@ class BrowserAutomation:
                     try:
                         if self._handle_role_selection():
                             self._log("[recover_session] 角色选择完成")
-                            time.sleep(3)
+                            time.sleep(1)
                             return {"success": True, "state_before": "role_select",
                                     "action_taken": "auto_role_select", "error": ""}
                         else:
@@ -1129,7 +1337,7 @@ class BrowserAutomation:
                         webdriver.ActionChains(self.driver).send_keys(Keys.ESCAPE).perform()
                         time.sleep(1)
                         self.driver.refresh()
-                        time.sleep(2)
+                        time.sleep(1)
                         # 刷新后继续循环重新检测
                         continue
                     except Exception:
@@ -1142,7 +1350,7 @@ class BrowserAutomation:
                     self._log("[recover_session] 未知页面状态，尝试刷新后重新检测...")
                     try:
                         self.driver.refresh()
-                        time.sleep(2)
+                        time.sleep(1)
                         # 刷新后继续循环重新检测
                         continue
                     except Exception:
@@ -1473,8 +1681,23 @@ class BrowserAutomation:
             error_text = ""
 
             self.driver.implicitly_wait(0)  # 轮询阶段禁用隐式等待
+            poll_count = 0  # 轮询计数器，用于降低部分检查频率
             try:
                 while time.time() < deadline:
+                    poll_count += 1
+                    # 0) 前置检测：页面是否跳转到登录页（会话丢失）
+                    try:
+                        url = self.driver.current_url
+                        if "login" in url.lower() or "/login" in url:
+                            error_text = "会话丢失(页面跳转到登录页)，账号可能被异地登录踢下线"
+                            self._log(f"[FAIL] {error_text}")
+                            self.is_logged_in = False
+                            self.last_upload_error = error_text
+                            result = False
+                            break
+                    except Exception:
+                        pass  # 读取URL失败则跳过本次检查
+
                     # 1) 检查提交按钮是否已消失（对话框关闭的最可靠信号）
                     try:
                         submit_btn.is_enabled()  # 触发 StaleElementReferenceException 如果按钮已脱离DOM
@@ -1524,11 +1747,25 @@ class BrowserAutomation:
                                 self._log(f"[FAIL] 学校未开通数智作业服务: {error_text}")
                             else:
                                 self._log(f"[FAIL] 检测到错误提示: {error_text}")
+                            # 账号被踢下线 → 标记会话失效，阻止后续文件继续上传
+                            if ("另一个地点登录" in error_text
+                                    or "被迫下线" in error_text
+                                    or "异地登录" in error_text):
+                                self.is_logged_in = False
+                                self._log("[WARN] 会话已失效(账号被踢下线)，后续文件将暂停处理")
                             self.last_upload_error = error_text
                             result = False
                             break
                     except Exception:
                         pass
+
+                    # 3.5) 每3秒扫描一次页面文本中的会话丢失信号（降低开销）
+                    if poll_count % 3 == 0 and self._detect_session_lost_on_page():
+                        error_text = "会话丢失(页面文本检测到踢下线信号)"
+                        self._log(f"[FAIL] {error_text}")
+                        self.last_upload_error = error_text
+                        result = False
+                        break
 
                     time.sleep(1)
             finally:
@@ -1639,7 +1876,7 @@ class BrowserAutomation:
                     base_url = self.config.website_url.rstrip('/')
                     # 尝试直接跳转到首页
                     self.driver.get(base_url)
-                    time.sleep(2)
+                    time.sleep(1)
 
                     # 等待页面加载
                     WebDriverWait(self.driver, 10).until(
@@ -1665,6 +1902,33 @@ class BrowserAutomation:
             import traceback
             traceback.print_exc()
             return False
+
+
+    # ─── 会话丢失检测 ───
+
+    def _detect_session_lost_on_page(self) -> bool:
+        """
+        扫描当前页面可见文本，检测会话丢失信号（如"已被迫下线"等toast/通知）。
+        仅做检测，不触发页面刷新——由调用方决定后续操作。
+
+        Returns:
+            True=检测到会话已丢失, False=未检测到会话丢失信号
+        """
+        if not self.driver:
+            return False
+        try:
+            from error_types import SESSION_LOST_KEYWORDS
+            body_text = self.driver.execute_script(
+                "return document.body ? document.body.innerText.substring(0, 1000) : ''"
+            )
+            for kw in SESSION_LOST_KEYWORDS:
+                if kw in body_text:
+                    self._log(f"检测到会话丢失关键词: {kw}")
+                    self.is_logged_in = False
+                    return True
+        except Exception:
+            pass
+        return False
 
     def check_browser_status(self) -> bool:
         """
@@ -1716,6 +1980,16 @@ class BrowserAutomation:
                 except NoSuchElementException:
                     continue
 
+            # 方式2.5: 扫描页面文本中的会话丢失关键词（使用共享检测方法）
+            if self._detect_session_lost_on_page():
+                return False
+
+            # 方式3: URL 包含 login 说明已跳转到登录页，判定为未登录
+            if "login" in current_url.lower():
+                self._log(f"检测到登录页URL: {current_url}")
+                self.is_logged_in = False
+                return False
+
             return True  # 无明确失败信号时假设仍登录（避免误判）
         except Exception:
             # 浏览器崩溃等异常才判定失效
@@ -1733,7 +2007,7 @@ class BrowserAutomation:
         """
         print("正在重启浏览器...")
         self.close()
-        time.sleep(2)
+        time.sleep(1)
         return self.initialize()
     
     # ─── 页面检查工具（供 AI Agent ReAct 循环调用）───

@@ -21,15 +21,49 @@ class ReActLoop:
     """
 
     # LLM 输出格式的正则
+    # ── Action 匹配 ──
+    # 主模式：Action: tool_name(key=value, ...)  —— 末尾不锚定 $，允许行尾有注释
     ACTION_RE = re.compile(
-        r'Action:\s*([a-zA-Z_][a-zA-Z0-9_]*)'  # 工具名
-        r'\s*\((.*?)\)'  # 参数括号
-        r'(?:\s*$)',  # 行尾
+        r'(?:^|\n)\s*Action\s*[:：]\s*'             # Action: 或 Action：（中英文冒号）
+        r'([a-zA-Z_][a-zA-Z0-9_]*)'                  # 工具名
+        r'\s*\(\s*(.*?)\s*\)'                         # 参数（允许括号内空白）
+        r'(?:\s*(?:#.*)?)$',                          # 行尾（可选注释）
         re.MULTILINE
     )
-    # 使用 \Z 替代 $ 以支持多行 JSON（re.MULTILINE 下 $ 匹配行尾会导致截断）
-    FINAL_RE = re.compile(r'Final:\s*(.+?)(?:\s*\Z)', re.MULTILINE | re.DOTALL)
-    THOUGHT_RE = re.compile(r'Thought:\s*(.+?)(?:\n\n|\n(?=Action:|\n*Final:)|\Z)', re.MULTILINE | re.DOTALL)
+    # 降级模式1：无括号调用（无参工具省略了括号）
+    ACTION_NOARGS_RE = re.compile(
+        r'(?:^|\n)\s*Action\s*[:：]\s*'
+        r'([a-zA-Z_][a-zA-Z0-9_]*)'
+        r'(?:\s*\(\))?'                                # 可选空括号
+        r'\s*$',
+        re.MULTILINE
+    )
+    # 降级模式2：代码块包裹的 Action（LLM 习惯用 ``` 包裹）
+    ACTION_FENCED_RE = re.compile(
+        r'```(?:json|text|plain)?\s*\n?'
+        r'\s*Action\s*[:：]\s*'
+        r'([a-zA-Z_][a-zA-Z0-9_]*)'
+        r'\s*\(\s*(.*?)\s*\)'
+        r'\s*\n?```',
+        re.MULTILINE | re.DOTALL
+    )
+    # ── Final 匹配 ──
+    # 主模式：不要求 Final 在字符串绝对末尾，允许后面有空白或代码块结束符
+    FINAL_RE = re.compile(
+        r'(?:^|\n)\s*Final\s*[:：]\s*'
+        r'(\{.+?\}|\[.+?\]|.+?)'                       # JSON 对象/数组 或 自由文本
+        r'\s*$',
+        re.MULTILINE | re.DOTALL
+    )
+    # 降级：代码块包裹的 Final
+    FINAL_FENCED_RE = re.compile(
+        r'```(?:json)?\s*\n?'
+        r'(?:Final\s*[:：]\s*)?'                       # 代码块内可选的 Final: 前缀
+        r'(\{[\s\S]+?\}|\[[\s\S]+?\])'                 # JSON
+        r'\s*\n?```',
+        re.MULTILINE
+    )
+    THOUGHT_RE = re.compile(r'Thought\s*[:：]\s*(.+?)(?:\n\n|\n(?=Action|\n*Final)|\Z)', re.MULTILINE | re.DOTALL)
 
     def __init__(self,
                  llm,
@@ -139,8 +173,10 @@ Final: [JSON格式的最终结果]
                 last_thought = thought_match.group(1).strip()
                 self.log(f"  Thought: {last_thought[:100]}...")
 
-            # 检查是否是 Final
+            # ── 检测 Final（含降级模式）──
             final_match = self.FINAL_RE.search(response)
+            if not final_match:
+                final_match = self.FINAL_FENCED_RE.search(response)  # 代码块降级
             if final_match:
                 final_text = final_match.group(1).strip()
                 self.log(f"  Final: {final_text[:200]}")
@@ -167,16 +203,80 @@ Final: [JSON格式的最终结果]
                     "history": messages
                 }
 
-            # 检查是否包含 Action
+            # ── 检测 Action（含降级模式）──
             action_match = self.ACTION_RE.search(response)
             if not action_match:
-                # LLM 既没有给出 Action 也没有 Final，给予反馈
+                action_match = self.ACTION_FENCED_RE.search(response)  # 代码块降级
+            if not action_match:
+                # 无参降级：匹配 "Action: tool_name" 无括号形式
+                action_match = self.ACTION_NOARGS_RE.search(response)
+                # 过滤：排除 "Action: skip" / "Action: manual" 这类非工具调用词
+                if action_match and action_match.group(1) in self.tools:
+                    pass  # 有效无参调用
+                elif action_match:
+                    action_match = None  # 不匹配任何已知工具，继续找
+
+            if not action_match:
+                # LLM 没有输出可解析的 Action 或 Final，给予反馈
+                # 记录原始响应（截断）便于调试
+                self.log(f"  [ReAct] 未检测到 Action/Final，LLM原始响应(前200字): {response[:200]}")
                 self.log("  [ReAct] 未检测到 Action 或 Final，提示 LLM")
-                messages.append({
-                    "role": "user",
-                    "content": "你没有输出 Action 或 Final。请输出 Action: tool_name(key=value) 来调用工具，或 Final: {...} 来结束任务。"
-                })
+
+                # 动态反馈：第一第二次宽容提醒，第三次起给出强制格式示例
+                consecutive_failures = getattr(self, '_format_fail_count', 0) + 1
+                self._format_fail_count = consecutive_failures
+
+                # ── 逃生舱口：连续3次格式失败后，尝试直接从原始响应中提取 Final JSON ──
+                # 某些模型（如 Qwen）不遵循 ReAct 格式，但会在文本中输出 JSON 决策
+                if consecutive_failures >= 3:
+                    extracted = self._try_extract_final_from_text(response)
+                    if extracted:
+                        self.log(f"  [ReAct] 逃生舱口: 从原始响应中提取到 Final JSON (连续{consecutive_failures}次格式失败)")
+                        self._format_fail_count = 0
+                        try:
+                            result = json.loads(extracted) if isinstance(extracted, str) else extracted
+                        except json.JSONDecodeError:
+                            result = {"raw": str(extracted)}
+                        return {
+                            "success": True,
+                            "result": result,
+                            "steps": step,
+                            "reasoning": last_thought,
+                            "history": messages
+                        }
+
+                if consecutive_failures <= 2:
+                    hint = (
+                        "你的上一条回复没有包含 Action 或 Final 指令。\n\n"
+                        "请严格按以下格式回复（任选一种）：\n\n"
+                        "格式1 - 调用工具:\n"
+                        "Thought: 你的分析推理\n"
+                        "Action: tool_name(key1=value1)\n\n"
+                        "格式2 - 完成:\n"
+                        "Thought: 你的总结\n"
+                        "Final: {\"action\": \"enqueue\", \"retry_level\": \"L2\", \"reason\": \"...\"}\n\n"
+                        "注意：Action 必须在单独一行以 \"Action: \" 开头，"
+                        "Final 必须在单独一行以 \"Final: \" 开头。"
+                    )
+                else:
+                    # 第三次及以后：给出具体强制示例
+                    hint = (
+                        f"你已经连续 {consecutive_failures} 次没有输出正确的格式。\n\n"
+                        "现在你必须严格、一字不差地按以下格式回复。请选择一个行动：\n\n"
+                        "如果要调用工具，请输出：\n"
+                        "Thought: [一句话分析]\n"
+                        "Action: capture_page_error()\n\n"
+                        "如果要完成任务，请输出：\n"
+                        "Thought: 任务完成\n"
+                        "Final: {\"action\": \"enqueue\", \"retry_level\": \"L1\", \"reason\": \"页面干净可重试\"}\n\n"
+                        "现在就输出，不要输出其他额外内容，不要用中文冒号。"
+                    )
+
+                messages.append({"role": "user", "content": hint})
                 continue
+            else:
+                # 格式匹配成功，重置失败计数
+                self._format_fail_count = 0
 
             tool_name = action_match.group(1)
             args_str = action_match.group(2).strip()
@@ -242,6 +342,46 @@ Final: [JSON格式的最终结果]
                     value = value[1:-1]
             kwargs[key] = value
         return kwargs
+
+    @staticmethod
+    def _try_extract_final_from_text(text: str) -> Optional[str]:
+        """
+        逃生舱口：从 LLM 的任意文本响应中尝试提取 Final 决策 JSON。
+
+        当 LLM 连续多次不遵循 ReAct 格式时调用，作为最后的兜底尝试。
+        查找包含 action 字段的 JSON 对象（enqueue/manual/skip）。
+
+        Returns:
+            提取到的 JSON 字符串，或 None
+        """
+        # 策略1：匹配 {"action": "enqueue"|"manual"|"skip", ...} 的 JSON 对象
+        action_json_re = re.compile(
+            r'\{[^{}]*"action"\s*:\s*"(?:enqueue|manual|skip)"[^{}]*\}',
+            re.DOTALL
+        )
+        match = action_json_re.search(text)
+        if match:
+            return match.group(0)
+
+        # 策略2：从代码块中提取 JSON
+        fenced_match = re.search(r'```(?:json)?\s*\n?([\s\S]+?)\n?```', text)
+        if fenced_match:
+            inner = fenced_match.group(1).strip()
+            if inner.startswith('{'):
+                return inner
+
+        # 策略3：匹配任意 JSON 对象（最宽松）
+        json_obj_re = re.compile(r'\{[^{}]*\}')
+        for m in json_obj_re.finditer(text):
+            candidate = m.group(0)
+            try:
+                obj = json.loads(candidate)
+                if isinstance(obj, dict) and 'action' in obj:
+                    return candidate
+            except json.JSONDecodeError:
+                continue
+
+        return None
 
 
 # ─── CLI 独立测试入口 ───

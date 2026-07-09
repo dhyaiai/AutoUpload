@@ -55,6 +55,15 @@ class UploadProcessor:
         self._agent_retry_map: dict = {}       # file_path -> record_id (Agent触发的重试)
         self._agent_retry_level_map: dict = {} # file_path -> retry_level (重试自愈级别)
 
+        # 会话丢失标志：上传过程中检测到账号被踢下线时置位，
+        # run() 据此暂停队列消费，等待 Agent 恢复后再继续。
+        # 使用 threading.Event 保证跨线程读写安全（Agent 线程 ↔ UploadProcessor 线程）
+        self._session_lost = threading.Event()
+
+    def _on_session_lost(self):
+        """会话丢失时置位标志，Agent 主循环检测到后自动切换为 5s 快速轮询"""
+        self._session_lost.set()
+
     def set_agent(self, agent):
         """
         注入 AutoRetryAgent 引用，用于上传完成后回调通知
@@ -144,12 +153,33 @@ class UploadProcessor:
                     time.sleep(0.5)
                     continue
 
+                # 会话失效时暂停消费新任务，等待Agent恢复登录
+                if self._session_lost.is_set():
+                    # 检查浏览器是否已恢复登录
+                    if self.browser.driver and self.browser.is_logged_in:
+                        self._send_log("检测到浏览器会话已恢复，继续处理任务")
+                        self._session_lost.clear()
+                    else:
+                        time.sleep(2)
+                        continue
+
                 # 从队列中获取任务(超时1秒,以便检查停止信号)
                 file_path = self.task_queue.get(timeout=1)
                 
                 # 处理文件上传
                 self._process_file(file_path)
-                
+
+                # 检测到会话丢失 → 重新排队当前文件，暂停队列等待Agent恢复
+                if self._session_lost.is_set():
+                    # 标记登录态失效，使 Agent 能正确判断
+                    self.browser.is_logged_in = False
+                    self._send_log(
+                        "会话丢失(账号被踢下线)，当前文件已重新排队，"
+                        "暂停消费新任务，等待Agent恢复登录..."
+                    )
+                    # 当前文件放回队尾，等恢复后重试
+                    self.task_queue.put(file_path)
+
                 # 标记任务完成
                 self.task_queue.task_done()
             
@@ -315,9 +345,20 @@ class UploadProcessor:
                 if page_hint:
                     error_msg += f"（页面提示: {page_hint}）"
                 self._send_log(f"错误: {error_msg}")
+                # 检测会话丢失：页面提示中包含被迫下线/异地登录等关键词
+                school_error_type = ErrorType.SCHOOL_SWITCH_FAIL
+                if page_hint and self._is_session_lost_error(page_hint):
+                    school_error_type = ErrorType.LOGIN_EXPIRED
+                    self._on_session_lost()
+                # 也检查浏览器是否已标记登录失效（check_and_switch_school 内部已检测到登录页）
+                if not page_hint and not self.browser.is_logged_in:
+                    school_error_type = ErrorType.LOGIN_EXPIRED
+                    self._on_session_lost()
+                    error_msg = f"学校校验/切换失败: 会话丢失(页面已跳转到登录页，账号被踢下线)"
+                    self._send_log(f"错误: {error_msg}")
                 self._handle_failure(file_name, file_path, folder_name, school, grade, subject,
                                      error_msg, current_stage,
-                                     ErrorCategory.BROWSER_ERROR, ErrorType.SCHOOL_SWITCH_FAIL,
+                                     ErrorCategory.BROWSER_ERROR, school_error_type,
                                      error_context, existing_record_id=agent_retry_record_id)
                 return
             self._send_log(f"✓ 学校校验通过: {school}")
@@ -376,11 +417,15 @@ class UploadProcessor:
             elif last_error and last_error.strip():
                 # 优先使用浏览器捕获的网页实际错误信息，而非笼统提示
                 error_msg = self._clean_error_marker(last_error)
+                error_cat, error_type = self._classify_browser_error(error_msg)
                 self._send_log(f"✗ 上传失败: {file_name} - 页面错误: {error_msg}")
                 self._handle_failure(file_name, file_path, folder_name, school, grade, subject,
                                      error_msg, current_stage,
-                                     ErrorCategory.BROWSER_ERROR, ErrorType.UPLOAD_SUBMIT_TIMEOUT,
+                                     error_cat, error_type,
                                      error_context, existing_record_id=agent_retry_record_id)
+                # 检测到会话丢失 → 通知 run() 暂停队列
+                if error_type == ErrorType.LOGIN_EXPIRED:
+                    self._on_session_lost()
             else:
                 error_msg = "上传操作失败(详见浏览器日志)"
                 self._send_log(f"✗ 上传失败: {file_name} - {error_msg}")
@@ -388,6 +433,40 @@ class UploadProcessor:
                                      error_msg, current_stage,
                                      ErrorCategory.BROWSER_ERROR, ErrorType.UPLOAD_SUBMIT_TIMEOUT,
                                      error_context, existing_record_id=agent_retry_record_id)
+
+    # ─── 错误分类辅助方法 ───
+
+    @classmethod
+    def _is_session_lost_error(cls, error_text: str) -> bool:
+        """检测错误是否由会话丢失（账号被踢下线）引起"""
+        if not error_text:
+            return False
+        from error_types import SESSION_LOST_KEYWORDS
+        return any(kw in error_text for kw in SESSION_LOST_KEYWORDS)
+
+    @classmethod
+    def _classify_browser_error(cls, error_text: str) -> tuple:
+        """
+        根据浏览器错误信息推断 ErrorType，替代硬编码的 UPLOAD_SUBMIT_TIMEOUT
+
+        Returns:
+            (ErrorCategory, ErrorType) 元组
+        """
+        if not error_text:
+            return (ErrorCategory.BROWSER_ERROR, ErrorType.UPLOAD_SUBMIT_TIMEOUT)
+
+        if cls._is_session_lost_error(error_text):
+            return (ErrorCategory.BROWSER_ERROR, ErrorType.LOGIN_EXPIRED)
+        if "只能上传一个文件" in error_text:
+            # 可能是级联错误（上一文件因会话丢失已提交但响应丢失），
+            # 也可能是真正的重复提交，先归类为表单校验失败
+            return (ErrorCategory.BROWSER_ERROR, ErrorType.FORM_VALIDATE_FAIL)
+        if "学校未开通" in error_text or "数智作业服务" in error_text:
+            return (ErrorCategory.PLATFORM_BIZ_ERROR, ErrorType.SCHOOL_NOT_ACTIVATED)
+        if "权限" in error_text or "无权" in error_text:
+            return (ErrorCategory.PLATFORM_BIZ_ERROR, ErrorType.PERMISSION_DENIED)
+
+        return (ErrorCategory.BROWSER_ERROR, ErrorType.UPLOAD_SUBMIT_TIMEOUT)
 
     @staticmethod
     def _is_school_not_activated_error(error_text: str) -> bool:

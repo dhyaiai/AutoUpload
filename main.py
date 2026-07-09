@@ -149,9 +149,13 @@ def backend_worker(stop_event: threading.Event, task_queue: Queue,
             else:
                 browser_error_logged = False
 
-        # 步骤5: 收到停止信号,等待任务队列清空
+        # 步骤5: 收到停止信号,等待任务队列清空(最多等30秒防止无限阻塞)
         log_queue.put("收到停止信号,正在等待任务完成...")
-        task_queue.join()  # 等待所有任务完成
+        drain_deadline = time.time() + 30
+        while not task_queue.empty() and time.time() < drain_deadline:
+            time.sleep(0.5)
+        if not task_queue.empty():
+            log_queue.put(f"警告: 等待超时,队列中仍有{task_queue.qsize()}个未完成任务,强制退出")
 
         # 步骤6: 停止文件监控
         log_queue.put("正在停止文件监控...")
@@ -239,7 +243,15 @@ def main():
 
         # 等待后台线程结束
         if worker_thread is not None:
-            worker_thread.join(timeout=10)
+            worker_thread.join(timeout=15)
+            if worker_thread.is_alive():
+                print("警告: 后台线程未能在15秒内退出, 强制清理浏览器进程...")
+                # 强制关闭浏览器，防止 ChromeDriver/Chrome 进程残留
+                try:
+                    browser = BrowserAutomation()
+                    browser.close()
+                except Exception:
+                    pass
 
         print("程序已退出")
 

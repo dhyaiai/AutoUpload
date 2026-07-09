@@ -354,11 +354,11 @@ class DatabaseManager:
         return [dict(row) for row in cursor.fetchall()]
 
     def get_failed_records_for_stats(self) -> List[Dict]:
-        """获取失败记录的关键字段,用于统计面板显示"""
+        """获取失败记录的关键字段,用于统计面板显示(从分析表读取,持久保留)"""
         cursor = self._connection.cursor()
         cursor.execute('''
-            SELECT file_name, school, grade, subject, upload_time, error_message, agent_retry_success
-            FROM upload_records WHERE status = 'failed'
+            SELECT file_name, school, grade, subject, upload_time, error_message
+            FROM analysis_records WHERE status = 'failed'
             ORDER BY upload_time DESC
         ''')
         return [dict(row) for row in cursor.fetchall()]
