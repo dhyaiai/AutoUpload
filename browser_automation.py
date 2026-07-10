@@ -6,6 +6,7 @@
 import os
 import sys
 import time
+import threading
 from datetime import datetime, timedelta
 from typing import Optional
 from selenium import webdriver
@@ -38,6 +39,7 @@ class BrowserAutomation:
             cls._instance.is_logged_in = False
             cls._instance.last_active_time = time.time()
             cls._instance.last_upload_error = ""  # 最近一次 upload_file 的 error_text
+            cls._instance._lock = threading.RLock()  # 保护浏览器生命周期操作的线程安全
         # 每次调用都更新 log_queue（允许后续调用者注入有效的日志队列）
         if log_queue is not None:
             cls._instance.log_queue = log_queue
@@ -72,102 +74,120 @@ class BrowserAutomation:
         """
         延迟初始化: 只在浏览器未运行时才启动
         供 UploadProcessor 在处理文件前调用
+        线程安全：加锁防止多线程同时初始化浏览器
 
         Returns:
             True表示浏览器可用,False表示启动失败
         """
-        if self.is_initialized:
-            # 验证浏览器是否真的还活着（用户可能手动关闭了浏览器）
-            if self.check_browser_status():
-                self.update_activity_time()
-                return True
-            else:
-                self._log("检测到浏览器已被手动关闭，将重新初始化...")
-                self.is_logged_in = False
-                self.driver = None
-        self._log("检测到新文件,正在启动浏览器...")
-        return self.initialize()
+        with self._lock:
+            if self.is_initialized:
+                # 验证浏览器是否真的还活着（用户可能手动关闭了浏览器）
+                if self.check_browser_status():
+                    self.update_activity_time()
+                    return True
+                else:
+                    self._log("检测到浏览器已被手动关闭，将重新初始化...")
+                    self.is_logged_in = False
+                    self.driver = None
+            self._log("检测到新文件,正在启动浏览器...")
+            return self.initialize()
 
     def initialize(self):
         """
         初始化并启动Chrome浏览器
         配置浏览器选项,加载驱动,打开目标网站
-        
+        线程安全：加锁防止多线程同时初始化
+
         Returns:
             True表示启动成功,False表示失败
         """
-        try:
-            self._log("正在启动Chrome浏览器...")
-            
-            # 创建Chrome选项
-            options = ChromeOptions()
-            options.page_load_strategy = "eager"  # DOM就绪即返回，不等图片加载
-            # 添加常用选项(可根据需要调整)
-            options.add_argument('--start-maximized')  # 最大化窗口
-            # options.add_argument('--disable-gpu')      # 禁用GPU加速
-            
-            # 创建WebDriver实例
-            driver_path = self.config.chrome_driver_path
-            
-            # 检查ChromeDriver是否存在
-            import os
-            if driver_path and driver_path != "./chromedriver.exe":
-                # 如果配置了驱动路径且不是默认值
-                if os.path.exists(driver_path):
-                    self._log(f"使用指定的ChromeDriver: {driver_path}")
-                    from selenium.webdriver.chrome.service import Service
-                    service = Service(executable_path=driver_path)
-                    self.driver = webdriver.Chrome(service=service, options=options)
+        # 注意：调用者（ensure_initialized/restart_browser）可能已持有 _lock，
+        # 此处用 RLock 允许同一线程重入。
+        with self._lock:
+            try:
+                # 防御：初始化前先关闭已存在的残留 driver（如上次异常未清理的）
+                if self.driver is not None:
+                    try:
+                        self.driver.quit()
+                    except Exception:
+                        pass
+                    self.driver = None
+                    self.is_logged_in = False
+
+                self._log("正在启动Chrome浏览器...")
+
+                # 创建Chrome选项
+                options = ChromeOptions()
+                options.page_load_strategy = "eager"  # DOM就绪即返回，不等图片加载
+                # 添加常用选项(可根据需要调整)
+                options.add_argument('--start-maximized')  # 最大化窗口
+                # options.add_argument('--disable-gpu')      # 禁用GPU加速
+
+                # 创建WebDriver实例
+                driver_path = self.config.chrome_driver_path
+
+                # 检查ChromeDriver是否存在
+                import os
+                if driver_path and driver_path != "./chromedriver.exe":
+                    # 如果配置了驱动路径且不是默认值
+                    if os.path.exists(driver_path):
+                        self._log(f"使用指定的ChromeDriver: {driver_path}")
+                        from selenium.webdriver.chrome.service import Service
+                        service = Service(executable_path=driver_path)
+                        self.driver = webdriver.Chrome(service=service, options=options)
+                    else:
+                        self._log(f"警告: ChromeDriver不存在于 {driver_path},尝试自动查找")
+                        self.driver = webdriver.Chrome(options=options)
                 else:
-                    self._log(f"警告: ChromeDriver不存在于 {driver_path},尝试自动查找")
+                    # 否则让Selenium自动管理驱动(推荐方式)
+                    self._log("使用Selenium自动管理的ChromeDriver")
                     self.driver = webdriver.Chrome(options=options)
-            else:
-                # 否则让Selenium自动管理驱动(推荐方式)
-                self._log("使用Selenium自动管理的ChromeDriver")
-                self.driver = webdriver.Chrome(options=options)
-            
-            # 设置隐式等待时间(查找元素时最多等待10秒)
-            self.driver.implicitly_wait(10)
-            # 限制异步脚本执行超时（防止 execute_async_script 无限卡死）
-            self.driver.timeouts.script = 5
-            
-            # 打开目标网站
-            self._log(f"正在访问网站: {self.config.website_url}")
-            self.driver.get(self.config.website_url)
-            
-            # 执行登录
-            if self._login():
-                self.is_logged_in = True
-                self.last_active_time = time.time()
-                self._log("浏览器初始化成功,已登录")
-                self._log("BROWSER_STATUS:CONNECTED")
-                return True
-            else:
-                self._log("错误: 登录失败")
+
+                # 设置隐式等待时间(查找元素时最多等待10秒)
+                self.driver.implicitly_wait(10)
+                # 限制异步脚本执行超时（防止 execute_async_script 无限卡死）
+                self.driver.timeouts.script = 5
+
+                # 打开目标网站
+                self._log(f"正在访问网站: {self.config.website_url}")
+                self.driver.get(self.config.website_url)
+
+                # 执行登录
+                if self._login():
+                    self.is_logged_in = True
+                    self.last_active_time = time.time()
+                    self._log("浏览器初始化成功,已登录")
+                    self._log("BROWSER_STATUS:CONNECTED")
+                    return True
+                else:
+                    self._log("错误: 登录失败")
+                    self.close()
+                    return False
+
+            except Exception as e:
+                error_msg = str(e)
+                self._log(f"错误: 浏览器启动失败 - {error_msg}")
+
+                # 提供更详细的错误提示
+                if "chromedriver" in error_msg.lower() or "chrome" in error_msg.lower():
+                    self._log("")
+                    self._log("可能的原因:")
+                    self._log("1. Chrome浏览器未安装或版本不兼容")
+                    self._log("2. ChromeDriver版本与Chrome浏览器版本不匹配")
+                    self._log("3. ChromeDriver不在系统PATH中")
+                    self._log("")
+                    self._log("解决方案:")
+                    self._log("- 确保已安装最新版本的Chrome浏览器")
+                    self._log("- 删除config.json中的CHROME_DRIVER_PATH配置,让Selenium自动管理")
+                    self._log("- 或下载与Chrome版本匹配的ChromeDriver并放到正确位置")
+
+                import traceback
+                tb_str = traceback.format_exc()
+                self._log(f"详细错误信息:\n{tb_str}")
+
+                # 清理残留 driver（初始化中途失败时 driver 可能已部分创建）
                 self.close()
                 return False
-        
-        except Exception as e:
-            error_msg = str(e)
-            self._log(f"错误: 浏览器启动失败 - {error_msg}")
-            
-            # 提供更详细的错误提示
-            if "chromedriver" in error_msg.lower() or "chrome" in error_msg.lower():
-                self._log("")
-                self._log("可能的原因:")
-                self._log("1. Chrome浏览器未安装或版本不兼容")
-                self._log("2. ChromeDriver版本与Chrome浏览器版本不匹配")
-                self._log("3. ChromeDriver不在系统PATH中")
-                self._log("")
-                self._log("解决方案:")
-                self._log("- 确保已安装最新版本的Chrome浏览器")
-                self._log("- 删除config.json中的CHROME_DRIVER_PATH配置,让Selenium自动管理")
-                self._log("- 或下载与Chrome版本匹配的ChromeDriver并放到正确位置")
-            
-            import traceback
-            tb_str = traceback.format_exc()
-            self._log(f"详细错误信息:\n{tb_str}")
-            return False
     
     def _login(self) -> bool:
         """
@@ -2041,14 +2061,16 @@ class BrowserAutomation:
         """
         重启浏览器(关闭后重新初始化)
         用于处理浏览器崩溃或登录失效的情况
-        
+        线程安全：加锁防止多线程同时重启
+
         Returns:
             True表示重启成功,False表示失败
         """
-        print("正在重启浏览器...")
-        self.close()
-        time.sleep(1)
-        return self.initialize()
+        with self._lock:
+            print("正在重启浏览器...")
+            self.close()
+            time.sleep(1)
+            return self.initialize()
     
     # ─── 页面检查工具（供 AI Agent ReAct 循环调用）───
 
@@ -2168,17 +2190,19 @@ class BrowserAutomation:
     def close(self):
         """
         关闭浏览器,释放资源
+        线程安全：加锁防止多线程同时关闭/初始化
         """
-        if self.driver:
-            try:
-                self.driver.quit()
-                self._log("浏览器已关闭")
-            except Exception as e:
-                self._log(f"警告: 关闭浏览器时出错 - {e}")
-            finally:
-                self.driver = None
-                self.is_logged_in = False
-                self._log("BROWSER_STATUS:DISCONNECTED")
+        with self._lock:
+            if self.driver:
+                try:
+                    self.driver.quit()
+                    self._log("浏览器已关闭")
+                except Exception as e:
+                    self._log(f"警告: 关闭浏览器时出错 - {e}")
+                finally:
+                    self.driver = None
+                    self.is_logged_in = False
+                    self._log("BROWSER_STATUS:DISCONNECTED")
     
     def update_activity_time(self):
         """

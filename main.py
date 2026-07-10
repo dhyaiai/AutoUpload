@@ -106,10 +106,14 @@ def backend_worker(stop_event: threading.Event, task_queue: Queue,
                 if stop_event.is_set():
                     break
                 # 上传处理中不干预：让 upload_processor 自行检测失败并处理
+                # 但需清理过期状态，防止其他线程（Agent/UploadProcessor）误判浏览器仍存活
                 if upload_processor.processing:
                     if not browser_error_logged:
                         log_queue.put("浏览器已关闭，但上传正在处理中，等待处理完成...")
                         browser_error_logged = True
+                    # 清理过期状态，确保 UploadProcessor 的 check_browser_status 能正确检测
+                    browser.driver = None
+                    browser.is_logged_in = False
                 # 队列为空且无处理任务 → 不重启，清理状态避免重复检查
                 elif task_queue.empty():
                     pending_retry = db.count_pending_retry_records()
