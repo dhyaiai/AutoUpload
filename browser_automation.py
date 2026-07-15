@@ -2351,6 +2351,119 @@ class BrowserAutomation:
         idle_time = time.time() - self.last_active_time
         return idle_time > self.config.browser_idle_timeout
 
+    @staticmethod
+    def start_idle_monitor(stop_event, task_queue, log_queue, upload_processor,
+                           db, browser=None):
+        """
+        共享的浏览器空闲监控——以 daemon 线程运行，api_server.py 和 main.py 共用。
+        每 5s 检查一次：空闲关闭/超时关闭/崩溃/登录态。
+
+        Args:
+            stop_event: 停止信号 (threading.Event)
+            task_queue: 任务队列 (Queue)
+            log_queue: 日志队列 (Queue)
+            upload_processor: UploadProcessor 实例
+            db: DatabaseManager 实例
+            browser: BrowserAutomation 实例 (可选，默认取单例)
+        """
+        import threading as _thr
+        if browser is None:
+            browser = BrowserAutomation()
+
+        def _run():
+            _browser_error = False
+            _pending_retry_logged = False
+            _idle_timeout_pending_logged = False
+
+            while not stop_event.is_set():
+                stop_event.wait(5)
+                if stop_event.is_set():
+                    break
+
+                if not browser.is_initialized:
+                    _browser_error = False
+                    _pending_retry_logged = False
+                    _idle_timeout_pending_logged = False
+                    continue
+
+                config = browser.config
+
+                # 队列为空 + 无处理任务 + 空闲超时 → 关闭浏览器
+                if (task_queue.empty() and not upload_processor.processing
+                        and browser.is_idle_for(config.upload_idle_timeout)):
+                    pending_retry = db.count_pending_retry_records()
+                    if pending_retry > 0:
+                        if not _pending_retry_logged:
+                            log_queue.put(f"队列空闲但有{pending_retry}条待重试记录,"
+                                          f"保持浏览器运行等待Agent处理")
+                            _pending_retry_logged = True
+                    else:
+                        log_queue.put("上传完成,队列为空,正在关闭浏览器...")
+                        browser.close()
+                        _browser_error = False
+                        _pending_retry_logged = False
+                    continue
+                else:
+                    _pending_retry_logged = False
+
+                # 浏览器空闲兜底超时
+                if not upload_processor.processing and browser.is_idle_timeout():
+                    pending_retry = db.count_pending_retry_records()
+                    if pending_retry > 0:
+                        if not _idle_timeout_pending_logged:
+                            log_queue.put(f"浏览器已空闲{config.browser_idle_timeout}秒,"
+                                          f"但仍有{pending_retry}条待重试记录,继续等待Agent处理")
+                            _idle_timeout_pending_logged = True
+                    else:
+                        log_queue.put("检测到浏览器空闲超时,正在关闭...")
+                        browser.close()
+                        _browser_error = False
+                        _pending_retry_logged = False
+                        _idle_timeout_pending_logged = False
+
+                # 浏览器崩溃检测
+                elif not browser.check_browser_status():
+                    if upload_processor.processing:
+                        if not _browser_error:
+                            log_queue.put("浏览器已关闭，但上传正在处理中，等待处理完成...")
+                            _browser_error = True
+                        browser.driver = None
+                        browser.is_logged_in = False
+                    elif task_queue.empty():
+                        pending_retry = db.count_pending_retry_records()
+                        if pending_retry > 0:
+                            if not _browser_error:
+                                log_queue.put(f"浏览器已关闭但有{pending_retry}条待重试记录,尝试重启...")
+                                _browser_error = True
+                            if browser.restart_browser():
+                                _browser_error = False
+                        else:
+                            if not _browser_error:
+                                log_queue.put("浏览器已关闭,队列为空,不重启")
+                                _browser_error = True
+                            browser.driver = None
+                            browser.is_logged_in = False
+                    else:
+                        if not _browser_error:
+                            log_queue.put("警告: 浏览器异常关闭,尝试重启...")
+                            _browser_error = True
+                        if browser.restart_browser():
+                            _browser_error = False
+
+                # 登录状态检查
+                elif not browser.check_login_status():
+                    if not _browser_error:
+                        log_queue.put("警告: 登录态失效,尝试重新登录...")
+                        _browser_error = True
+                    if browser.restart_browser():
+                        _browser_error = False
+
+                else:
+                    _browser_error = False
+
+        monitor_thread = _thr.Thread(target=_run, daemon=True, name="BrowserIdleMonitor")
+        monitor_thread.start()
+
 
 # ============================================================
 # 直接测试入口: 无需打包成exe, python browser_automation.py 即可测试

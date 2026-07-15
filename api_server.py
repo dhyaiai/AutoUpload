@@ -104,97 +104,9 @@ async def lifespan(app: FastAPI):
     _app_state["browser"] = browser
     _app_state["db"] = db
 
-    # --- 浏览器空闲监控线程 ---
-    # 在 API 模式下没有 GUI 主循环管理浏览器生命周期，
-    # 需要独立的后台线程检测空闲并自动关闭浏览器，避免资源浪费
-    def _browser_idle_monitor():
-        browser_error_logged = False
-        _pending_retry_logged = False       # 防日志刷屏：pending_retry 提示只输出一次
-        _idle_timeout_pending_logged = False
-        while not stop_event.is_set():
-            stop_event.wait(5)
-            if stop_event.is_set():
-                break
-
-            if not browser.is_initialized:
-                browser_error_logged = False
-                _pending_retry_logged = False
-                _idle_timeout_pending_logged = False
-                continue
-
-            # 队列为空 + 无正在处理的任务 + 空闲超过阈值 → 关闭浏览器
-            # 阈值由 config.json 的 UPLOAD_IDLE_TIMEOUT 控制（默认1800秒=30分钟）
-            if (task_queue.empty() and not upload_processor.processing
-                    and browser.is_idle_for(config.upload_idle_timeout)):
-                pending_retry = db.count_pending_retry_records()
-                if pending_retry > 0:
-                    if not _pending_retry_logged:
-                        log_queue.put(f"队列空闲但有{pending_retry}条待重试记录,"
-                                      f"保持浏览器运行等待Agent处理")
-                        _pending_retry_logged = True
-                    # 不重置 last_active_time —— Agent 自己干活时会更新；
-                    # Agent 不干活说明无法处理，交给 is_idle_timeout 兜底关闭
-                else:
-                    log_queue.put("上传完成,队列为空,正在关闭浏览器...")
-                    browser.close()
-                    browser_error_logged = False
-                    _pending_retry_logged = False
-                continue
-            else:
-                _pending_retry_logged = False
-
-            # 浏览器空闲兜底超时（默认30分钟，由 BROWSER_IDLE_TIMEOUT 控制）
-            # 有待重试记录时不关闭——Agent 还在工作中，关闭后反而要重新初始化
-            if not upload_processor.processing and browser.is_idle_timeout():
-                pending_retry = db.count_pending_retry_records()
-                if pending_retry > 0:
-                    if not _idle_timeout_pending_logged:
-                        log_queue.put(f"浏览器已空闲{browser.config.browser_idle_timeout}秒,"
-                                      f"但仍有{pending_retry}条待重试记录,继续等待Agent处理")
-                        _idle_timeout_pending_logged = True
-                else:
-                    log_queue.put("检测到浏览器空闲超时,正在关闭...")
-                    browser.close()
-                    browser_error_logged = False
-                    _pending_retry_logged = False
-                    _idle_timeout_pending_logged = False
-
-            # 浏览器崩溃检测
-            elif not browser.check_browser_status():
-                if upload_processor.processing:
-                    if not browser_error_logged:
-                        log_queue.put("浏览器已关闭，但上传正在处理中，等待处理完成...")
-                        browser_error_logged = True
-                    browser.driver = None
-                    browser.is_logged_in = False
-                elif task_queue.empty():
-                    if not browser_error_logged:
-                        log_queue.put("浏览器已关闭,队列为空,不重启")
-                        browser_error_logged = True
-                    browser.driver = None
-                    browser.is_logged_in = False
-                else:
-                    if not browser_error_logged:
-                        log_queue.put("警告: 浏览器异常关闭,尝试重启...")
-                        browser_error_logged = True
-                    if browser.restart_browser():
-                        browser_error_logged = False
-
-            # 登录状态检查
-            elif not browser.check_login_status():
-                if not browser_error_logged:
-                    log_queue.put("警告: 登录态失效,尝试重新登录...")
-                    browser_error_logged = True
-                if browser.restart_browser():
-                    browser_error_logged = False
-
-            else:
-                browser_error_logged = False
-
-    idle_monitor_thread = threading.Thread(
-        target=_browser_idle_monitor, daemon=True, name="BrowserIdleMonitor"
-    )
-    idle_monitor_thread.start()
+    # --- 浏览器空闲监控线程（使用 BrowserAutomation 共享方法） ---
+    browser.start_idle_monitor(
+        stop_event, task_queue, log_queue, upload_processor, db, browser=browser)
     print("浏览器空闲监控已启动")
 
     print(f"API Server 已启动: http://{config.api_server_host}:{config.api_server_port}")
@@ -205,8 +117,16 @@ async def lifespan(app: FastAPI):
 
     # --- 优雅关闭 ---
     print("API Server 正在关闭...")
+    _app_state["_shutting_down"] = True
     stop_event.set()
-    time.sleep(2)
+
+    # 等待任务队列排空（最多等待 upload_idle_timeout 秒）
+    drain_timeout = config.upload_idle_timeout
+    drain_deadline = time.time() + drain_timeout
+    while not task_queue.empty() and time.time() < drain_deadline:
+        time.sleep(0.5)
+    if not task_queue.empty():
+        print(f"警告: 等待超时({drain_timeout}s), 队列中仍有{task_queue.qsize()}个未完成任务")
 
     try:
         browser.close()
@@ -239,7 +159,7 @@ app.add_middleware(
 
 @app.post("/api/upload/submit")
 async def submit_upload(
-    file: UploadFile = File(..., max_size=50 * 1024 * 1024),  # 50MB 上限
+    file: UploadFile = File(...),
     school: str = Form(...),
     grade: str = Form(...),
     subject: Optional[str] = Form(None),
@@ -260,16 +180,27 @@ async def submit_upload(
 
     # 原始文件名：优先使用客户端传入的 filename，回退到 file.filename
     # 微信小程序 wx.uploadFile 会将文件名设为临时路径的 UUID，不含原始名称
-    original_name = filename or file.filename
+    original_name = filename or file.filename or "unknown"
 
-    # 保存文件：用 UUID 子目录防碰撞，文件名保持原始名称不变
+    # 检查任务队列可用性（在写DB之前，避免创建孤儿记录）
+    task_queue = _app_state.get("task_queue")
+    if task_queue is None:
+        return api_response(code=1, msg="服务未就绪，任务队列不可用")
+
+    # 读文件内容并限制大小为 15MB
+    MAX_UPLOAD_SIZE = 15 * 1024 * 1024
+    content = await file.read()
+    if len(content) > MAX_UPLOAD_SIZE:
+        return api_response(code=1, msg=f"文件大小超过限制(最大15MB)，当前大小: {len(content) // (1024*1024)}MB")
+
+    # 保存文件：UUID 子目录防碰撞，文件名保持原始名称不变
+    import asyncio
     file_dir = os.path.join(upload_temp, uuid.uuid4().hex)
     os.makedirs(file_dir, exist_ok=True)
     file_path = os.path.join(file_dir, original_name)
     try:
-        content = await file.read()
-        with open(file_path, 'wb') as f:
-            f.write(content)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: open(file_path, 'wb').write(content))
     except Exception as e:
         return api_response(code=1, msg=f"文件保存失败: {e}")
 
@@ -286,6 +217,11 @@ async def submit_upload(
             source='miniprogram'
         )
     except Exception as e:
+        # 删除已保存的文件，避免磁盘残留
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass
         return api_response(code=1, msg=f"数据库写入失败: {e}")
 
     # 入队
@@ -297,11 +233,7 @@ async def submit_upload(
         "subject": subject,  # 可能为 None，上传处理器会 AI 识别
         "record_id": record_id,
     }
-    task_queue = _app_state.get("task_queue")
-    if task_queue is not None:
-        task_queue.put(task)
-    else:
-        return api_response(code=1, msg="服务未就绪，任务队列不可用")
+    task_queue.put(task)
 
     return api_response(msg="任务已提交", data={"task_id": record_id})
 
@@ -393,6 +325,11 @@ async def retry_upload(task_id: int):
     if not os.path.exists(file_path):
         return api_response(code=1, msg=f"文件不存在: {file_path}")
 
+    # 先检查任务队列可用性（在递增重试计数前，避免状态卡死）
+    task_queue = _app_state.get("task_queue")
+    if task_queue is None:
+        return api_response(code=1, msg="服务未就绪，任务队列不可用")
+
     # 增加重试次数并检查上限
     retry_count = db.increment_retry(task_id)
     config = _app_state.get("config")
@@ -417,17 +354,16 @@ async def retry_upload(task_id: int):
         "record_id": task_id,
         "is_retry": True,
     }
-    task_queue = _app_state.get("task_queue")
-    if task_queue is not None:
-        task_queue.put(task)
-    else:
-        return api_response(code=1, msg="服务未就绪，任务队列不可用")
+    task_queue.put(task)
 
     return api_response(msg="重试任务已提交", data={"task_id": task_id})
 
 
 @app.post("/api/report/generate")
-async def generate_report(start_date: str, end_date: str):
+async def generate_report(
+    start_date: str = Form(...),
+    end_date: str = Form(...)
+):
     """
     手动生成失败分析报告
 

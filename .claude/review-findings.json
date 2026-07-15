@@ -1,0 +1,107 @@
+[
+  {
+    "file": "api_server.py",
+    "line": 242,
+    "summary": "fastapi.File(max_size=...) silently ignored, no upload size enforcement",
+    "failure_scenario": "Client uploads 5GB file; max_size=50MB is not a valid FastAPI File() parameter and falls into **extra/dropped silently; server reads entire file into memory via f.write() in async endpoint; OOM crash or disk exhaustion",
+    "category": "correctness"
+  },
+  {
+    "file": "upload_processor.py",
+    "line": 218,
+    "summary": "task_done() called after re-queuing task on session-loss, breaking Queue.unfinished_count invariant",
+    "failure_scenario": "get() increments unfinished→1, session lost triggers put() back to queue, task_done() decrements unfinished→0; task still in queue but counter is zero; graceful shutdown's Queue.join() returns immediately, discarding the re-queued unprocessed task",
+    "category": "correctness"
+  },
+  {
+    "file": "api_server.py",
+    "line": 279,
+    "summary": "DB pending record inserted before task_queue availability check, creating orphaned records on queue failure",
+    "failure_scenario": "During startup/shutdown race, add_pending_record() succeeds writing status='pending' to DB; subsequent task_queue.get() returns None; API returns error but DB record remains as pending forever; pollutes count_pending_retry_records and stats overview",
+    "category": "correctness"
+  },
+  {
+    "file": "api_server.py",
+    "line": 208,
+    "summary": "API server lifespan shutdown only sleep(2) before closing browser/DB, no graceful task queue drain",
+    "failure_scenario": "Upload in progress (up to 120s UPLOAD_TIMEOUT); SIGTERM received; stop_event.set() + sleep(2) + browser.close() + db.close(); daemon UploadProcessor thread killed mid-operation; DB records stuck in 'processing' state permanently; contrast with main.py which drains queue up to 30s before shutdown",
+    "category": "correctness"
+  },
+  {
+    "file": "upload_processor.py",
+    "line": 651,
+    "summary": "_process_miniprogram_task already_handled branch overwrites specific error_message from _handle_failure with generic one",
+    "failure_scenario": "_handle_failure writes specific error like 'XX(session lost)'; already_handled branch reads last_upload_error (empty for non-upload-stage failures like BROWSER_INIT/SCHOOL_CHECK); calls update_record_structured_error overwriting specific error with generic 'upload operation failed'; root cause lost",
+    "category": "correctness"
+  },
+  {
+    "file": "db_manager.py",
+    "line": 901,
+    "summary": "get_stats_overview() counts pending records in denominator, deflating reported success_rate",
+    "failure_scenario": "10 success + 5 miniprogram pending records; SELECT COUNT(*) = 15; success_rate = 10/15 = 66.7%; actual rate for non-pending tasks is 100%; stats overview API shows misleading low success rate",
+    "category": "correctness"
+  },
+  {
+    "file": "api_server.py",
+    "line": 397,
+    "summary": "API retry endpoint increments retry count and marks processing BEFORE queue check; stuck on failure",
+    "failure_scenario": "retry_count incremented, retry_status set to 'processing', then task_queue.get() returns None; API returns error but unlike the max-retry branch (line 404) which sets status='finished', this path leaves status='processing' permanently; retry count was consumed for nothing",
+    "category": "correctness"
+  },
+  {
+    "file": "upload_processor.py",
+    "line": 224,
+    "summary": "Outer except handler in run() misses task_done(), causing Queue.join() to hang on unexpected exceptions",
+    "failure_scenario": "_process_file or _process_miniprogram_task raises unhandled exception; caught by outer except at line 224; task_done() at line 218 never executes; Queue.unfinished_count stays >0; graceful shutdown's task_queue.join() hangs forever, preventing program exit",
+    "category": "correctness"
+  },
+  {
+    "file": "upload_processor.py",
+    "line": 56,
+    "summary": "_agent_retry_map dict shared across Agent and UploadProcessor threads without lock",
+    "failure_scenario": "Agent thread calls register_agent_retry() writing to _agent_retry_map dict; UploadProcessor thread simultaneously reads/pops via _notify_agent_result or _preprocess_agent_retry; dict resize during write can interleave with read; potential KeyError, lost update, or partial data read under CPython GIL",
+    "category": "correctness"
+  },
+  {
+    "file": "api_server.py",
+    "line": 110,
+    "summary": "Browser idle monitor daemon thread may call db.count_pending_retry_records() after db.close() during shutdown",
+    "failure_scenario": "Shutdown sequence: stop_event.set() → sleep(2) → db.close(); daemon monitor thread just entered loop body before event check; proceeds to call db.count_pending_retry_records() on closed connection; sqlite3.ProgrammingError: Cannot operate on a closed database",
+    "category": "correctness"
+  },
+  {
+    "file": "api_server.py",
+    "line": 110,
+    "summary": "Browser idle monitor logic duplicated ~100 lines verbatim between api_server.py and main.py",
+    "failure_scenario": "Same monitoring loop (idle check→timeout check→crash detection→login check) with same 3 dedup flags exists in both api_server.py:110-192 and main.py:66-169; any bugfix to monitoring logic must be applied in two places or they will drift; belongs on BrowserAutomation as shared method",
+    "category": "simplification"
+  },
+  {
+    "file": "upload_processor.py",
+    "line": 444,
+    "summary": "_process_file and _process_miniprogram_task share ~80% duplicated pipeline logic",
+    "failure_scenario": "Both methods independently implement parse→read→classify→upload→handle_result pipeline; only difference is how school/grade/subject are obtained; success handling diverges (one uses _on_upload_success, other inlines DB writes); failure handling diverges (one delegates to _handle_failure, other writes DB directly); bugfix to pipeline must be applied in 2 places",
+    "category": "simplification"
+  },
+  {
+    "file": "api_server.py",
+    "line": 430,
+    "summary": "POST /api/report/generate reads start_date/end_date as query params instead of Form/Body",
+    "failure_scenario": "Client sends POST with JSON body {start_date, end_date} expecting standard POST semantics; FastAPI treats plain str params on POST as query parameters; returns 422 validation error; inconsistent with /api/upload/submit which correctly uses Form(...)",
+    "category": "correctness"
+  },
+  {
+    "file": "api_server.py",
+    "line": 271,
+    "summary": "Blocking sync f.write(content) in async endpoint freezes asyncio event loop during file uploads up to 50MB",
+    "failure_scenario": "async def submit_upload calls synchronous f.write(content) on main thread; 50MB write blocks event loop 200-500ms (SSD) to 1-2s (HDD); during this window all other API requests are unserved; concurrent uploads serialize on the event loop",
+    "category": "efficiency"
+  },
+  {
+    "file": "upload_processor.py",
+    "line": 458,
+    "summary": "error_context initialized as {} stays empty on folder parse failure path; JSON column stores NULL",
+    "failure_scenario": "error_context = {}; folder parse fails; _handle_failure called with error_context={}; inside _handle_failure, bool({}) is False so json.dumps skipped, error_context column gets NULL; folder_name is in its own column but structured error context is inconsistent with success path",
+    "category": "correctness"
+  }
+]

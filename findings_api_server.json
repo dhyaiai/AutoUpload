@@ -1,0 +1,56 @@
+[
+  {
+    "severity": "high",
+    "category": "race_condition",
+    "title": "API server lifespan shutdown does not gracefully drain the task queue",
+    "detail": "In `api_server.py` lines 208-216, the shutdown sequence is: `stop_event.set()` → `time.sleep(2)` → `browser.close()` → `db.close()`. There is no `task_queue.join()` or drain loop (compare with `main.py` lines 172-176 which wait up to 30 seconds). Uploads can take up to 120 seconds (UPLOAD_TIMEOUT). Shutting down after only 2 seconds means: (a) the `UploadProcessor` thread (daemon) is killed mid-upload, (b) `browser.close()` runs while Selenium may be mid-operation, (c) an incomplete DB write can leave records as `pending` or `processing` permanently. Additionally, line 118 (`_browser_idle_monitor` daemon thread) may still be running and accessing DB after `db.close()` at line 216, causing SQLite errors.",
+    "fix": "Add a queue drain loop before closing browser/db (like main.py: wait for queue to empty with a deadline), then join the UploadProcessor thread. Set a `shutting_down` flag so the idle monitor exits before db.close()."
+  },
+  {
+    "severity": "medium",
+    "category": "inconsistency",
+    "title": "/api/report/generate uses query parameters instead of form/body on a POST endpoint",
+    "detail": "`api_server.py` line 430: `async def generate_report(start_date: str, end_date: str)` — no `Form(...)` or `Body(...)` annotation. FastAPI treats plain parameters on a POST endpoint as query parameters. This is inconsistent with `/api/upload/submit` which correctly uses `Form(...)` for POST body params. A client sending JSON or form data expecting the standard pattern will get a 422 validation error, while only URL query parameters work. The endpoint name suggests 'generate' as a POST action, but its parameter style is that of a GET.",
+    "fix": "Add `start_date: str = Form(...), end_date: str = Form(...)` to match the pattern used by `/api/upload/submit`, or change the HTTP method to GET if query params are intentional."
+  },
+  {
+    "severity": "medium",
+    "category": "potential_bug",
+    "title": "Browser idle monitor may call db.count_pending_retry_records() after db.close() during shutdown",
+    "detail": "The `_browser_idle_monitor` daemon thread (lines 110-192) runs in a loop checking `stop_event.wait(5)`. During shutdown, `stop_event.set()` is called at line 208, then `db.close()` at line 216. The monitor could have just entered the loop body before the event is set, then proceed to call `db.count_pending_retry_records()` (lines 129, 149) or other db methods after `db.close()` has already closed the connection. Daemon threads don't block process exit but can still execute during the brief window of shutdown. This causes `sqlite3.ProgrammingError: Cannot operate on a closed database.`",
+    "fix": "Add a shutdown flag `_app_state['shutting_down'] = True` before `db.close()`, and check it inside the monitor loop before any DB access."
+  },
+  {
+    "severity": "low",
+    "category": "race_condition",
+    "title": "DatabaseManager singleton: re-call in endpoints works but has a shutdown race with db.close()",
+    "detail": "Each endpoint calls `db = DatabaseManager()` (lines 277, 316, 344, 385, 454). Since `DatabaseManager` is a singleton via `__new__`, this correctly returns the same instance without re-initialization (`_init_db` is only called on first construction). However, after line 216 `db.close()` sets `DatabaseManager._instance = None`, any remaining in-flight HTTP request calling `DatabaseManager()` would create a *new* instance with a fresh database connection, while the old connection is closed. The new instance is unrelated and the old DB state is lost. This is a shutdown race — unlikely in practice (uvicorn usually stops accepting requests before lifespan shutdown) but not guaranteed by the ASGI spec.",
+    "fix": "No code change needed in normal operation. Add a note that `db.close()` should be the very last cleanup step, and consider setting a `_shutting_down` flag that endpoints check before proceeding."
+  },
+  {
+    "severity": "info",
+    "category": "style",
+    "title": "Health check endpoint creates a throwaway Queue() object on every call",
+    "detail": "Line 468: `_app_state.get('task_queue', Queue()).qsize() if _app_state.get('task_queue') else 0`. Python evaluates `Queue()` as the default argument to `.get()` every time this endpoint is called. Since `task_queue` is always in `_app_state`, the `Queue()` is created and immediately discarded. This is harmless but wastes allocation on each health check poll.",
+    "fix": "Replace with `(_app_state['task_queue'].qsize()) if 'task_queue' in _app_state else 0` or use `_app_state.get('task_queue') or Queue()` to avoid constructing an unused Queue."
+  },
+  {
+    "severity": "info",
+    "category": "correctness",
+    "title": "UploadProcessor is NOT a singleton — but API and GUI modes are mutually exclusive, so no conflict",
+    "detail": "`UploadProcessor` has no `__new__` override or `_instance` class variable (confirmed in `upload_processor.py` line 21: `class UploadProcessor:`). This is fine because the two modes are mutually exclusive: `main.py` line 209-211 returns early in `--api-only` mode, so only one UploadProcessor is ever created. However, if someone later adds a hybrid mode (GUI + API simultaneously), there would be two independent UploadProcessors sharing the same BrowserAutomation singleton and task_queue — creating a subtle race. The desktop mode's `main.py` (line 228) and `api_server.py` (line 71) create separate instances, each with their own `processing` flag and `_agent_retry_map`.",
+    "fix": "Consider making UploadProcessor a proper singleton using the same `__new__` pattern as DatabaseManager/BrowserAutomation if hybrid mode is ever needed. For now, document the assumption explicitly in the class docstring."
+  },
+  {
+    "severity": "info",
+    "category": "correctness",
+    "title": "Singleton sharing in BrowserAutomation and ConfigManager is handled correctly",
+    "detail": "Both `BrowserAutomation` and `ConfigManager` use the standard `__new__` singleton pattern. In the API server lifespan: (a) `ConfigManager()` at line 53 returns the same instance that `UploadProcessor.__init__` gets at `upload_processor.py` line 47; (b) `BrowserAutomation(log_queue=log_queue)` at line 68 returns the same instance that `UploadProcessor.__init__` gets at line 50. The `_app_state['config']` and `_app_state['browser']` references are consistent with the singletons. No issue found."
+  },
+  {
+    "severity": "info",
+    "category": "robustness",
+    "title": "All _app_state accesses in endpoints have proper None guards",
+    "detail": "Every endpoint that reads from `_app_state` guards against None: `task_queue = _app_state.get('task_queue')` with `if task_queue is not None` (lines 300-304, 420-424); `config = _app_state.get('config')` with `if config else 10` fallback (line 399); `analysis_agent = _app_state.get('analysis_agent')` with None check (line 438). `upload_temp` (line 258) gets a safe default `'./upload_temp'`. If lifespan initialization fails partway through, `_app_state` will be incomplete, but since all initialization occurs before `yield`, the app would not start serving requests in that case."
+  }
+]

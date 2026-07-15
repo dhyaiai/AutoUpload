@@ -897,8 +897,8 @@ class DatabaseManager:
         cursor = self._connection.cursor()
         today = datetime.now().strftime('%Y-%m-%d')
 
-        # 总上传量
-        cursor.execute("SELECT COUNT(*) FROM upload_records")
+        # 总上传量（排除 pending 状态，只统计已完成的成功/失败）
+        cursor.execute("SELECT COUNT(*) FROM upload_records WHERE status != 'pending'")
         total = cursor.fetchone()[0]
 
         # 成功数
@@ -909,9 +909,9 @@ class DatabaseManager:
         cursor.execute("SELECT COUNT(*) FROM upload_records WHERE status = 'failed'")
         failed = cursor.fetchone()[0]
 
-        # 今日上传量
+        # 今日上传量（排除 pending）
         cursor.execute(
-            "SELECT COUNT(*) FROM upload_records WHERE DATE(upload_time) = ?", (today,))
+            "SELECT COUNT(*) FROM upload_records WHERE status != 'pending' AND DATE(upload_time) = ?", (today,))
         today_total = cursor.fetchone()[0]
 
         # 今日成功数
