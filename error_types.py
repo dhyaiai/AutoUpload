@@ -104,6 +104,7 @@ STRATEGY_MAP: Dict[Tuple[UploadStage, ErrorType], Tuple[RetryLevel, int]] = {
     (UploadStage.SCHOOL_CHECK, ErrorType.SCHOOL_NOT_FOUND):   (RetryLevel.L5_MANUAL, 0),
     (UploadStage.SCHOOL_CHECK, ErrorType.SCHOOL_SWITCH_FAIL): (RetryLevel.L3_ENV_RESET, 2),
     (UploadStage.SCHOOL_CHECK, ErrorType.PAGE_LOAD_TIMEOUT):  (RetryLevel.L2_PAGE_RESET, 1),
+    (UploadStage.SCHOOL_CHECK, ErrorType.UPLOAD_SUBMIT_TIMEOUT): (RetryLevel.L3_ENV_RESET, 2),
 
     # FORM_FILL 阶段
     (UploadStage.FORM_FILL, ErrorType.ELEMENT_TIMEOUT):       (RetryLevel.L2_PAGE_RESET, 2),

@@ -74,7 +74,8 @@ class DatabaseManager:
                 error_type TEXT DEFAULT NULL,           -- 错误二级类型(ErrorType枚举值)
                 error_context TEXT DEFAULT NULL,        -- 错误上下文JSON(页面URL/元素信息等)
                 retry_status TEXT DEFAULT 'pending',    -- 重试处理状态:pending/processing/finished
-                agent_retry_success TEXT DEFAULT NULL   -- Agent接管是否成功: '是'/'否'
+                agent_retry_success TEXT DEFAULT NULL,  -- Agent接管是否成功: '是'/'否'
+                source TEXT DEFAULT 'desktop'           -- 任务来源: desktop/miniprogram
             )
         ''')
         
@@ -121,6 +122,7 @@ class DatabaseManager:
             'error_context': 'TEXT DEFAULT NULL',
             'retry_status': "TEXT DEFAULT 'pending'",
             'agent_retry_success': 'TEXT DEFAULT NULL',
+            'source': "TEXT DEFAULT 'desktop'",
         }
         cursor = self._connection.cursor()
         existing = {row[1] for row in cursor.execute("PRAGMA table_info(upload_records)").fetchall()}
@@ -185,19 +187,32 @@ class DatabaseManager:
         count = cursor.fetchone()[0]
         return count > 0
     
-    def get_failed_records(self) -> List[Dict]:
+    def get_failed_records(self, page: int = None, size: int = None) -> List[Dict]:
         """
-        获取所有上传失败的记录
-        
+        获取所有上传失败的记录（支持可选分页）
+
+        Args:
+            page: 页码(从1开始), None=返回全部
+            size: 每页条数, None=返回全部
+
         Returns:
             失败记录列表,每条记录是一个字典,按上传时间倒序排列
         """
         cursor = self._connection.cursor()
-        cursor.execute('''
-            SELECT * FROM upload_records 
-            WHERE status = 'failed'
-            ORDER BY upload_time DESC
-        ''')
+        if page is not None and size is not None:
+            offset = (page - 1) * size
+            cursor.execute('''
+                SELECT * FROM upload_records
+                WHERE status = 'failed'
+                ORDER BY upload_time DESC
+                LIMIT ? OFFSET ?
+            ''', (size, offset))
+        else:
+            cursor.execute('''
+                SELECT * FROM upload_records
+                WHERE status = 'failed'
+                ORDER BY upload_time DESC
+            ''')
         rows = cursor.fetchall()
         # 将每行转换为字典格式,方便GUI显示
         return [dict(row) for row in rows]
@@ -218,6 +233,21 @@ class DatabaseManager:
                 upload_time = ?
             WHERE id = ?
         ''', (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), record_id))
+        self._connection.commit()
+
+    def mark_record_failed(self, record_id: int):
+        """
+        将记录标记为失败（用于 miniprogram 任务处理失败时将 pending 改为 failed）
+
+        Args:
+            record_id: 要更新的记录ID
+        """
+        cursor = self._connection.cursor()
+        cursor.execute('''
+            UPDATE upload_records
+            SET status = 'failed'
+            WHERE id = ?
+        ''', (record_id,))
         self._connection.commit()
 
     def resolve_pending_by_file(self, file_name: str, folder_name: str) -> int:
@@ -798,6 +828,114 @@ class DatabaseManager:
             WHERE error_type = ? AND upload_time >= ? AND status = 'failed'
         ''', (error_type, cutoff))
         return cursor.fetchone()[0]
+
+    # ==================== 微信小程序适配方法 ====================
+
+    def add_pending_record(self, file_name: str, file_path: str, folder_name: str,
+                           school: str, grade: str, subject: str,
+                           source: str = 'desktop') -> int:
+        """
+        写入待处理任务记录（初始状态为 pending，供小程序轮询查询）
+
+        Args:
+            file_name: 文件名
+            file_path: 文件完整路径
+            folder_name: 文件夹名（小程序任务统一用 "miniprogram"）
+            school: 学校
+            grade: 年级
+            subject: 科目
+            source: 任务来源 desktop/miniprogram
+
+        Returns:
+            新插入记录的ID
+        """
+        cursor = self._connection.cursor()
+        cursor.execute('''
+            INSERT INTO upload_records
+            (file_name, file_path, folder_name, school, grade, subject,
+             status, retry_status, upload_time, source)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', 'pending', ?, ?)
+        ''', (file_name, file_path, folder_name, school, grade, subject,
+              datetime.now().strftime('%Y-%m-%d %H:%M:%S'), source))
+        self._connection.commit()
+        return cursor.lastrowid
+
+    def get_record_by_id(self, record_id: int) -> Optional[Dict]:
+        """
+        根据ID查询单条记录
+
+        Args:
+            record_id: 记录ID
+
+        Returns:
+            记录字典，不存在则返回 None
+        """
+        cursor = self._connection.cursor()
+        cursor.execute('SELECT * FROM upload_records WHERE id = ?', (record_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def get_failed_count(self) -> int:
+        """
+        获取失败记录总数
+
+        Returns:
+            失败记录数量
+        """
+        cursor = self._connection.cursor()
+        cursor.execute("SELECT COUNT(*) FROM upload_records WHERE status = 'failed'")
+        row = cursor.fetchone()
+        return row[0] if row else 0
+
+    def get_stats_overview(self) -> Dict:
+        """
+        获取统计概览数据（总量/成功率/今日数据/待重试数）
+
+        Returns:
+            统计概览字典
+        """
+        cursor = self._connection.cursor()
+        today = datetime.now().strftime('%Y-%m-%d')
+
+        # 总上传量
+        cursor.execute("SELECT COUNT(*) FROM upload_records")
+        total = cursor.fetchone()[0]
+
+        # 成功数
+        cursor.execute("SELECT COUNT(*) FROM upload_records WHERE status = 'success'")
+        success = cursor.fetchone()[0]
+
+        # 失败数
+        cursor.execute("SELECT COUNT(*) FROM upload_records WHERE status = 'failed'")
+        failed = cursor.fetchone()[0]
+
+        # 今日上传量
+        cursor.execute(
+            "SELECT COUNT(*) FROM upload_records WHERE DATE(upload_time) = ?", (today,))
+        today_total = cursor.fetchone()[0]
+
+        # 今日成功数
+        cursor.execute(
+            "SELECT COUNT(*) FROM upload_records WHERE status = 'success' AND DATE(upload_time) = ?", (today,))
+        today_success = cursor.fetchone()[0]
+
+        # 待重试数
+        pending_retry = self.count_pending_retry_records()
+
+        success_rate = round(success / total * 100, 2) if total > 0 else 0.0
+        today_success_rate = round(
+            today_success / today_total * 100, 2) if today_total > 0 else 0.0
+
+        return {
+            'total_uploads': total,
+            'success_count': success,
+            'failed_count': failed,
+            'success_rate': success_rate,
+            'pending_retry_count': pending_retry,
+            'today_uploads': today_total,
+            'today_success': today_success,
+            'today_success_rate': today_success_rate,
+        }
 
     def close(self):
         """

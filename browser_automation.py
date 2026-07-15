@@ -4,6 +4,7 @@
 特点:单例模式复用浏览器实例,支持自动重启和状态检测
 """
 import os
+import re
 import sys
 import time
 import threading
@@ -98,6 +99,10 @@ class BrowserAutomation:
         配置浏览器选项,加载驱动,打开目标网站
         线程安全：加锁防止多线程同时初始化
 
+        优化：如果配置了 CHROME_PROFILE_DIR，使用持久化用户目录，
+        浏览器重启后 cookie/session 保留，自动恢复登录态，
+        初始化时间从 ~60s 降至 ~10s。
+
         Returns:
             True表示启动成功,False表示失败
         """
@@ -119,9 +124,16 @@ class BrowserAutomation:
                 # 创建Chrome选项
                 options = ChromeOptions()
                 options.page_load_strategy = "eager"  # DOM就绪即返回，不等图片加载
-                # 添加常用选项(可根据需要调整)
                 options.add_argument('--start-maximized')  # 最大化窗口
-                # options.add_argument('--disable-gpu')      # 禁用GPU加速
+
+                # 持久化用户数据目录：浏览器重启后保留登录 Cookie，跳过重新登录
+                profile_dir = self.config.chrome_profile_dir
+                if profile_dir:
+                    os.makedirs(profile_dir, exist_ok=True)
+                    options.add_argument(f'--user-data-dir={profile_dir}')
+                    self._log(f"使用Chrome用户数据目录: {profile_dir}")
+                else:
+                    self._log("未配置CHROME_PROFILE_DIR，使用临时会话（每次重启需重新登录）")
 
                 # 创建WebDriver实例
                 driver_path = self.config.chrome_driver_path
@@ -143,14 +155,24 @@ class BrowserAutomation:
                     self._log("使用Selenium自动管理的ChromeDriver")
                     self.driver = webdriver.Chrome(options=options)
 
-                # 设置隐式等待时间(查找元素时最多等待10秒)
-                self.driver.implicitly_wait(10)
+                # 低隐式等待(2s)：Vue 组件异步渲染需要短暂余量，但不能设为10s
+                # 否则每次 find_element 最多等10s，与 WebDriverWait 叠加后
+                # 登录→角色选择→学校校验全链路累计 60~90s 卡顿
+                self.driver.implicitly_wait(2)
                 # 限制异步脚本执行超时（防止 execute_async_script 无限卡死）
                 self.driver.timeouts.script = 5
 
                 # 打开目标网站
                 self._log(f"正在访问网站: {self.config.website_url}")
                 self.driver.get(self.config.website_url)
+
+                # ── 免登录检测：持久化 profile 恢复后可能已有有效 session ──
+                if self._detect_existing_session():
+                    self.is_logged_in = True
+                    self.last_active_time = time.time()
+                    self._log("检测到已有登录会话，跳过登录流程")
+                    self._log("BROWSER_STATUS:CONNECTED")
+                    return True
 
                 # 执行登录
                 if self._login():
@@ -199,6 +221,18 @@ class BrowserAutomation:
         """
         try:
             self._log("正在执行登录操作...")
+
+            # 等待登录表单渲染完成（Vue/ElementUI 在 DOM ready 后异步渲染，
+            # 仅靠 driver.get() 的 eager 策略不够，需显式等待表单元素就位）
+            try:
+                WebDriverWait(self.driver, 15).until(
+                    EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, "input[placeholder='请输入您的账户']")
+                    )
+                )
+            except TimeoutException:
+                self._log("错误: 登录表单未能在15秒内加载")
+                return False
 
             # 查找账号输入框(通过placeholder定位)
             username_input = self.driver.find_element(By.CSS_SELECTOR, "input[placeholder='请输入您的账户']")
@@ -653,9 +687,7 @@ class BrowserAutomation:
             # 3. 判断是否一致
             if current_school == target_school:
                 self._log("[OK] 学校一致，无需切换")
-                # 关闭下拉菜单
-                self.driver.find_element(By.TAG_NAME, "body").click()
-                time.sleep(0.5)
+                self._close_teacher_dropdown()
                 return True
 
             # 4. 不一致：点击学校元素弹出切换对话框
@@ -850,18 +882,11 @@ class BrowserAutomation:
                 
                 if target_school in new_school or new_school in target_school:
                     self._log(f"[OK] 学校切换成功: {new_school}")
-                    # 关闭下拉菜单
-                    try:
-                        self.driver.find_element(By.TAG_NAME, "body").click()
-                    except:
-                        pass
+                    self._close_teacher_dropdown()
                     return True
                 else:
                     self._log(f"[FAIL] 学校切换失败,当前学校仍为: {new_school}")
-                    try:
-                        self.driver.find_element(By.TAG_NAME, "body").click()
-                    except:
-                        pass
+                    self._close_teacher_dropdown()
                     return False
             except Exception as e:
                 self._log(f"警告: 验证学校切换时出错 - {e}")
@@ -962,11 +987,8 @@ class BrowserAutomation:
             school_li = self.driver.find_element(By.CSS_SELECTOR, menu_selector)
             current_school = school_li.text.strip()
 
-            # 步骤4: 关闭下拉菜单（点击 body 空白处）
-            try:
-                self.driver.find_element(By.TAG_NAME, "body").click()
-            except Exception:
-                pass
+            # 步骤4: 关闭下拉菜单
+            self._close_teacher_dropdown()
 
             self._log(f"[get_current_school] 当前学校: {current_school}")
             return {"success": True, "school": current_school}
@@ -1451,6 +1473,24 @@ class BrowserAutomation:
             self._log(f"读取{label_text}选中值异常: {e}")
             return None
 
+    def _close_teacher_dropdown(self):
+        """关闭教师下拉菜单 — Vue API 优先，JS body.click() 兜底触发 click-outside 关闭"""
+        try:
+            self.driver.execute_script("""
+                var dropdown = document.querySelector('.info-user > .el-dropdown');
+                if (dropdown && dropdown.__vue__) {
+                    dropdown.__vue__.visible = false;
+                }
+            """)
+        except Exception:
+            pass
+        # 兜底：JS 直接触发 body click，不会像 Selenium click 那样受坐标影响
+        try:
+            self.driver.execute_script("document.body.click();")
+        except Exception:
+            pass
+        time.sleep(0.2)
+
     def _is_on_login_page(self) -> bool:
         """
         快速检测当前页面是否为登录页（仅检查URL，不等待任何元素）。
@@ -1486,7 +1526,8 @@ class BrowserAutomation:
         """
         try:
             self.last_upload_error = ""  # 每次上传前重置错误记录
-            self._log(f"开始上传: {os.path.basename(file_path)} (学校={school}, 年级={grade}, 科目={subject})")
+            display_name = re.sub(r'^[0-9a-f]{32}_', '', os.path.basename(file_path))
+            self._log(f"开始上传: {display_name} (学校={school}, 年级={grade}, 科目={subject})")
 
             # 0) 快速前置检查：是否已经在登录页（账号在上一步操作中被踢下线）
             if self._is_on_login_page():
@@ -1740,7 +1781,7 @@ class BrowserAutomation:
             result = None  # None=等待中, True=成功, False=失败
             error_text = ""
 
-            self.driver.implicitly_wait(0)  # 轮询阶段禁用隐式等待
+            self.driver.implicitly_wait(0)  # 轮询阶段确保隐式等待关闭（全局默认已是0）
             poll_count = 0  # 轮询计数器，用于降低部分检查频率
             try:
                 while time.time() < deadline:
@@ -1829,7 +1870,7 @@ class BrowserAutomation:
 
                     time.sleep(1)
             finally:
-                self.driver.implicitly_wait(10)  # 恢复隐式等待
+                self.driver.implicitly_wait(2)  # 恢复隐式等待至全局默认值
 
             self.last_active_time = time.time()
 
@@ -1942,9 +1983,26 @@ class BrowserAutomation:
                     WebDriverWait(self.driver, 10).until(
                         lambda d: d.execute_script("return document.readyState;") == "complete"
                     )
+
+                    # 强制刷新清除卡住的JS状态
+                    try:
+                        self.driver.refresh()
+                        time.sleep(1)
+                    except Exception:
+                        pass
             except Exception as e:
                 self._log(f"reset_to_home: 导航回首页失败 - {e}")
-                # 不返回 False，继续尝试登录校验
+                # 导航失败时尝试浏览器重启
+                try:
+                    self._log("reset_to_home: 尝试重启浏览器恢复...")
+                    if self.restart_browser():
+                        self._log("reset_to_home: 浏览器重启成功")
+                    else:
+                        self._log("reset_to_home: 浏览器重启也失败")
+                        return False
+                except Exception as re:
+                    self._log(f"reset_to_home: 浏览器重启异常 - {re}")
+                    return False
 
             # 4. 校验登录状态
             if not self.check_login_status():
@@ -2007,6 +2065,66 @@ class BrowserAutomation:
         except Exception:
             return False
     
+    def _detect_existing_session(self) -> bool:
+        """
+        检测浏览器是否已有有效登录会话（持久化 profile 恢复场景）。
+        与 check_login_status 不同：此方法不依赖 self.is_logged_in 标志，
+        直接检查页面状态，用于 initialize() 中跳过登录流程。
+
+        Returns:
+            True表示已有有效会话无需重新登录, False表示需要走登录流程
+        """
+        try:
+            current_url = self.driver.current_url
+
+            # 不在登录页 → 大概率已有 session
+            if "login" not in current_url.lower():
+                # 进一步确认：检查是否有用户信息元素
+                status_indicators = [
+                    (By.CSS_SELECTOR, ".info-user"),
+                    (By.CSS_SELECTOR, ".el-dropdown-link"),
+                ]
+                for by, selector in status_indicators:
+                    try:
+                        self.driver.find_element(by, selector)
+                        self._log(f"_detect_existing_session: 找到元素 {selector}，会话有效")
+                        return True
+                    except NoSuchElementException:
+                        continue
+
+                # URL不在login且页面有内容 → 可能已登录（有些页面info-user渲染慢）
+                body_text = self.driver.execute_script(
+                    "return document.body ? document.body.innerText : ''")
+                if len(body_text) > 100 and "登录" not in body_text[:500]:
+                    self._log("_detect_existing_session: URL非登录页+页面无登录提示，判定会话有效")
+                    return True
+
+            # 在登录页 → 但可能表单还没渲染，稍等片刻再判断
+            if "login" in current_url.lower():
+                # 快速检查登录表单是否已出现
+                try:
+                    self.driver.find_element(
+                        By.CSS_SELECTOR, "input[placeholder='请输入您的账户']")
+                    self._log("_detect_existing_session: 在登录页检测到登录表单，需要重新登录")
+                    return False
+                except NoSuchElementException:
+                    # 可能在登录页但页面还在加载，短等后重试
+                    time.sleep(1)
+                    try:
+                        self.driver.find_element(
+                            By.CSS_SELECTOR, "input[placeholder='请输入您的账户']")
+                        self._log("_detect_existing_session: 登录表单已出现，需要重新登录")
+                        return False
+                    except NoSuchElementException:
+                        pass
+
+            self._log("_detect_existing_session: 无法确定会话状态，走正常登录流程")
+            return False
+
+        except Exception as e:
+            self._log(f"_detect_existing_session: 检测异常 - {e}，走正常登录流程")
+            return False
+
     def check_login_status(self) -> bool:
         """
         检查登录状态是否仍然有效

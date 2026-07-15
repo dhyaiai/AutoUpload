@@ -45,7 +45,7 @@ class FailureAnalysisAgent:
         qwen_key = self.config.qwen_api_key
         if qwen_key:
             self.deepseek = DeepSeekHelper(
-                api_url="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+                api_url=self.config.qwen_api_url,
                 api_key=qwen_key,
                 model=self.config.qwen_model
             )

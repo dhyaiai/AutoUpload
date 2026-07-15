@@ -60,8 +60,10 @@ class ConfigManager:
             "ROLE": "超级管理员",                                   # 用户角色
             "DEEPSEEK_API_KEY": "",                                # DeepSeek API密钥（需填写）
             "CHROME_DRIVER_PATH": "",                              # Chrome驱动路径（留空让Selenium自动管理）
+            "CHROME_PROFILE_DIR": "",                              # Chrome用户数据目录（留空=默认临时目录，填写则复用登录态）
             "FILE_STABLE_DELAY": 2,                                # 文件稳定等待时间(秒)
-            "BROWSER_IDLE_TIMEOUT": 1800,                          # 浏览器空闲超时时间(秒)
+            "BROWSER_IDLE_TIMEOUT": 1800,                          # 浏览器空闲兜底超时(秒)，即使有待重试记录也强制关闭
+            "UPLOAD_IDLE_TIMEOUT": 1800,                           # 上传完成后无操作关闭超时(秒)，队列空+无处理时触发
             "MAX_RETRY_COUNT": 3,                                  # 最大重试次数
             "SLEEP_INTERVAL": 0.5,                                # 操作间隔时间(秒)
             "MINIMIZE_TO_TRAY": True,                              # 关闭窗口时最小化到托盘(False=直接退出)
@@ -79,6 +81,13 @@ class ConfigManager:
             "AI_AGENT_MAX_STEPS": 10,                                # ReAct循环最大步数
             "QWEN_API_KEY": "",                                      # 通义千问 API Key
             "QWEN_MODEL": "qwen3.7-plus",                           # 通义千问模型名
+            "QWEN_API_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",  # 通义千问 API 端点
+
+            # API 服务配置（微信小程序对接）
+            "API_SERVER_HOST": "0.0.0.0",                           # API服务监听地址
+            "API_SERVER_PORT": 8000,                                  # API服务监听端口
+            "UPLOAD_TEMP_DIR": "./upload_temp",                       # 小程序上传文件临时目录
+            "BROWSER_RESTART_INTERVAL": 50,                           # 浏览器定时重启间隔(每N次上传,0=不自动重启)
         }
 
         # 尝试加载配置文件
@@ -171,14 +180,24 @@ class ConfigManager:
         return self.get("CHROME_DRIVER_PATH")
 
     @property
+    def chrome_profile_dir(self) -> str:
+        """获取Chrome用户数据目录路径（持久化登录Cookie，重启后免登录）"""
+        return self.get("CHROME_PROFILE_DIR")
+
+    @property
     def file_stable_delay(self) -> int:
         """获取文件稳定等待时间(秒)"""
         return self.get("FILE_STABLE_DELAY", 2)
 
     @property
     def browser_idle_timeout(self) -> int:
-        """获取浏览器空闲超时时间(秒)"""
+        """获取浏览器空闲兜底超时(秒)，即使有待重试记录也强制关闭"""
         return self.get("BROWSER_IDLE_TIMEOUT", 1800)
+
+    @property
+    def upload_idle_timeout(self) -> int:
+        """获取上传完成后无操作关闭超时(秒)，队列空+无处理时触发"""
+        return self.get("UPLOAD_IDLE_TIMEOUT", 1800)
 
     @property
     def max_retry_count(self) -> int:
@@ -231,9 +250,36 @@ class ConfigManager:
         return self.get("QWEN_API_KEY", "")
 
     @property
+    def qwen_api_url(self) -> str:
+        """通义千问 API 端点 URL"""
+        return self.get("QWEN_API_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions")
+
+    @property
     def qwen_model(self) -> str:
         """通义千问模型名"""
         return self.get("QWEN_MODEL", "qwen-plus")
+
+    # ==================== API 服务配置 ====================
+
+    @property
+    def api_server_host(self) -> str:
+        """API服务监听地址"""
+        return self.get("API_SERVER_HOST", "0.0.0.0")
+
+    @property
+    def api_server_port(self) -> int:
+        """API服务监听端口"""
+        return self.get("API_SERVER_PORT", 8000)
+
+    @property
+    def upload_temp_dir(self) -> str:
+        """小程序上传文件临时目录"""
+        return self.get("UPLOAD_TEMP_DIR", "./upload_temp")
+
+    @property
+    def browser_restart_interval(self) -> int:
+        """浏览器定时重启间隔(每N次上传后重启,0=不自动重启)"""
+        return self.get("BROWSER_RESTART_INTERVAL", 50)
 
     def reload(self):
         """

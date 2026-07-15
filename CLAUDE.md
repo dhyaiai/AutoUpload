@@ -124,9 +124,15 @@ watchdog 检测新文件 → task_queue → UploadProcessor.run()
 - `WEBSITE_URL`：`https://zuoye.7net.cc`
 - `ROLE`：`"超级管理员"` 或 `"老师"`
 - `DEEPSEEK_API_KEY`：DeepSeek API 密钥
+- `QWEN_API_KEY` / `QWEN_MODEL`：通义千问 API（deepseek_helper 支持多提供商切换）
 - `BROWSER_IDLE_TIMEOUT`：1800 秒（30 分钟）
 - `MINIMIZE_TO_TRAY`：关闭窗口时最小化到系统托盘（默认 true）
 - `UPLOAD_TIMEOUT`：上传超时秒数（默认 120）
+- `AUTO_RETRY_ENABLE`：是否启用自动重试 Agent（默认 true）
+- `AUTO_RETRY_SCAN_INTERVAL`：Agent 扫描间隔秒数（默认 60）
+- `AUTO_RETRY_CIRCUIT_BREAKER_THRESHOLD`：熔断阈值（默认 10 次/30 分钟）
+- `AI_RETRY_AGENT_ENABLE` / `AI_ANALYSIS_AGENT_ENABLE`：AI 驱动重试/分析开关
+- `AI_AGENT_MAX_STEPS`：ReAct 循环最大步数（默认 10）
 
 ## 数据库
 
@@ -141,9 +147,10 @@ GUI 的"合并文件"区域支持将试题文件和答案文件合并为一个�
 
 ## 打包注意事项
 
-- `build.spec` 是 PyInstaller 配置，`console=False`（窗口模式），显式声明所有 `hiddenimports`
+- `build.spec` 是当前使用的 PyInstaller 配置，`console=False`（窗口模式）。项目根目录还有一个 `HomeworkAutoUpload.spec` 是旧版遗留文件，以 `build.spec` 为准
 - 必须将 `selenium-manager.exe` 作为 binary 打包（路径含 Python 版本号，不同环境需调整）
 - hiddenimports 包含：所有本地模块、selenium 子模块、pystray/PIL、matplotlib、openpyxl、pypdf、win32com、olefile、tkinterdnd2
+- **⚠️ 已知问题**：`build.spec` 的 hiddenimports 缺少 Agent 相关模块（`auto_retry_agent`、`failure_analysis_agent`、`error_types`、`deepseek_helper`、`react_loop`），PyInstaller 静态分析可能检测不到这些动态导入的模块，打包后 exe 的 Agent 功能可能失效。新增 Agent 相关模块时需同步更新 build.spec
 - 打包目标平台：Windows 10/11 x64，目标 Python 版本：3.9+
 - exe 名称：`HomeworkAutoUpload.exe`
 - `build.bat` 会删除 `*.spec` 文件（第37行 `if exist *.spec del /q *.spec`），打包后如需保留 spec 请注释该行

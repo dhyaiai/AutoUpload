@@ -198,7 +198,7 @@ class AutoRetryAgent:
         qwen_key = self.config.qwen_api_key
         if qwen_key:
             self.deepseek = DeepSeekHelper(
-                api_url="https://llm-nwnb3n9ni4k5ebc2.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+                api_url=self.config.qwen_api_url,
                 api_key=qwen_key,
                 model=self.config.qwen_model
             )

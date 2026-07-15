@@ -9,6 +9,7 @@ import time
 import threading
 from queue import Queue, Empty
 from typing import Optional
+from selenium.webdriver.support.ui import WebDriverWait
 from db_manager import DatabaseManager
 from info_extractor import InfoExtractor
 from subject_classifier import SubjectClassifier
@@ -59,6 +60,9 @@ class UploadProcessor:
         # run() 据此暂停队列消费，等待 Agent 恢复后再继续。
         # 使用 threading.Event 保证跨线程读写安全（Agent 线程 ↔ UploadProcessor 线程）
         self._session_lost = threading.Event()
+
+        # 浏览器定时重启计数器：累计上传次数，达到阈值自动重启浏览器防内存泄漏
+        self._upload_count = 0
 
     def _on_session_lost(self):
         """会话丢失时置位标志，Agent 主循环检测到后自动切换为 5s 快速轮询。
@@ -127,12 +131,19 @@ class UploadProcessor:
 
         if level in (RetryLevel.L2_PAGE_RESET, RetryLevel.L3_ENV_RESET):
             self._send_log(f"Agent重试: 执行{level.value}浏览器复位...")
-            if not self.browser.reset_to_home():
-                self._send_log(f"Agent重试: {level.value}浏览器复位失败，继续尝试上传流程")
-                # 非致命：reset_to_home 内部已尝试 restart_browser，
-                # 后续 ensure_initialized 还会再次尝试恢复
+            # 浏览器未初始化时只需保证可用，不需要完整的 reset_to_home
+            # （reset_to_home 会在初始化后做 driver.get(base_url)+refresh，干扰登录流程）
+            if not self.browser.driver or not self.browser.is_logged_in:
+                self._send_log("Agent重试: 浏览器未就绪，先初始化...")
+                if not self.browser.ensure_initialized():
+                    self._send_log("Agent重试: 浏览器初始化失败，继续尝试上传流程")
+                else:
+                    self._send_log("Agent重试: 浏览器初始化完成")
             else:
-                self._send_log(f"Agent重试: {level.value}浏览器复位完成")
+                if not self.browser.reset_to_home():
+                    self._send_log(f"Agent重试: {level.value}浏览器复位失败，继续尝试上传流程")
+                else:
+                    self._send_log(f"Agent重试: {level.value}浏览器复位完成")
 
         elif level == RetryLevel.L4_SERVICE_RESTART:
             self._send_log(f"Agent重试: L4 已在Agent中重启浏览器，跳过预处理")
@@ -143,8 +154,12 @@ class UploadProcessor:
     def run(self):
         """
         主运行循环
-        持续从任务队列中取出文件并处理,直到收到停止信号
+        持续从任务队列中取出任务并处理,直到收到停止信号
         Agent 忙碌时暂停消费新任务，等待恢复完成
+
+        支持两种任务格式：
+        - str: 桌面端文件路径（文件夹监控产生）
+        - dict: 小程序结构化任务 {file_path, school, grade, subject, record_id}
         """
         print("上传处理器已启动")
 
@@ -174,111 +189,76 @@ class UploadProcessor:
                         continue
 
                 # 从队列中获取任务(超时1秒,以便检查停止信号)
-                file_path = self.task_queue.get(timeout=1)
-                
-                # 处理文件上传
-                self._process_file(file_path)
+                raw_task = self.task_queue.get(timeout=1)
 
-                # 检测到会话丢失 → 重新排队当前文件，暂停队列等待Agent恢复
+                # 根据任务类型分发
+                if isinstance(raw_task, str):
+                    # 桌面端：纯文件路径
+                    self._process_file(raw_task)
+                elif isinstance(raw_task, dict):
+                    # 小程序：结构化任务
+                    self._process_miniprogram_task(raw_task)
+                else:
+                    self._send_log(f"警告: 未知任务格式,跳过: {type(raw_task)}")
+                    self.task_queue.task_done()
+                    continue
+
+                # 检测到会话丢失 → 重新排队当前任务，暂停队列等待Agent恢复
                 if self._session_lost.is_set():
                     # 标记登录态失效，使 Agent 能正确判断
                     self.browser.is_logged_in = False
                     self._send_log(
-                        "会话丢失(账号被踢下线)，当前文件已重新排队，"
+                        "会话丢失(账号被踢下线)，当前任务已重新排队，"
                         "暂停消费新任务，等待Agent恢复登录..."
                     )
-                    # 当前文件放回队尾，等恢复后重试
-                    self.task_queue.put(file_path)
+                    # 当前任务放回队尾，等恢复后重试
+                    self.task_queue.put(raw_task)
 
                 # 标记任务完成
                 self.task_queue.task_done()
-            
+
             except Empty:
                 # 队列为空,继续循环
                 continue
-            
+
             except Exception as e:
                 # 捕获未预期的异常,确保程序不崩溃
                 error_msg = f"上传处理器异常: {e}"
                 print(error_msg)
                 self._send_log(error_msg)
-        
+
         print("上传处理器已停止")
     
-    def _process_file(self, file_path: str):
+    def _execute_browser_upload(self, file_name: str, file_path: str, folder_name: str,
+                                 school: str, grade: str, subject: str,
+                                 error_context: dict, is_agent_retry: bool = False,
+                                 agent_retry_record_id: int = None,
+                                 agent_retry_level: str = None):
         """
-        处理单个文件的完整上传流程
-        每个阶段设置 _current_stage 用于失败时精准定位
+        执行浏览器上传流水线：BrowserInit → SchoolCheck → SubmitUpload
+        从 _process_file 中提取，供桌面端和小程序两种任务共用。
 
         Args:
-            file_path: 文件的完整路径
+            file_name: 文件名
+            file_path: 文件完整路径
+            folder_name: 文件夹名
+            school: 学校
+            grade: 年级
+            subject: 科目
+            error_context: 错误上下文
+            is_agent_retry: 是否Agent触发的重试
+            agent_retry_record_id: Agent重试对应的记录ID
+            agent_retry_level: Agent重试级别
+
+        Returns:
+            (upload_success: bool, current_stage: UploadStage, already_handled: bool)
+            upload_success=True 表示上传成功
+            current_stage 表示失败的阶段（仅失败时有意义）
+            already_handled=True 表示 _handle_failure 已在内部调用，外层无需重复处理
         """
-        file_name = os.path.basename(file_path)
-        folder_path = os.path.dirname(file_path)
-        folder_name = os.path.basename(folder_path)
-
-        self._send_log(f"开始处理文件: {file_name}")
-
-        # 当前阶段变量（用于失败定位）
         current_stage = None
-        error_context = {}
 
-        # 步骤1: 检查是否已经上传过(防重复,按文件名+文件夹名精确匹配)
-        if self.db.is_file_uploaded(file_name, folder_name):
-            self._send_log(f"文件已上传过,跳过: {file_name}")
-            # Agent 触发的重试：通知 Agent 已有成功记录
-            self._notify_agent_result(file_path, True)
-            return
-
-        # 捕获 Agent 重试信息（必须在 finally 弹出 _agent_retry_map 之前保存；
-        # 失败分支在 finally 之后执行，届时 map 已弹出，故需提前持有 record_id）
-        is_agent_retry = file_path in self._agent_retry_map
-        agent_retry_record_id = self._agent_retry_map.get(file_path)
-        agent_retry_level = self._agent_retry_level_map.get(file_path)
-
-        # 步骤2: 解析学校和年级
-        current_stage = UploadStage.PARSE_FOLDER
-        school, grade = self.info_extractor.parse_folder_name(folder_path)
-
-        if not school or not grade:
-            error_msg = f"无法解析文件夹名称: {folder_name}"
-            self._send_log(f"错误: {error_msg}")
-            self._handle_failure(file_name, file_path, folder_name, "未知", "未知", "未知",
-                                 error_msg, current_stage,
-                                 ErrorCategory.FILE_PROCESS_ERROR, ErrorType.FILE_UNREADABLE,
-                                 error_context, existing_record_id=agent_retry_record_id)
-            self._notify_agent_result(file_path, False)
-            return
-
-        self._send_log(f"解析成功 - 学校: {school}, 年级: {grade}")
-
-        # 步骤3: 读取文件内容
-        current_stage = UploadStage.READ_FILE
-        error_context = {"folder_name": folder_name, "school": school, "grade": grade}
-        file_content = self.info_extractor.read_file_content(file_path)
-
-        if not file_content:
-            error_msg = "无法读取文件内容或文件格式不支持"
-            self._send_log(f"警告: {error_msg}")
-            # 继续处理,但科目标记为"未知"
-
-        # 标记处理中，防止后端在任务处理期间误关浏览器
-        self.processing = True
-
-        # 步骤4: AI识别科目(优先从文件名正则,失败则用AI从文件内容识别)
-        current_stage = UploadStage.AI_CLASSIFY
-        self._send_log("正在识别科目...")
-        subject = self.classifier.classify(file_content, file_name=file_name)
-
-        if not subject:
-            subject = "未知"
-            self._send_log(f"警告: 科目识别失败,标记为'未知'")
-        else:
-            self._send_log(f"识别结果: {subject}")
-
-        upload_success = False
-
-        # Agent 重试预处理：在单线程内执行浏览器复位（L2/L3），避免与正常上传并发操作浏览器
+        # Agent 重试预处理：在单线程内执行浏览器复位（L2/L3）
         if is_agent_retry:
             if not self._preprocess_agent_retry(file_path):
                 self._send_log("Agent重试: 预处理失败，放弃本次重试")
@@ -286,12 +266,10 @@ class UploadProcessor:
                                      "Agent重试预处理失败: 浏览器无法恢复", UploadStage.BROWSER_INIT,
                                      ErrorCategory.BROWSER_ERROR, ErrorType.BROWSER_START_FAIL,
                                      error_context, existing_record_id=agent_retry_record_id)
-                self.processing = False
-                self._notify_agent_result(file_path, False)
-                return
+                return False, UploadStage.BROWSER_INIT, True
 
         try:
-            # 步骤5: 确保浏览器已启动（延迟初始化，首次调用时才打开浏览器）
+            # 确保浏览器已启动（延迟初始化，首次调用时才打开浏览器）
             current_stage = UploadStage.BROWSER_INIT
             if not self.browser.ensure_initialized():
                 error_msg = "浏览器启动失败"
@@ -300,7 +278,7 @@ class UploadProcessor:
                                      error_msg, current_stage,
                                      ErrorCategory.BROWSER_ERROR, ErrorType.BROWSER_START_FAIL,
                                      error_context, existing_record_id=agent_retry_record_id)
-                return
+                return False, current_stage, True
 
             # 检查浏览器是否崩溃
             if not self.browser.check_browser_status():
@@ -312,7 +290,7 @@ class UploadProcessor:
                                          error_msg, current_stage,
                                          ErrorCategory.BROWSER_ERROR, ErrorType.BROWSER_START_FAIL,
                                          error_context, existing_record_id=agent_retry_record_id)
-                    return
+                    return False, current_stage, True
 
             # 检查登录状态
             if not self.browser.check_login_status():
@@ -324,9 +302,28 @@ class UploadProcessor:
                                          error_msg, current_stage,
                                          ErrorCategory.BROWSER_ERROR, ErrorType.LOGIN_EXPIRED,
                                          error_context, existing_record_id=agent_retry_record_id)
-                    return
+                    return False, current_stage, True
 
-            # 步骤6: 校验并切换学校(每次上传前都实际检查网页上的学校)
+            # 浏览器复用场景：确保当前在首页，否则后续上传按钮可能找不到
+            # ensure_initialized 对已打开的浏览器不会导航，页面可能停留在任何位置
+            # 只对明确不在首页的状态才导航（login/dialog/error），unknown 可能是检测未匹配URL
+            NON_HOME_STATES = ("login", "role_select", "upload_dialog", "school_dialog", "error")
+            page_state = self.browser.detect_page_state()
+            state = page_state.get("state", "unknown") if page_state.get("success") else "unknown"
+            if state in NON_HOME_STATES:
+                self._send_log(f"当前页面状态: {state}，导航回首页...")
+                try:
+                    base_url = self.config.website_url.rstrip('/')
+                    self.browser.driver.get(base_url)
+                    WebDriverWait(self.browser.driver, 10).until(
+                        lambda d: d.execute_script("return document.readyState;") == "complete"
+                    )
+                    time.sleep(0.5)
+                    self._send_log("已导航回首页")
+                except Exception as e:
+                    self._send_log(f"警告: 导航回首页失败 - {e}，继续尝试...")
+
+            # 校验并切换学校(每次上传前都实际检查网页上的学校)
             current_stage = UploadStage.SCHOOL_CHECK
             self._send_log(f"正在校验学校: {school}")
             if not self.browser.check_and_switch_school(school):
@@ -340,7 +337,7 @@ class UploadProcessor:
                     is_session_lost = True
                     error_msg = f"学校校验/切换失败: 会话丢失(页面已跳转到登录页，账号被踢下线)"
 
-                # 第1层：detect_page_state 全面检测页面状态（比关键词匹配更可靠）
+                # 第1层：detect_page_state 全面检测页面状态
                 if not is_session_lost:
                     try:
                         page_state = self.browser.detect_page_state()
@@ -358,7 +355,7 @@ class UploadProcessor:
                     except Exception as e:
                         self._send_log(f"页面状态检测异常(非致命): {e}")
 
-                # 第2层：页面文本关键词扫描（detect_page_state 未检测到时兜底）
+                # 第2层：页面文本关键词扫描
                 page_hint = ""
                 if not is_session_lost:
                     page_info = self.browser.get_page_text()
@@ -371,8 +368,7 @@ class UploadProcessor:
                                                  error_msg, current_stage,
                                                  ErrorCategory.PLATFORM_BIZ_ERROR, ErrorType.SCHOOL_NOT_ACTIVATED,
                                                  error_context, existing_record_id=agent_retry_record_id)
-                            return
-                        # 提取页面关键错误信息
+                            return False, current_stage, True
                         error_keywords = ["被迫下线", "异地登录", "登录失效", "重新登录",
                                          "没有权限", "已过期", "账号异常"]
                         for kw in error_keywords:
@@ -385,7 +381,7 @@ class UploadProcessor:
                                                  f"（页面提示: {page_hint}）")
                                 break
 
-                # ── 统一处理会话丢失 ──
+                # 统一处理会话丢失
                 if is_session_lost:
                     school_error_type = ErrorType.LOGIN_EXPIRED
                     self._on_session_lost()
@@ -397,60 +393,156 @@ class UploadProcessor:
                                      error_msg, current_stage,
                                      ErrorCategory.BROWSER_ERROR, school_error_type,
                                      error_context, existing_record_id=agent_retry_record_id)
-                return
+                return False, current_stage, True
             self._send_log(f"✓ 学校校验通过: {school}")
 
-            # 步骤7: 执行上传(传递学校参数,用于在上传对话框中选择)
+            # 执行上传(传递学校参数,用于在上传对话框中选择)
             current_stage = UploadStage.SUBMIT_UPLOAD
             self._send_log(f"正在上传到平台...")
             upload_success = self.browser.upload_file(file_path, grade, subject, school)
+            return upload_success, current_stage, False
+
         except Exception as e:
-            # 兜底：捕获浏览器操作中未预期的异常，确保写入失败记录
+            # 兜底：捕获浏览器操作中未预期的异常
             error_msg = f"浏览器操作异常: {e}"
             self._send_log(f"✗ 上传异常: {file_name} - {error_msg}")
             import traceback
             traceback.print_exc()
-            upload_success = False
+            return False, current_stage or UploadStage.SUBMIT_UPLOAD, False
+
+    def _on_upload_success(self, file_name: str, file_path: str, folder_name: str,
+                            school: str, grade: str, subject: str, is_agent_retry: bool):
+        """上传成功后的后处理：记录数据库、清理旧失败、通知Agent"""
+        if self.auto_retry_agent is not None:
+            self.auto_retry_agent.on_any_upload_success()
+        if not is_agent_retry:
+            self.db.add_record(
+                file_name=file_name, file_path=file_path, folder_name=folder_name,
+                school=school, grade=grade, subject=subject, status='success'
+            )
+        resolved = self.db.resolve_pending_by_file(file_name, folder_name)
+        if resolved > 0:
+            self._send_log(f"已清理 {resolved} 条旧失败记录: {file_name}")
+        self.db.add_analysis_record(
+            file_name=file_name, file_path=file_path, folder_name=folder_name,
+            school=school, grade=grade, subject=subject, status='success'
+        )
+        self._send_log(f"✓ 上传成功: {file_name} ({subject})")
+
+    def _update_upload_counter(self):
+        """上传计数器：达到阈值自动重启浏览器防内存泄漏"""
+        self._upload_count += 1
+        restart_interval = self.config.browser_restart_interval
+        if restart_interval > 0 and self._upload_count >= restart_interval:
+            self._send_log(f"达到{restart_interval}次上传阈值，主动重启浏览器...")
+            try:
+                self.browser.restart_browser()
+            except Exception as e:
+                self._send_log(f"浏览器定时重启失败: {e}")
+            self._upload_count = 0
+
+    def _process_file(self, file_path: str):
+        """
+        处理单个文件的完整上传流程（桌面端文件夹监控）
+
+        Args:
+            file_path: 文件的完整路径
+        """
+        file_name = os.path.basename(file_path)
+        folder_path = os.path.dirname(file_path)
+        folder_name = os.path.basename(folder_path)
+
+        self._send_log(f"开始处理文件: {file_name}")
+
+        current_stage = None
+        error_context = {}
+
+        # 防重复检查
+        if self.db.is_file_uploaded(file_name, folder_name):
+            self._send_log(f"文件已上传过,跳过: {file_name}")
+            self._notify_agent_result(file_path, True)
+            return
+
+        is_agent_retry = file_path in self._agent_retry_map
+        agent_retry_record_id = self._agent_retry_map.get(file_path)
+        agent_retry_level = self._agent_retry_level_map.get(file_path)
+
+        # 解析学校和年级
+        # Agent 重试的小程序文件不在学校/年级文件夹下，需从数据库读取
+        current_stage = UploadStage.PARSE_FOLDER
+        school, grade = self.info_extractor.parse_folder_name(folder_path)
+        if agent_retry_record_id:
+            record = self.db.get_record_by_id(agent_retry_record_id)
+            if record:
+                db_school = (record.get('school', '') or '').strip()
+                db_grade = (record.get('grade', '') or '').strip()
+                is_miniprogram = (record.get('source', '') == 'miniprogram')
+                if is_miniprogram and db_school and db_grade:
+                    school, grade = db_school, db_grade
+                    folder_name = 'miniprogram'
+                    self._send_log(f"Agent重试-小程序: 使用数据库学校/年级 - {school}/{grade}")
+                else:
+                    # 桌面端：数据库值作为解析失败的兜底
+                    if not school and db_school:
+                        school = db_school
+                    if not grade and db_grade:
+                        grade = db_grade
+
+        if not school or not grade:
+            error_msg = f"无法解析文件夹名称: {folder_name}"
+            self._send_log(f"错误: {error_msg}")
+            self._handle_failure(file_name, file_path, folder_name, "未知", "未知", "未知",
+                                 error_msg, current_stage,
+                                 ErrorCategory.FILE_PROCESS_ERROR, ErrorType.FILE_UNREADABLE,
+                                 error_context, existing_record_id=agent_retry_record_id)
+            self._notify_agent_result(file_path, False)
+            return
+
+        self._send_log(f"解析成功 - 学校: {school}, 年级: {grade}")
+
+        # 读取文件内容用于科目识别
+        current_stage = UploadStage.READ_FILE
+        error_context = {"folder_name": folder_name, "school": school, "grade": grade}
+        file_content = self.info_extractor.read_file_content(file_path)
+        if not file_content:
+            self._send_log("警告: 无法读取文件内容或文件格式不支持")
+
+        self.processing = True
+
+        # AI识别科目
+        current_stage = UploadStage.AI_CLASSIFY
+        self._send_log("正在识别科目...")
+        subject = self.classifier.classify(file_content, file_name=file_name)
+        if not subject:
+            subject = "未知"
+            self._send_log(f"警告: 科目识别失败,标记为'未知'")
+        else:
+            self._send_log(f"识别结果: {subject}")
+
+        upload_success = False
+
+        try:
+            upload_success, failed_stage, already_handled = self._execute_browser_upload(
+                file_name, file_path, folder_name, school, grade, subject,
+                error_context, is_agent_retry=is_agent_retry,
+                agent_retry_record_id=agent_retry_record_id,
+                agent_retry_level=agent_retry_level
+            )
         finally:
             self.processing = False
-            # Agent 回调：通知 AutoRetryAgent 上传结果
             self._notify_agent_result(file_path, upload_success)
 
         if upload_success:
-            # 上传成功证明环境正常，通知Agent重置临时性错误的熔断器
-            if self.auto_retry_agent is not None:
-                self.auto_retry_agent.on_any_upload_success()
-            # 上传成功,记录到数据库
-            if not is_agent_retry:
-                # Agent 重试：原失败记录已由 on_upload_result 标记为 success，无需新建
-                self.db.add_record(
-                    file_name=file_name,
-                    file_path=file_path,
-                    folder_name=folder_name,
-                    school=school,
-                    grade=grade,
-                    subject=subject,
-                    status='success'
-                )
-            # 清理该文件的旧失败记录（会话丢失等场景会导致同一文件先失败后成功，
-            # 旧 pending 记录若不清理，Agent 会反复扫描到它）
-            resolved = self.db.resolve_pending_by_file(file_name, folder_name)
-            if resolved > 0:
-                self._send_log(f"已清理 {resolved} 条旧失败记录: {file_name}")
-            # 同步写入分析表，确保持久化统计（无论是否 Agent 重试均写入）
-            self.db.add_analysis_record(
-                file_name=file_name,
-                file_path=file_path,
-                folder_name=folder_name,
-                school=school,
-                grade=grade,
-                subject=subject,
-                status='success'
-            )
-            self._send_log(f"✓ 上传成功: {file_name} ({subject})")
+            self._on_upload_success(file_name, file_path, folder_name, school, grade, subject,
+                                     is_agent_retry)
+            self._update_upload_counter()
+        elif already_handled:
+            # _execute_browser_upload 内部已写入结构化失败记录，外层无需重复处理
+            pass
         else:
-            # 上传失败,记录失败信息
-            current_stage = UploadStage.SUBMIT_UPLOAD
+            # 浏览器上传流水线内部已处理学校未激活/会话丢失等情况，
+            # 此处仅处理 _execute_browser_upload 未能内部捕获的通用失败
+            current_stage = failed_stage
             last_error = getattr(self.browser, 'last_upload_error', '')
             if self._is_school_not_activated_error(last_error):
                 error_msg = f"学校未开通数智作业服务: {school}"
@@ -460,15 +552,12 @@ class UploadProcessor:
                                      ErrorCategory.PLATFORM_BIZ_ERROR, ErrorType.SCHOOL_NOT_ACTIVATED,
                                      error_context, existing_record_id=agent_retry_record_id)
             elif last_error and last_error.strip():
-                # 优先使用浏览器捕获的网页实际错误信息，而非笼统提示
                 error_msg = self._clean_error_marker(last_error)
                 error_cat, error_type = self._classify_browser_error(error_msg)
                 self._send_log(f"✗ 上传失败: {file_name} - 页面错误: {error_msg}")
                 self._handle_failure(file_name, file_path, folder_name, school, grade, subject,
-                                     error_msg, current_stage,
-                                     error_cat, error_type,
+                                     error_msg, current_stage, error_cat, error_type,
                                      error_context, existing_record_id=agent_retry_record_id)
-                # 检测到会话丢失 → 通知 run() 暂停队列
                 if error_type == ErrorType.LOGIN_EXPIRED:
                     self._on_session_lost()
             else:
@@ -478,6 +567,129 @@ class UploadProcessor:
                                      error_msg, current_stage,
                                      ErrorCategory.BROWSER_ERROR, ErrorType.UPLOAD_SUBMIT_TIMEOUT,
                                      error_context, existing_record_id=agent_retry_record_id)
+
+    def _process_miniprogram_task(self, task: dict):
+        """
+        处理小程序提交的结构化任务
+
+        任务格式: {file_path, school, grade, subject (可选), record_id}
+
+        Args:
+            task: 任务字典
+        """
+        file_path = task['file_path']
+        # 优先使用客户端传入的原始文件名，回退到磁盘文件名
+        file_name = task.get('original_name') or os.path.basename(file_path)
+        school = task['school']
+        grade = task['grade']
+        subject = task.get('subject')
+        record_id = task.get('record_id')
+
+        self._send_log(f"[小程序任务] 开始处理: {file_name} ({school}/{grade}/{subject or '待识别'})")
+
+        current_stage = None
+        error_context = {"school": school, "grade": grade, "source": "miniprogram"}
+        upload_success = False
+
+        # 更新记录状态为 processing
+        if record_id:
+            self.db.update_retry_status(record_id, 'processing')
+
+        # 检查文件是否存在
+        if not os.path.exists(file_path):
+            error_msg = f"文件不存在: {file_path}"
+            self._send_log(f"错误: {error_msg}")
+            self._handle_failure(file_name, file_path, "miniprogram", school, grade,
+                                 subject or "未知", error_msg, UploadStage.READ_FILE,
+                                 ErrorCategory.FILE_PROCESS_ERROR, ErrorType.FILE_NOT_EXIST,
+                                 error_context, existing_record_id=record_id)
+            return
+
+        # 读取文件内容
+        current_stage = UploadStage.READ_FILE
+        file_content = self.info_extractor.read_file_content(file_path)
+        if not file_content:
+            self._send_log("警告: 无法读取文件内容")
+
+        # AI科目识别（用户未传subject时自动识别）
+        current_stage = UploadStage.AI_CLASSIFY
+        if not subject:
+            self._send_log("正在AI识别科目...")
+            subject = self.classifier.classify(file_content, file_name=file_name)
+            if not subject:
+                subject = "未知"
+                self._send_log(f"警告: 科目识别失败,标记为'未知'")
+            else:
+                self._send_log(f"识别结果: {subject}")
+        else:
+            self._send_log(f"用户指定科目: {subject}")
+
+        self.processing = True
+
+        try:
+            upload_success, failed_stage, already_handled = self._execute_browser_upload(
+                file_name, file_path, "miniprogram", school, grade, subject,
+                error_context, is_agent_retry=False,
+                agent_retry_record_id=record_id
+            )
+        finally:
+            self.processing = False
+
+        if upload_success:
+            if record_id:
+                self.db.mark_record_success(record_id)
+                self.db.update_retry_status(record_id, 'finished')
+            self.db.resolve_pending_by_file(file_name, "miniprogram")
+            self.db.add_analysis_record(
+                file_name=file_name, file_path=file_path, folder_name="miniprogram",
+                school=school, grade=grade, subject=subject, status='success'
+            )
+            self._send_log(f"✓ [小程序任务] 上传成功: {file_name} ({subject})")
+            if self.auto_retry_agent is not None:
+                self.auto_retry_agent.on_any_upload_success()
+            self._update_upload_counter()
+        elif already_handled:
+            # _execute_browser_upload 内部已写入结构化失败记录，
+            # 此处仅需确保重试状态和 error_message 同步
+            last_error = getattr(self.browser, 'last_upload_error', '')
+            error_msg = self._clean_error_marker(last_error) if last_error else "上传操作失败"
+            if record_id:
+                self.db.update_retry_status(record_id, 'pending')
+                self.db.update_record_structured_error(
+                    record_id,
+                    error_message=error_msg,
+                    fail_stage=failed_stage.value if failed_stage else None
+                )
+                self.db.mark_record_failed(record_id)
+            self._send_log("REFRESH_FAILED_LIST")
+        else:
+            current_stage = failed_stage
+            last_error = getattr(self.browser, 'last_upload_error', '')
+            if self._is_school_not_activated_error(last_error):
+                error_msg = f"学校未开通数智作业服务: {school}"
+            elif last_error and last_error.strip():
+                error_msg = self._clean_error_marker(last_error)
+            else:
+                error_msg = "上传操作失败(详见浏览器日志)"
+            self._send_log(f"✗ [小程序任务] 上传失败: {file_name} - {error_msg}")
+
+            # 如果 _execute_browser_upload 内部已处理（调用了 _handle_failure），
+            # 则仅需确保重试状态正确；否则需完整写入
+            if record_id:
+                self.db.update_retry_status(record_id, 'pending')
+                self.db.update_record_structured_error(
+                    record_id,
+                    error_message=error_msg,
+                    fail_stage=current_stage.value if current_stage else None
+                )
+                self.db.mark_record_failed(record_id)
+            else:
+                error_cat, error_type = self._classify_browser_error(error_msg) if last_error else \
+                    (ErrorCategory.BROWSER_ERROR, ErrorType.UPLOAD_SUBMIT_TIMEOUT)
+                self._handle_failure(file_name, file_path, "miniprogram", school, grade,
+                                     subject, error_msg, current_stage,
+                                     error_cat, error_type, error_context)
+            self._send_log("REFRESH_FAILED_LIST")
 
     # ─── 错误分类辅助方法 ───
 
@@ -562,6 +774,9 @@ class UploadProcessor:
             )
             # 防御性设置：确保状态不会卡在 processing（正常流程由 _notify_agent_result 兜底）
             self.db.update_retry_status(record_id, 'pending')
+            # 关键：将 status 从 pending 改为 failed，否则小程序轮询永远看不到失败，
+            # AutoRetryAgent 也不会接管
+            self.db.mark_record_failed(record_id)
         else:
             # 首次失败：创建新记录
             self.db.add_failed_record_structured(
@@ -597,6 +812,7 @@ class UploadProcessor:
     def retry_upload(self, record_id: int, file_path: str):
         """
         重新上传失败的文件（含阶段埋点）
+        支持桌面端（从文件夹名解析学校/年级）和小程序（从数据库记录读取学校/年级）
 
         Args:
             record_id: 数据库记录ID
@@ -627,9 +843,22 @@ class UploadProcessor:
             self._send_log("REFRESH_FAILED_LIST")
             return
 
-        # 重新执行上传流程
+        # 解析学校/年级：小程序任务优先从数据库记录读取（文件夹名无法解析）
         current_stage = UploadStage.PARSE_FOLDER
-        school, grade = self.info_extractor.parse_folder_name(folder_path)
+        record = self.db.get_record_by_id(record_id)
+        db_school = (record.get('school', '') or '').strip() if record else ''
+        db_grade = (record.get('grade', '') or '').strip() if record else ''
+        is_miniprogram = (record.get('source', '') == 'miniprogram') if record else False
+
+        if is_miniprogram and db_school and db_grade:
+            school, grade = db_school, db_grade
+            self._send_log(f"小程序任务: 使用数据库中的学校/年级 - {school}/{grade}")
+        else:
+            school, grade = self.info_extractor.parse_folder_name(folder_path)
+            if not school and db_school:
+                school = db_school
+            if not grade and db_grade:
+                grade = db_grade
 
         if not school or not grade:
             error_msg = "无法解析文件夹名称"
