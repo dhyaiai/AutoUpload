@@ -29,6 +29,7 @@ Pillow>=10.0.0         # 托盘图标生成
 
 # GUI增强
 tkinterdnd2>=0.3.0     # 拖拽文件上传支持
+customtkinter>=5.2.0   # 现代化圆角UI控件库
 
 # 数据可视化与统计
 matplotlib>=3.7.0

@@ -1,0 +1,20 @@
+[
+  {
+    "scenario": "agent_full_loop",
+    "part": "B",
+    "desc": "智能体全链路: 真LLM诊断→真浏览器修复→验证→入队",
+    "steps": [
+      "当前学校: 高密市醴泉实验学校",
+      "破坏后 page_state=upload_dialog",
+      "页面真实错误: 该校未开通数智作业服务 (永久性=True)",
+      "LLM 工具链: (无)",
+      "最终记录状态: retry_status=finished retry_count=0",
+      "任务队列入队: False",
+      "页面实际状态: verified=False state=upload_dialog",
+      "✓ 页面存在真实永久性业务错误，智能体正确识别并转人工（拒绝无意义重试）"
+    ],
+    "grade": "PASS",
+    "llm_calls": 0,
+    "duration_s": 111.2
+  }
+]

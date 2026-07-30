@@ -1,17 +1,20 @@
 """
 作业上传数据统计面板模块
-功能: 提供数据复制、柱状图、折线图、上传记录表、失败记录表及Excel导出
-技术: tkinter + matplotlib + openpyxl
+功能: 提供数据报告、柱状图、折线图、上传记录表、失败记录表及Excel导出
+技术: customtkinter + matplotlib + openpyxl (卡片化布局 + 扁平化图表)
 """
 import os
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from datetime import datetime, timedelta
 
+import customtkinter as ctk
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.ticker import MaxNLocator
 import matplotlib.pyplot as plt
+
+import ui_theme as theme
 
 
 class StatsPanel:
@@ -20,7 +23,7 @@ class StatsPanel:
     包含图表可视化、数据表格和Excel导出功能
     """
 
-    def __init__(self, parent: ttk.Frame, db, root: tk.Tk):
+    def __init__(self, parent, db, root):
         self.parent = parent
         self.db = db
         self.root = root
@@ -43,33 +46,21 @@ class StatsPanel:
 
     @staticmethod
     def _setup_chinese_font():
-        """配置matplotlib中文字体支持"""
-        plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'WenQuanYi Micro Hei', 'Arial Unicode MS']
+        """配置matplotlib中文字体(与全局UI字体保持一致)"""
+        plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'WenQuanYi Micro Hei', 'Arial Unicode MS']
         plt.rcParams['axes.unicode_minus'] = False
 
     # ==================== 界面构建 ====================
 
     def _create_widgets(self):
-        """创建统计面板所有界面组件"""
-        # 可滚动画布
-        self._canvas = tk.Canvas(self.parent, highlightthickness=0)
-        self._scrollbar = ttk.Scrollbar(self.parent, orient="vertical", command=self._canvas.yview)
-        self._inner_frame = ttk.Frame(self._canvas)
+        """创建统计面板所有界面组件(纵向滚动卡片流)"""
+        self._scroll = ctk.CTkScrollableFrame(
+            self.parent, fg_color="transparent",
+            scrollbar_button_color=theme.TEXT_FAINT,
+            scrollbar_button_hover_color=theme.TEXT_MUTED)
+        self._scroll.pack(fill="both", expand=True)
 
-        self._inner_frame.bind("<Configure>",
-            lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
-        self._canvas_window = self._canvas.create_window(
-            (0, 0), window=self._inner_frame, anchor="nw")
-
-        self._canvas.bind("<Configure>", self._on_canvas_configure)
-        self._canvas.bind("<Enter>", self._bind_mousewheel)
-        self._canvas.bind("<Leave>", self._unbind_mousewheel)
-        self._canvas.configure(yscrollcommand=self._scrollbar.set)
-
-        self._canvas.pack(side="left", fill="both", expand=True)
-        self._scrollbar.pack(side="right", fill="y")
-
-        # === 1. 数据管理区 ===
+        # === 1. 数据报告区 ===
         self._create_action_bar()
 
         # === 2. 柱状图: 作业上传数量 ===
@@ -88,36 +79,35 @@ class StatsPanel:
         self._refresh_upload_table()
         self._refresh_failed_table()
 
+    def _new_card(self, title: str, subtitle: str = None):
+        """创建一张带标题的卡片并返回卡片容器"""
+        card = theme.card(self._scroll)
+        card.pack(fill="x", pady=(0, 12))
+
+        head = ctk.CTkFrame(card, fg_color="transparent")
+        head.pack(fill="x", padx=20, pady=(16, 8))
+        theme.card_title(head, title).pack(side="left")
+        if subtitle:
+            ctk.CTkLabel(head, text=subtitle, font=theme.font(11),
+                         text_color=theme.TEXT_FAINT).pack(side="right")
+        return card
+
     def _create_action_bar(self):
-        """数据管理区: 状态提示 + 分析报告按钮"""
-        frame = ttk.LabelFrame(self._inner_frame, text="【数据管理】", padding=10)
-        frame.pack(fill="x", padx=10, pady=5)
+        """数据报告区: 状态提示 + 分析报告按钮"""
+        card = self._new_card("数据报告",
+                              "上传成功自动同步到分析表，数据持久保留")
 
-        # 左侧状态提示
-        self._sync_status_label = ttk.Label(frame,
-            text="✓ 上传成功自动同步到分析表，数据持久保留不受上传记录清理影响",
-            foreground="green")
-        self._sync_status_label.pack(side="left", padx=5)
+        btn_row = ctk.CTkFrame(card, fg_color="transparent")
+        btn_row.pack(fill="x", padx=20, pady=(0, 18))
 
-        # 右侧分析报告按钮组
-        btn_frame = ttk.Frame(frame)
-        btn_frame.pack(side="right", padx=5)
+        for label, period in [("今日报告", "daily"), ("近7天报告", "weekly"),
+                              ("近30天报告", "monthly")]:
+            theme.ghost_button(btn_row, label,
+                               lambda p=period: self._generate_report(p),
+                               width=110).pack(side="left", padx=(0, 10))
 
-        self._report_daily_btn = ttk.Button(btn_frame, text="今日报告",
-                                            command=lambda: self._generate_report('daily'))
-        self._report_daily_btn.pack(side="left", padx=2)
-
-        self._report_weekly_btn = ttk.Button(btn_frame, text="近7天报告",
-                                             command=lambda: self._generate_report('weekly'))
-        self._report_weekly_btn.pack(side="left", padx=2)
-
-        self._report_monthly_btn = ttk.Button(btn_frame, text="近30天报告",
-                                              command=lambda: self._generate_report('monthly'))
-        self._report_monthly_btn.pack(side="left", padx=2)
-
-        self._report_open_dir_btn = ttk.Button(btn_frame, text="打开报告目录",
-                                               command=self._open_reports_dir)
-        self._report_open_dir_btn.pack(side="left", padx=(10, 2))
+        theme.primary_button(btn_row, "打开报告目录", self._open_reports_dir,
+                             width=120).pack(side="right")
 
     def _generate_report(self, period: str):
         """
@@ -169,90 +159,91 @@ class StatsPanel:
 
     def _create_bar_chart_section(self):
         """柱状图区: 作业上传数量图"""
-        frame = ttk.LabelFrame(self._inner_frame, text="【作业上传数量图】", padding=10)
-        frame.pack(fill="x", padx=10, pady=5)
+        card = self._new_card("上传数量统计")
 
-        toggle_frame = ttk.Frame(frame)
-        toggle_frame.pack(fill="x", pady=(0, 5))
+        self._bar_segment = ctk.CTkSegmentedButton(
+            card, values=["按科目", "按学校+年级"], font=theme.font(11),
+            height=30, corner_radius=8,
+            fg_color=theme.CARD_INNER,
+            selected_color=theme.PRIMARY, selected_hover_color=theme.PRIMARY_HOVER,
+            unselected_color=theme.CARD_INNER, unselected_hover_color=theme.PRIMARY_SOFT,
+            text_color=theme.TEXT_MUTED,
+            command=self._on_bar_segment_change)
+        self._bar_segment.set("按科目")
+        self._bar_segment.pack(anchor="w", padx=20, pady=(0, 8))
 
-        self._bar_toggle_btn = ttk.Button(toggle_frame, text="切换为: 按学校+年级",
-                                           command=self._toggle_bar_chart)
-        self._bar_toggle_btn.pack(side="left", padx=5)
-
-        self._bar_figure = Figure(figsize=(8, 3.5), dpi=100)
-        self._bar_canvas = FigureCanvasTkAgg(self._bar_figure, master=frame)
-        self._bar_canvas.get_tk_widget().pack(fill="x", padx=5, pady=5)
+        self._bar_figure = Figure(figsize=(8, 3.5), dpi=100,
+                                  facecolor=theme.CARD)
+        self._bar_canvas = FigureCanvasTkAgg(self._bar_figure, master=card)
+        self._bar_canvas.get_tk_widget().pack(fill="x", padx=20, pady=(0, 18))
 
         # 初始尝试加载数据
         self._refresh_bar_chart()
 
     def _create_line_chart_section(self):
         """折线图区: 作业上传趋势图"""
-        frame = ttk.LabelFrame(self._inner_frame, text="【作业上传趋势图】", padding=10)
-        frame.pack(fill="x", padx=10, pady=5)
+        card = self._new_card("上传趋势")
 
-        toggle_frame = ttk.Frame(frame)
-        toggle_frame.pack(fill="x", pady=(0, 5))
+        self._line_segment = ctk.CTkSegmentedButton(
+            card, values=["按日", "按周", "按月"], font=theme.font(11),
+            height=30, corner_radius=8,
+            fg_color=theme.CARD_INNER,
+            selected_color=theme.PRIMARY, selected_hover_color=theme.PRIMARY_HOVER,
+            unselected_color=theme.CARD_INNER, unselected_hover_color=theme.PRIMARY_SOFT,
+            text_color=theme.TEXT_MUTED,
+            command=self._on_line_segment_change)
+        self._line_segment.set("按日")
+        self._line_segment.pack(anchor="w", padx=20, pady=(0, 8))
 
-        self._line_buttons = {}
-        for mode, label in [("daily", "按日"), ("weekly", "按周"), ("monthly", "按月")]:
-            btn = ttk.Button(toggle_frame, text=label,
-                             command=lambda m=mode: self._switch_line_mode(m))
-            btn.pack(side="left", padx=3)
-            self._line_buttons[mode] = btn
-
-        self._line_figure = Figure(figsize=(8, 3.5), dpi=100)
-        self._line_canvas = FigureCanvasTkAgg(self._line_figure, master=frame)
-        self._line_canvas.get_tk_widget().pack(fill="x", padx=5, pady=5)
+        self._line_figure = Figure(figsize=(8, 3.5), dpi=100,
+                                   facecolor=theme.CARD)
+        self._line_canvas = FigureCanvasTkAgg(self._line_figure, master=card)
+        self._line_canvas.get_tk_widget().pack(fill="x", padx=20, pady=(0, 18))
 
         self._refresh_line_chart()
 
     def _create_upload_table_section(self):
         """上传记录表"""
-        frame = ttk.LabelFrame(self._inner_frame, text="【上传记录表】", padding=10)
-        frame.pack(fill="both", expand=True, padx=10, pady=5)
+        card = self._new_card("上传记录")
 
-        btn_frame = ttk.Frame(frame)
-        btn_frame.pack(fill="x", pady=(0, 5))
-
-        ttk.Button(btn_frame, text="📥 导出到Excel",
-                   command=self._export_upload_table).pack(side="right", padx=5)
+        btn_row = ctk.CTkFrame(card, fg_color="transparent")
+        btn_row.pack(fill="x", padx=20, pady=(0, 8))
+        theme.ghost_button(btn_row, "导出到 Excel",
+                           self._export_upload_table,
+                           width=110).pack(side="right")
 
         columns = ("file_name", "school", "grade", "subject", "upload_time")
         headers = ("作业名称", "学校", "年级", "科目", "上传时间")
-        upload_frame, self._upload_tree = self._create_treeview(frame, columns, headers, height=8)
-        upload_frame.pack(fill="both", expand=True)
+        upload_frame, self._upload_tree = self._create_treeview(card, columns, headers, height=8)
+        upload_frame.pack(fill="both", expand=True, padx=20, pady=(0, 18))
 
     def _create_failed_table_section(self):
         """失败记录表"""
-        frame = ttk.LabelFrame(self._inner_frame, text="【失败上传记录表】", padding=10)
-        frame.pack(fill="both", expand=True, padx=10, pady=5)
+        card = self._new_card("失败上传记录")
 
-        btn_frame = ttk.Frame(frame)
-        btn_frame.pack(fill="x", pady=(0, 5))
-
-        ttk.Button(btn_frame, text="📥 导出到Excel",
-                   command=self._export_failed_table).pack(side="right", padx=5)
+        btn_row = ctk.CTkFrame(card, fg_color="transparent")
+        btn_row.pack(fill="x", padx=20, pady=(0, 8))
+        theme.ghost_button(btn_row, "导出到 Excel",
+                           self._export_failed_table,
+                           width=110).pack(side="right")
 
         columns = ("file_name", "school", "grade", "subject", "upload_time", "error_message")
         headers = ("作业名称", "学校", "年级", "科目", "上传时间", "失败原因")
-        failed_frame, self._failed_tree = self._create_treeview(frame, columns, headers, height=8)
-        failed_frame.pack(fill="both", expand=True)
+        failed_frame, self._failed_tree = self._create_treeview(card, columns, headers, height=8)
+        failed_frame.pack(fill="both", expand=True, padx=20, pady=(0, 18))
 
     @staticmethod
     def _create_treeview(parent, columns, headers, height=10):
-        """创建带滚动条的Treeview，返回 (容器Frame, Treeview) 元组"""
-        tree_frame = ttk.Frame(parent)
-        tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=height)
+        """创建带滚动条的扁平化Treeview，返回 (容器Frame, Treeview) 元组"""
+        tree_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        tree = ttk.Treeview(tree_frame, columns=columns, show="headings",
+                            height=height, style="Card.Treeview")
 
         for col, header in zip(columns, headers):
             tree.heading(col, text=header)
             if col == "error_message":
                 width = 200
                 anchor = "w"
-            elif col == "agent_retry_success":
-                width = 70
-                anchor = "center"
             elif col == "file_name":
                 width = 200
                 anchor = "w"
@@ -264,36 +255,43 @@ class StatsPanel:
                 anchor = "center"
             tree.column(col, width=width, anchor=anchor, minwidth=60)
 
-        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=scrollbar.set)
-
+        sb = theme.attach_tree_scrollbar(tree_frame, tree)
         tree.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        sb.pack(side="right", fill="y", padx=(6, 0))
         return tree_frame, tree
 
     # ==================== 图表刷新 ====================
 
-    def _toggle_bar_chart(self):
+    def _on_bar_segment_change(self, value: str):
         """切换柱状图视图: 科目 ↔ 学校+年级"""
-        self._bar_mode = "school_grade" if self._bar_mode == "subject" else "subject"
-        next_label = "按科目" if self._bar_mode == "subject" else "按学校+年级"
-        self._bar_toggle_btn.config(text=f"切换为: {next_label}")
+        self._bar_mode = "subject" if value == "按科目" else "school_grade"
         self._refresh_bar_chart()
 
-    def _switch_line_mode(self, mode):
+    def _on_line_segment_change(self, value: str):
         """切换折线图聚合方式: daily / weekly / monthly"""
-        self._line_mode = mode
+        mapping = {"按日": "daily", "按周": "weekly", "按月": "monthly"}
+        self._line_mode = mapping.get(value, "daily")
         self._refresh_line_chart()
+
+    @staticmethod
+    def _style_axes(ax):
+        """扁平化坐标轴样式: 去顶右边框、浅色网格、灰色刻度文字"""
+        ax.set_facecolor(theme.CARD)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            ax.spines[side].set_color(theme.BORDER)
+        ax.tick_params(colors=theme.TEXT_MUTED, labelsize=8, length=0)
+        ax.yaxis.grid(True, color=theme.BORDER, linewidth=0.8, alpha=0.6)
+        ax.set_axisbelow(True)
 
     def _refresh_bar_chart(self):
         """重绘柱状图"""
         if self._bar_mode == "subject":
             data = self.db.get_upload_count_by_subject()
-            x_label = "科目"
             title = "各科目上传数量统计"
         else:
             data = self.db.get_upload_count_by_school_grade()
-            x_label = "学校 + 年级"
             title = "各学校年级上传数量统计"
 
         self._bar_figure.clear()
@@ -301,8 +299,8 @@ class StatsPanel:
 
         if not data:
             ax.text(0.5, 0.5, "暂无数据", ha="center", va="center",
-                    fontsize=14, transform=ax.transAxes)
-            ax.set_title(title)
+                    fontsize=13, color=theme.TEXT_FAINT, transform=ax.transAxes)
+            ax.axis("off")
             self._bar_figure.tight_layout()
             self._bar_canvas.draw()
             return
@@ -313,22 +311,20 @@ class StatsPanel:
             labels = [f"{d['school']}{d['grade']}" for d in data]
         counts = [d["count"] for d in data]
 
-        # 颜色: 用渐变蓝色
-        colors = [f"#{(60 + i * 30 % 200):02X}{(120 + i * 20 % 100):02X}{(200 - i * 15 % 50):02X}"
-                  for i in range(len(labels))]
-
-        bars = ax.bar(range(len(labels)), counts, color="#4A90D9")
+        self._style_axes(ax)
+        bars = ax.bar(range(len(labels)), counts, color=theme.PRIMARY,
+                      width=0.55, zorder=3)
         ax.set_xticks(range(len(labels)))
         ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
-        ax.set_xlabel(x_label)
-        ax.set_ylabel("上传数量")
+        ax.set_ylabel("上传数量", fontsize=9, color=theme.TEXT_MUTED)
         ax.yaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
-        ax.set_title(title)
+        ax.set_title(title, fontsize=10, color=theme.TEXT, pad=10)
 
         # 柱顶数值标签
         for bar, count in zip(bars, counts):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
-                    str(count), ha="center", va="bottom", fontsize=8)
+                    str(count), ha="center", va="bottom", fontsize=8,
+                    color=theme.TEXT_MUTED)
 
         self._bar_figure.tight_layout()
         self._bar_canvas.draw()
@@ -342,8 +338,8 @@ class StatsPanel:
 
         if not data:
             ax.text(0.5, 0.5, "暂无数据", ha="center", va="center",
-                    fontsize=14, transform=ax.transAxes)
-            ax.set_title("作业上传趋势图")
+                    fontsize=13, color=theme.TEXT_FAINT, transform=ax.transAxes)
+            ax.axis("off")
             self._line_figure.tight_layout()
             self._line_canvas.draw()
             return
@@ -353,9 +349,11 @@ class StatsPanel:
 
         mode_title = {"daily": "每日", "weekly": "每周", "monthly": "每月"}
 
+        self._style_axes(ax)
         ax.plot(range(len(labels)), counts, marker="o", linestyle="-",
-                color="#E67E22", linewidth=1.5, markersize=4)
-        ax.fill_between(range(len(labels)), counts, alpha=0.12, color="#E67E22")
+                color=theme.PRIMARY, linewidth=1.6, markersize=4, zorder=3)
+        ax.fill_between(range(len(labels)), counts, alpha=0.10,
+                        color=theme.PRIMARY, zorder=2)
         ax.set_xticks(range(len(labels)))
 
         # 标签过多时每隔N个显示一个
@@ -363,28 +361,18 @@ class StatsPanel:
         visible_labels = [label if i % n == 0 else "" for i, label in enumerate(labels)]
         ax.set_xticklabels(visible_labels, rotation=45, ha="right", fontsize=8)
 
-        ax.set_xlabel("日期")
-        ax.set_ylabel("上传数量")
+        ax.set_ylabel("上传数量", fontsize=9, color=theme.TEXT_MUTED)
         ax.yaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
-        ax.set_title(f"作业上传趋势图 ({mode_title[self._line_mode]})")
+        ax.set_title(f"作业上传趋势 ({mode_title[self._line_mode]})",
+                     fontsize=10, color=theme.TEXT, pad=10)
 
         # 数值标注
         for i, (x, y) in enumerate(zip(range(len(labels)), counts)):
-            ax.text(x, y + 0.3, str(y), ha="center", va="bottom", fontsize=7)
+            ax.text(x, y + 0.3, str(y), ha="center", va="bottom", fontsize=7,
+                    color=theme.TEXT_MUTED)
 
         self._line_figure.tight_layout()
         self._line_canvas.draw()
-
-    @staticmethod
-    def _show_empty_chart(figure, message):
-        """在图表中显示提示信息"""
-        figure.clear()
-        ax = figure.add_subplot(111)
-        ax.text(0.5, 0.5, message, ha="center", va="center", fontsize=14,
-                color="gray", transform=ax.transAxes)
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
-        ax.axis("off")
 
     # ==================== 表格刷新 ====================
 
@@ -432,8 +420,7 @@ class StatsPanel:
 
             # 表头
             headers = ["作业名称", "学校", "年级", "科目", "上传时间"]
-            header_font = Font(bold=True, size=11)
-            header_fill = PatternFill(start_color="4A90D9", end_color="4A90D9", fill_type="solid")
+            header_fill = PatternFill(start_color="5B7CFA", end_color="5B7CFA", fill_type="solid")
             header_font_white = Font(bold=True, size=11, color="FFFFFF")
 
             for col_idx, header in enumerate(headers, 1):
@@ -479,7 +466,7 @@ class StatsPanel:
             ws.title = "失败记录"
 
             headers = ["作业名称", "学校", "年级", "科目", "上传时间", "失败原因", "Agent接管成功"]
-            header_fill = PatternFill(start_color="E74C3C", end_color="E74C3C", fill_type="solid")
+            header_fill = PatternFill(start_color="D9695F", end_color="D9695F", fill_type="solid")
             header_font = Font(bold=True, size=11, color="FFFFFF")
 
             for col_idx, header in enumerate(headers, 1):
@@ -506,20 +493,6 @@ class StatsPanel:
             messagebox.showinfo("导出成功", f"已导出 {count} 条失败记录到:\n{path}")
         except Exception as e:
             messagebox.showerror("导出失败", str(e))
-
-    # ==================== 滚动支持 ====================
-
-    def _on_canvas_configure(self, event):
-        self._canvas.itemconfig(self._canvas_window, width=event.width)
-
-    def _bind_mousewheel(self, event):
-        self._canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-
-    def _unbind_mousewheel(self, event):
-        self._canvas.unbind_all("<MouseWheel>")
-
-    def _on_mousewheel(self, event):
-        self._canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     # ==================== 资源清理 ====================
 

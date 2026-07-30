@@ -137,6 +137,103 @@ class DeepSeekHelper:
 
         return self._retry_api_call(_call, desc="多轮对话")
 
+    def chat_messages_raw(self, messages: List[Dict], tools: Optional[List[Dict]] = None,
+                          temperature: float = 0) -> Optional[Dict]:
+        """
+        支持原生 Function Calling 的多轮对话调用，返回完整 assistant 消息字典
+
+        Args:
+            messages: 消息列表，支持 role=system/user/assistant/tool 及 tool_calls 字段
+            tools: OpenAI 兼容的工具 JSON Schema 列表，传 None 则不启用工具
+            temperature: 温度参数，默认 0
+
+        Returns:
+            完整的 message 字典（含 content / tool_calls 字段），失败返回 None
+        """
+        if not self.api_key:
+            print("DeepSeekHelper: 未配置 API Key")
+            return None
+
+        def _call():
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}"
+            }
+            payload = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": temperature
+            }
+            if tools:
+                payload["tools"] = tools
+            response = requests.post(
+                self.api_url, headers=headers, json=payload, timeout=self.TIMEOUT
+            )
+            response.raise_for_status()
+            result = response.json()
+
+            if "choices" in result and len(result["choices"]) > 0:
+                message = result["choices"][0].get("message")
+                if message:
+                    return message
+            return None
+
+        return self._retry_api_call(_call, desc="FunctionCalling对话")
+
+    def chat_vision(self, system_prompt: str, user_text: str, image_base64: str,
+                    temperature: float = 0, mime: str = "image/jpeg") -> Optional[str]:
+        """
+        多模态视觉调用：文本 + base64 截图（OpenAI 兼容图片消息格式，DashScope compatible-mode 支持）
+
+        Args:
+            system_prompt: 系统提示词
+            user_text: 用户文本内容（对图片的提问）
+            image_base64: 截图的 base64 编码（不含 data: 前缀）
+            temperature: 温度参数，默认 0
+            mime: 图片 MIME 类型，默认 image/jpeg（压缩后截图），回退时为 image/png
+
+        Returns:
+            AI 回复文本，失败返回 None
+        """
+        if not self.api_key:
+            print("DeepSeekHelper: 未配置 API Key")
+            return None
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": [
+                {"type": "text", "text": user_text},
+                {"type": "image_url", "image_url": {
+                    "url": f"data:{mime};base64,{image_base64}"
+                }}
+            ]}
+        ]
+
+        def _call():
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}"
+            }
+            payload = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": temperature
+            }
+            # 视觉推理慢于文本，超时单独放宽为 60s
+            response = requests.post(
+                self.api_url, headers=headers, json=payload, timeout=60
+            )
+            response.raise_for_status()
+            result = response.json()
+
+            if "choices" in result and len(result["choices"]) > 0:
+                content = result["choices"][0]["message"]["content"]
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+            return None
+
+        return self._retry_api_call(_call, desc="视觉分析")
+
     def _is_auth_error(self, status_code: int) -> bool:
         """判断是否为认证/授权错误（不应重试）"""
         return status_code in (401, 403)

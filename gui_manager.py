@@ -1,16 +1,20 @@
 """
 GUI管理界面模块
 功能:提供图形化用户界面,管理文件夹、查看失败文件、显示日志
-技术:使用tkinter构建桌面应用
+技术:使用 customtkinter 构建现代化桌面应用(圆角卡片 + 侧边栏导航 + 低饱和配色)
 支持:关闭窗口时最小化到系统托盘
 """
 import os
 import shutil
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext, filedialog
+from tkinter import ttk, messagebox, filedialog
 from queue import Queue, Empty
 from threading import Thread
 from typing import Optional
+
+import customtkinter as ctk
+
+import ui_theme as theme
 from db_manager import DatabaseManager
 from config_manager import ConfigManager
 from file_merger import FileMerger
@@ -22,13 +26,13 @@ class MainApplication:
     主应用程序窗口
     包含文件夹管理、失败文件处理、日志显示等功能
     """
-    
-    def __init__(self, root: tk.Tk, stop_event, task_queue: Queue, log_queue: Queue, upload_processor):
+
+    def __init__(self, root, stop_event, task_queue: Queue, log_queue: Queue, upload_processor):
         """
         初始化GUI应用
-        
+
         Args:
-            root: tkinter根窗口
+            root: 根窗口(CTk)
             stop_event: 停止信号
             task_queue: 任务队列(用于重新上传)
             log_queue: 日志队列(接收后台日志)
@@ -56,258 +60,374 @@ class MainApplication:
         self.tray_icon = None
         self.tray_thread = None
         self._tray_setup_done = False
-        
+
+        # 当前页面: "upload" | "stats"
+        self._current_page = "upload"
+
         # 设置窗口属性
         self.root.title("作业自动上传管理工具")
-        self.root.geometry("1050x700")
-        self.root.minsize(900, 550)
+        self.root.geometry("1200x760")
+        self.root.minsize(1024, 680)
+        try:
+            self.root.configure(fg_color=theme.BG)
+        except Exception:
+            pass
 
-        # 可滚动画布（内容溢出时可滚动）
-        self._canvas = tk.Canvas(self.root, highlightthickness=0)
-        self._scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=self._canvas.yview)
-        self.content_frame = ttk.Frame(self._canvas)
+        # 配置全局 Treeview 扁平样式
+        theme.setup_treeview_style(self.root)
 
-        self.content_frame.bind("<Configure>",
-            lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
-        self._canvas_window = self._canvas.create_window(
-            (0, 0), window=self.content_frame, anchor="nw")
-
-        # 画布宽度跟随窗口变化时同步内容宽度
-        self._canvas.bind("<Configure>", self._on_canvas_configure)
-        # 鼠标滚轮滚动
-        self._canvas.bind("<Enter>", self._bind_mousewheel)
-        self._canvas.bind("<Leave>", self._unbind_mousewheel)
-
-        self._canvas.configure(yscrollcommand=self._scrollbar.set)
-
-        self._canvas.pack(side="left", fill="both", expand=True)
-        self._scrollbar.pack(side="right", fill="y")
-        
         # 创建界面组件
         self._create_widgets()
-        
+
         # 启动日志更新定时器
         self._update_logs()
-        
+
         # 启动失败列表刷新定时器
         self._refresh_failed_list()
-        
+
         # 绑定窗口关闭事件
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
-    
+
+    # ==================== 整体布局 ====================
+
     def _create_widgets(self):
-        """
-        创建所有界面组件
-        使用Notebook实现标签页切换
-        """
-        # 创建Notebook标签页容器
-        self.notebook = ttk.Notebook(self.content_frame)
-        self.notebook.pack(fill="both", expand=True, padx=0, pady=0)
+        """创建整体布局: 左侧导航栏 + 右侧内容区(两个页面切换)"""
+        self.root.grid_columnconfigure(1, weight=1)
+        self.root.grid_rowconfigure(0, weight=1)
 
-        # 标签页1: 上传管理（原有内容）
-        self.tab_upload = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_upload, text="📤 上传管理")
+        # ===== 左侧导航栏 =====
+        self._create_sidebar()
 
-        # 标签页2: 数据统计
-        self.tab_stats = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_stats, text="📊 作业上传数据统计")
+        # ===== 右侧内容区 =====
+        self.content = ctk.CTkFrame(self.root, fg_color="transparent")
+        self.content.grid(row=0, column=1, sticky="nsew", padx=(4, 16), pady=16)
 
-        # 创建上传管理标签页内容
-        self._create_upload_tab()
+        # 页面1: 上传管理
+        self.page_upload = ctk.CTkFrame(self.content, fg_color="transparent")
+        self._create_upload_page()
 
-        # 创建数据统计标签页内容
-        self._create_stats_tab()
+        # 页面2: 数据统计
+        self.page_stats = ctk.CTkFrame(self.content, fg_color="transparent")
+        self._create_stats_page()
+
+        # 默认显示上传管理页
+        self._show_page("upload")
 
         # 启动统计面板定时刷新
         self._start_stats_refresh()
 
-    def _create_upload_tab(self):
+    def _create_sidebar(self):
+        """左侧导航栏: 应用标题 + 页面导航 + 浏览器状态"""
+        sidebar = ctk.CTkFrame(self.root, width=208, corner_radius=0,
+                               fg_color=theme.CARD)
+        sidebar.grid(row=0, column=0, sticky="nsw")
+        sidebar.grid_propagate(False)
+        sidebar.grid_rowconfigure(3, weight=1)
+
+        # 应用标题
+        title_box = ctk.CTkFrame(sidebar, fg_color="transparent")
+        title_box.grid(row=0, column=0, sticky="ew", padx=20, pady=(28, 4))
+        ctk.CTkLabel(title_box, text="作业自动上传", font=theme.font(17, "bold"),
+                     text_color=theme.TEXT, anchor="w").pack(fill="x")
+        ctk.CTkLabel(title_box, text="AUTO UPLOAD", font=theme.font(10),
+                     text_color=theme.TEXT_FAINT, anchor="w").pack(fill="x")
+
+        # 分隔留白
+        ctk.CTkFrame(sidebar, fg_color="transparent", height=16).grid(row=1, column=0)
+
+        # 导航按钮
+        nav_box = ctk.CTkFrame(sidebar, fg_color="transparent")
+        nav_box.grid(row=2, column=0, sticky="ew", padx=12)
+
+        self._nav_buttons = {}
+        for key, label in [("upload", "上传管理"), ("stats", "数据统计")]:
+            btn = ctk.CTkButton(
+                nav_box, text=label, font=theme.font(13),
+                anchor="w", height=40, corner_radius=8,
+                fg_color="transparent", hover_color=theme.PRIMARY_SOFT,
+                text_color=theme.TEXT_MUTED,
+                command=lambda k=key: self._show_page(k))
+            btn.pack(fill="x", pady=3)
+            self._nav_buttons[key] = btn
+
+        # 底部: 浏览器状态指示
+        status_box = ctk.CTkFrame(sidebar, fg_color=theme.CARD_INNER,
+                                  corner_radius=10)
+        status_box.grid(row=4, column=0, sticky="ew", padx=12, pady=16)
+
+        ctk.CTkLabel(status_box, text="浏览器状态", font=theme.font(10),
+                     text_color=theme.TEXT_FAINT, anchor="w"
+                     ).pack(fill="x", padx=14, pady=(10, 0))
+
+        row = ctk.CTkFrame(status_box, fg_color="transparent")
+        row.pack(fill="x", padx=14, pady=(2, 10))
+        self._status_dot = ctk.CTkLabel(row, text="●", font=theme.font(12),
+                                        text_color=theme.TEXT_FAINT, width=14,
+                                        anchor="w")
+        self._status_dot.pack(side="left")
+        self.status_label = ctk.CTkLabel(row, text="未启动 · 等待文件",
+                                         font=theme.font(11),
+                                         text_color=theme.TEXT_MUTED, anchor="w")
+        self.status_label.pack(side="left", fill="x", expand=True)
+
+    def _show_page(self, name: str):
+        """切换页面并更新导航高亮"""
+        self._current_page = name
+        self.page_upload.pack_forget()
+        self.page_stats.pack_forget()
+        page = self.page_upload if name == "upload" else self.page_stats
+        page.pack(fill="both", expand=True)
+
+        for key, btn in self._nav_buttons.items():
+            if key == name:
+                btn.configure(fg_color=theme.PRIMARY_SOFT,
+                              text_color=theme.PRIMARY)
+            else:
+                btn.configure(fg_color="transparent",
+                              text_color=theme.TEXT_MUTED)
+
+    def _set_browser_status(self, state: str):
+        """更新侧边栏浏览器状态指示(state: connected/disconnected/restarting/error)"""
+        mapping = {
+            "connected": (theme.SUCCESS, "已连接"),
+            "disconnected": (theme.TEXT_FAINT, "未启动 · 等待文件"),
+            "restarting": (theme.WARNING, "重启中…"),
+            "error": (theme.DANGER, "未连接"),
+        }
+        color, text = mapping.get(state, mapping["disconnected"])
+        self._status_dot.configure(text_color=color)
+        self.status_label.configure(text=text)
+
+    # ==================== 上传管理页 ====================
+
+    def _create_upload_page(self):
         """
-        创建上传管理标签页内容
-        布局：左侧（创建文件夹 + 合并文件 + 文件夹列表 + 失败列表）| 右侧（浏览器状态 + 运行日志）
+        创建上传管理页
+        布局: 左列(创建文件夹 + 合并文件 + 文件夹列表 + 失败列表) | 右列(运行日志)
         """
-        parent = self.tab_upload
+        page = self.page_upload
+        page.grid_columnconfigure(0, weight=3, uniform="upload_cols")
+        page.grid_columnconfigure(1, weight=1, uniform="upload_cols", minsize=240)
+        page.grid_rowconfigure(0, weight=1)
 
-        # 左右分栏容器
-        main_pw = ttk.PanedWindow(parent, orient="horizontal")
-        main_pw.pack(fill="both", expand=True)
+        left = ctk.CTkFrame(page, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        left.grid_columnconfigure(0, weight=1)
+        left.grid_rowconfigure(2, weight=1)
+        left.grid_rowconfigure(3, weight=1)
 
-        # ===== 左侧面板：功能区域 =====
-        left_frame = ttk.Frame(main_pw)
-        main_pw.add(left_frame, weight=3)
+        right = ctk.CTkFrame(page, fg_color="transparent")
+        right.grid(row=0, column=1, sticky="nsew")
+        right.grid_columnconfigure(0, weight=1)
+        right.grid_rowconfigure(0, weight=1)
 
-        # === 1. 创建文件夹区域 ===
-        create_frame = ttk.LabelFrame(left_frame, text="【创建新文件夹】", padding=10)
-        create_frame.pack(fill="x", padx=5, pady=(5, 2))
+        self._build_create_card(left)
+        self._build_merge_card(left)
+        self._build_folder_card(left)
+        self._build_failed_card(left)
+        self._build_log_card(right)
 
-        # 学校名称输入
-        ttk.Label(create_frame, text="学校名称:").grid(row=0, column=0, sticky="w", padx=5)
-        self.school_entry = ttk.Entry(create_frame, width=20)
-        self.school_entry.grid(row=0, column=1, padx=5)
+    def _build_create_card(self, parent):
+        """卡片: 创建新文件夹"""
+        card = theme.card(parent)
+        card.grid(row=0, column=0, sticky="ew", pady=(0, 12))
 
-        # 年级下拉选择
-        ttk.Label(create_frame, text="年级:").grid(row=0, column=2, sticky="w", padx=5)
-        self.grade_combo = ttk.Combobox(create_frame, width=10, state="readonly")
-        self.grade_combo['values'] = ('高一', '高二', '高三', '初一', '初二', '初三',
-                                      '小一', '小二', '小三', '小四', '小五', '小六')
-        self.grade_combo.current(0)
-        self.grade_combo.grid(row=0, column=3, padx=5)
+        theme.card_title(card, "创建新文件夹").pack(fill="x", padx=20, pady=(16, 8))
 
-        # 创建按钮
-        create_btn = ttk.Button(create_frame, text="创建", command=self._create_folder)
-        create_btn.grid(row=0, column=4, padx=10)
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=20, pady=(0, 18))
 
-        # === 2. 合并文件区域 ===
-        merge_frame = ttk.LabelFrame(left_frame, text="【合并文件（仅支持同文件格式进行合并）】", padding=10)
-        merge_frame.pack(fill="x", padx=5, pady=2)
+        ctk.CTkLabel(row, text="学校名称", font=theme.font(12),
+                     text_color=theme.TEXT_MUTED).pack(side="left")
+        self.school_entry = ctk.CTkEntry(
+            row, width=220, height=34, corner_radius=8,
+            font=theme.font(12), placeholder_text="输入学校名称",
+            fg_color=theme.CARD_INNER, border_color=theme.BORDER,
+            text_color=theme.TEXT)
+        self.school_entry.pack(side="left", padx=(10, 24))
 
-        merge_frame.columnconfigure(0, weight=1)
-        merge_frame.columnconfigure(1, weight=1)
-        merge_frame.columnconfigure(2, weight=0)
+        ctk.CTkLabel(row, text="年级", font=theme.font(12),
+                     text_color=theme.TEXT_MUTED).pack(side="left")
+        self.grade_combo = ctk.CTkComboBox(
+            row, width=110, height=34, corner_radius=8, state="readonly",
+            font=theme.font(12), dropdown_font=theme.font(12),
+            values=['高一', '高二', '高三', '初一', '初二', '初三',
+                    '小一', '小二', '小三', '小四', '小五', '小六'],
+            fg_color=theme.CARD_INNER, border_color=theme.BORDER,
+            button_color=theme.CARD_INNER, button_hover_color=theme.PRIMARY_SOFT,
+            text_color=theme.TEXT, dropdown_fg_color=theme.CARD,
+            dropdown_hover_color=theme.PRIMARY_SOFT,
+            dropdown_text_color=theme.TEXT)
+        self.grade_combo.set('高一')
+        self.grade_combo.pack(side="left", padx=(10, 24))
 
-        # --- 左侧：上传试题 ---
-        question_sub = ttk.Frame(merge_frame)
-        question_sub.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        theme.primary_button(row, "创建", self._create_folder,
+                             width=88).pack(side="left")
 
-        self._question_status_label = tk.Label(
-            question_sub, text="上传试题：点击浏览或拖拽文件到下方区域",
-            bg="white", relief="sunken", anchor="center", height=3,
-            fg="gray"
-        )
-        self._question_status_label.pack(fill="x", pady=(0, 2))
-        self._question_status_label.bind('<Button-1>', lambda e: self._browse_question_file())
-        self._register_drop_target(self._question_status_label, self._on_question_drop)
+    def _build_merge_card(self, parent):
+        """卡片: 合并文件(试题 + 答案拖拽区)"""
+        card = theme.card(parent)
+        card.grid(row=1, column=0, sticky="ew", pady=(0, 12))
 
-        ttk.Button(question_sub, text="浏览...",
-                   command=self._browse_question_file).pack()
+        head = ctk.CTkFrame(card, fg_color="transparent")
+        head.pack(fill="x", padx=20, pady=(16, 8))
+        theme.card_title(head, "合并文件").pack(side="left")
+        ctk.CTkLabel(head, text="仅支持相同格式合并，完成后自动加入上传队列",
+                     font=theme.font(11), text_color=theme.TEXT_FAINT
+                     ).pack(side="right")
 
-        # --- 中间：上传答案 ---
-        answer_sub = ttk.Frame(merge_frame)
-        answer_sub.grid(row=0, column=1, sticky="nsew", padx=(5, 5))
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=20, pady=(0, 18))
+        row.grid_columnconfigure(0, weight=1)
+        row.grid_columnconfigure(1, weight=1)
 
-        self._answer_status_label = tk.Label(
-            answer_sub, text="上传答案：点击浏览或拖拽文件到下方区域",
-            bg="white", relief="sunken", anchor="center", height=3,
-            fg="gray"
-        )
-        self._answer_status_label.pack(fill="x", pady=(0, 2))
-        self._answer_status_label.bind('<Button-1>', lambda e: self._browse_answer_file())
-        self._register_drop_target(self._answer_status_label, self._on_answer_drop)
+        # 试题拖拽区
+        q_zone, self._question_status_label = self._build_drop_zone(
+            row, "试题文件", self._browse_question_file)
+        q_zone.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        theme.register_drop_target_recursive(q_zone, self._on_question_drop)
+        self._question_zone = q_zone
 
-        ttk.Button(answer_sub, text="浏览...",
-                   command=self._browse_answer_file).pack()
+        # 答案拖拽区
+        a_zone, self._answer_status_label = self._build_drop_zone(
+            row, "答案文件", self._browse_answer_file)
+        a_zone.grid(row=0, column=1, sticky="ew", padx=(0, 10))
+        theme.register_drop_target_recursive(a_zone, self._on_answer_drop)
+        self._answer_zone = a_zone
 
-        # --- 右侧：合并按钮 ---
-        merge_btn = ttk.Button(merge_frame, text="合  并", command=self._on_merge_click, width=10)
-        merge_btn.grid(row=0, column=2, padx=(5, 0), sticky="ns")
+        # 合并按钮
+        theme.primary_button(row, "合 并", self._on_merge_click,
+                             width=92, height=72, font=theme.font(13, "bold")
+                             ).grid(row=0, column=2)
 
-        # === 3. 文件夹列表区域 ===
-        folder_frame = ttk.LabelFrame(left_frame, text="文件夹列表:", padding=10)
-        folder_frame.pack(fill="both", expand=True, padx=5, pady=2)
+    @staticmethod
+    def _build_drop_zone(parent, title: str, browse_command):
+        """构建单个文件拖拽/点击选择区域，返回 (区域Frame, 状态Label)"""
+        zone = ctk.CTkFrame(parent, fg_color=theme.CARD_INNER, corner_radius=10,
+                            border_width=1, border_color=theme.BORDER, height=72)
+        zone.pack_propagate(False)
 
-        # 创建Treeview显示文件夹列表
+        ctk.CTkLabel(zone, text=title, font=theme.font(12, "bold"),
+                     text_color=theme.TEXT_MUTED).pack(pady=(14, 0))
+        status = ctk.CTkLabel(zone, text="点击选择或拖拽文件到此处",
+                              font=theme.font(11), text_color=theme.TEXT_FAINT)
+        status.pack(pady=(2, 0))
+
+        theme.bind_click_recursive(zone, lambda e: browse_command())
+        return zone, status
+
+    def _build_folder_card(self, parent):
+        """卡片: 文件夹列表"""
+        card = theme.card(parent)
+        card.grid(row=2, column=0, sticky="nsew", pady=(0, 12))
+
+        theme.card_title(card, "文件夹列表").pack(fill="x", padx=20, pady=(16, 8))
+
+        tree_box = ctk.CTkFrame(card, fg_color="transparent")
+        tree_box.pack(fill="both", expand=True, padx=20, pady=(0, 16))
+
         columns = ("序号", "文件夹名称", "清空文件", "删除文件夹")
-        self.folder_tree = ttk.Treeview(folder_frame, columns=columns, show="headings", height=6)
-        self.folder_tree.heading("序号", text="序号")
-        self.folder_tree.heading("文件夹名称", text="文件夹名称")
-        self.folder_tree.heading("清空文件", text="清空文件")
-        self.folder_tree.heading("删除文件夹", text="删除文件夹")
-
-        self.folder_tree.column("序号", width=50, anchor="center")
+        self.folder_tree = ttk.Treeview(tree_box, columns=columns,
+                                        show="headings", height=5,
+                                        style="Card.Treeview")
+        for col in columns:
+            self.folder_tree.heading(col, text=col)
+        self.folder_tree.column("序号", width=56, anchor="center", stretch=False)
         self.folder_tree.column("文件夹名称", width=300, anchor="w")
-        self.folder_tree.column("清空文件", width=100, anchor="center")
-        self.folder_tree.column("删除文件夹", width=100, anchor="center")
-
-        # 配置操作列的可点击样式
-        self.folder_tree.tag_configure("action", foreground="#0066CC", font=("Arial", 9, "underline"))
+        self.folder_tree.column("清空文件", width=90, anchor="center", stretch=False)
+        self.folder_tree.column("删除文件夹", width=90, anchor="center", stretch=False)
 
         # 绑定点击事件：点击"清空文件"或"删除文件夹"列时触发操作
         self.folder_tree.bind("<ButtonRelease-1>", self._on_folder_tree_click)
         self.folder_tree.bind("<Motion>", self._on_folder_tree_motion)
 
-        # 添加滚动条
-        folder_scrollbar = ttk.Scrollbar(folder_frame, orient="vertical", command=self.folder_tree.yview)
-        self.folder_tree.configure(yscrollcommand=folder_scrollbar.set)
-
+        sb = theme.attach_tree_scrollbar(tree_box, self.folder_tree)
         self.folder_tree.pack(side="left", fill="both", expand=True)
-        folder_scrollbar.pack(side="right", fill="y")
+        sb.pack(side="right", fill="y", padx=(6, 0))
 
         # 刷新文件夹列表
         self._refresh_folder_list()
 
-        # === 4. 上传失败文件列表 ===
-        failed_frame = ttk.LabelFrame(left_frame, text="⚠️ 上传失败文件(需处理):", padding=10)
-        failed_frame.pack(fill="both", expand=True, padx=5, pady=2)
+    def _build_failed_card(self, parent):
+        """卡片: 上传失败文件列表"""
+        card = theme.card(parent)
+        card.grid(row=3, column=0, sticky="nsew")
 
-        # 创建Treeview显示失败文件
+        head = ctk.CTkFrame(card, fg_color="transparent")
+        head.pack(fill="x", padx=20, pady=(16, 8))
+        ctk.CTkLabel(head, text="●", font=theme.font(11),
+                     text_color=theme.DANGER, width=14, anchor="w").pack(side="left")
+        theme.card_title(head, "上传失败文件（需处理）").pack(side="left")
+
+        tree_box = ctk.CTkFrame(card, fg_color="transparent")
+        tree_box.pack(fill="both", expand=True, padx=20, pady=(0, 16))
+
         failed_columns = ("ID", "文件名", "失败原因", "重试次数", "Agent接管", "重新上传", "忽略")
-        self.failed_tree = ttk.Treeview(failed_frame, columns=failed_columns, show="headings", height=6)
-        self.failed_tree.heading("ID", text="ID")
-        self.failed_tree.heading("文件名", text="文件名")
-        self.failed_tree.heading("失败原因", text="失败原因")
-        self.failed_tree.heading("重试次数", text="重试次数")
-        self.failed_tree.heading("Agent接管", text="Agent接管")
-        self.failed_tree.heading("重新上传", text="重新上传")
-        self.failed_tree.heading("忽略", text="忽略")
+        self.failed_tree = ttk.Treeview(tree_box, columns=failed_columns,
+                                        show="headings", height=5,
+                                        style="Card.Treeview")
+        for col in failed_columns:
+            self.failed_tree.heading(col, text=col)
+        self.failed_tree.column("ID", width=44, anchor="center", stretch=False)
+        self.failed_tree.column("文件名", width=150, anchor="w")
+        self.failed_tree.column("失败原因", width=190, anchor="w")
+        self.failed_tree.column("重试次数", width=64, anchor="center", stretch=False)
+        self.failed_tree.column("Agent接管", width=76, anchor="center", stretch=False)
+        self.failed_tree.column("重新上传", width=80, anchor="center", stretch=False)
+        self.failed_tree.column("忽略", width=60, anchor="center", stretch=False)
 
-        self.failed_tree.column("ID", width=40, anchor="center")
-        self.failed_tree.column("文件名", width=140, anchor="w")
-        self.failed_tree.column("失败原因", width=180, anchor="w")
-        self.failed_tree.column("重试次数", width=55, anchor="center")
-        self.failed_tree.column("Agent接管", width=70, anchor="center")
-        self.failed_tree.column("重新上传", width=100, anchor="center")
-        self.failed_tree.column("忽略", width=80, anchor="center")
-
-        # 配置操作列的可点击样式
-        self.failed_tree.tag_configure("action", foreground="#0066CC", font=("Arial", 9, "underline"))
-        self.failed_tree.tag_configure("action_disabled", foreground="#999999")
-        self.failed_tree.tag_configure("failed_row", background="#FFE6E6")
+        # 失败行浅红底色
+        self.failed_tree.tag_configure("failed_row", background=theme.DANGER_SOFT)
 
         # 绑定点击事件
         self.failed_tree.bind("<ButtonRelease-1>", self._on_failed_tree_click)
         self.failed_tree.bind("<Motion>", self._on_failed_tree_motion)
 
-        # 添加滚动条
-        failed_scrollbar = ttk.Scrollbar(failed_frame, orient="vertical", command=self.failed_tree.yview)
-        self.failed_tree.configure(yscrollcommand=failed_scrollbar.set)
-
+        sb = theme.attach_tree_scrollbar(tree_box, self.failed_tree)
         self.failed_tree.pack(side="left", fill="both", expand=True)
-        failed_scrollbar.pack(side="right", fill="y")
+        sb.pack(side="right", fill="y", padx=(6, 0))
 
         # 初始加载失败列表
         self._load_failed_records()
 
-        # ===== 右侧面板：浏览器状态 + 运行日志 =====
-        right_frame = ttk.Frame(main_pw)
-        main_pw.add(right_frame, weight=1)
+    def _build_log_card(self, parent):
+        """卡片: 运行日志"""
+        card = theme.card(parent)
+        card.grid(row=0, column=0, sticky="nsew")
 
-        # --- 浏览器状态 ---
-        status_frame = ttk.LabelFrame(right_frame, text="浏览器状态", padding=8)
-        status_frame.pack(fill="x", padx=5, pady=(5, 2))
+        theme.card_title(card, "运行日志").pack(fill="x", padx=20, pady=(16, 8))
 
-        self.status_label = ttk.Label(status_frame, text="🔴 未启动 (等待文件...)",
-                                      font=("Arial", 10), foreground="gray")
-        self.status_label.pack(fill="x")
+        log_box = ctk.CTkFrame(card, fg_color="transparent")
+        log_box.pack(fill="both", expand=True, padx=20, pady=(0, 16))
 
-        # --- 运行日志 ---
-        log_frame = ttk.LabelFrame(right_frame, text="运行日志", padding=8)
-        log_frame.pack(fill="both", expand=True, padx=5, pady=(2, 5))
+        self.log_text = tk.Text(
+            log_box, wrap="word", state="disabled", width=10,
+            font=(theme.FONT_FAMILY, 9), bg=theme.CARD, fg=theme.TEXT_MUTED,
+            relief="flat", bd=0, highlightthickness=0,
+            spacing1=3, spacing3=3, padx=4,
+            selectbackground=theme.PRIMARY_SOFT, selectforeground=theme.TEXT)
 
-        # 创建滚动文本框
-        self.log_text = scrolledtext.ScrolledText(log_frame, wrap="word", state="disabled")
-        self.log_text.pack(fill="both", expand=True)
+        sb = ctk.CTkScrollbar(log_box, command=self.log_text.yview,
+                              button_color=theme.TEXT_FAINT,
+                              button_hover_color=theme.TEXT_MUTED)
+        self.log_text.configure(yscrollcommand=sb.set)
+
+        self.log_text.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y", padx=(6, 0))
 
         # 配置日志文本样式
-        self.log_text.tag_configure("error", foreground="red")
-        self.log_text.tag_configure("success", foreground="green")
-        self.log_text.tag_configure("info", foreground="blue")
+        self.log_text.tag_configure("error", foreground=theme.DANGER)
+        self.log_text.tag_configure("success", foreground=theme.SUCCESS)
+        self.log_text.tag_configure("info", foreground=theme.TEXT_MUTED)
 
-    def _create_stats_tab(self):
-        """创建作业上传数据统计标签页"""
-        self.stats_panel = StatsPanel(self.tab_stats, self.db, self.root)
+    # ==================== 数据统计页 ====================
+
+    def _create_stats_page(self):
+        """创建作业上传数据统计页"""
+        self.stats_panel = StatsPanel(self.page_stats, self.db, self.root)
 
     def _start_stats_refresh(self):
-        """定时刷新统计面板（仅当统计标签页可见时）"""
+        """定时刷新统计面板（仅当统计页可见时）"""
         def _auto_refresh():
             try:
                 if hasattr(self, 'stats_panel') and self._is_stats_tab_selected():
@@ -320,37 +440,10 @@ class MainApplication:
         self.root.after(30000, _auto_refresh)
 
     def _is_stats_tab_selected(self) -> bool:
-        """判断当前是否选中了统计标签页"""
-        if hasattr(self, 'notebook'):
-            return self.notebook.index(self.notebook.select()) == 1
-        return False
+        """判断当前是否选中了统计页"""
+        return self._current_page == "stats"
 
-    def _on_canvas_configure(self, event):
-        """画布宽度变化时同步内容帧宽度，确保内容填满画布"""
-        self._canvas.itemconfig(self._canvas_window, width=event.width)
-
-    def _bind_mousewheel(self, event):
-        """鼠标进入画布时绑定滚轮"""
-        self._canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-
-    def _unbind_mousewheel(self, event):
-        """鼠标离开画布时解绑滚轮"""
-        self._canvas.unbind_all("<MouseWheel>")
-
-    def _on_mousewheel(self, event):
-        """鼠标滚轮滚动画布"""
-        self._canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-    
     # ==================== 合并文件相关方法 ====================
-
-    @staticmethod
-    def _register_drop_target(widget, callback):
-        """为控件注册拖拽放下目标，失败时静默忽略（DnD 库不可用时回退到点击上传）"""
-        try:
-            widget.drop_target_register('*')
-            widget.dnd_bind('<<Drop>>', callback)
-        except Exception:
-            pass
 
     def _browse_question_file(self):
         """浏览选择试题文件"""
@@ -408,38 +501,43 @@ class MainApplication:
             first = first[:-1]
         return first if first else None
 
-    def _set_question_file(self, path: str):
-        """设置试题文件路径并更新UI"""
+    def _validate_merge_file(self, path: str) -> bool:
+        """校验合并文件的存在性与格式"""
         if not os.path.isfile(path):
             messagebox.showwarning("警告", f"文件不存在: {path}")
-            return
+            return False
         ext = FileMerger.get_format(path)
         if ext not in FileMerger.SUPPORTED_EXTENSIONS:
             messagebox.showwarning("警告",
                 f"不支持的文件格式 ({ext})\n仅支持: {', '.join(FileMerger.SUPPORTED_EXTENSIONS)}")
+            return False
+        return True
+
+    @staticmethod
+    def _truncate_name(path: str, limit: int = 40) -> str:
+        """截断过长文件名用于展示"""
+        display = os.path.basename(path)
+        if len(display) > limit:
+            display = display[:limit - 3] + "..."
+        return display
+
+    def _set_question_file(self, path: str):
+        """设置试题文件路径并更新UI"""
+        if not self._validate_merge_file(path):
             return
         self.question_file_path = path
-        display = os.path.basename(path)
-        # 截断过长文件名
-        if len(display) > 50:
-            display = display[:47] + "..."
-        self._question_status_label.config(text=display, fg="black")
+        self._question_status_label.configure(
+            text=self._truncate_name(path), text_color=theme.TEXT)
+        self._question_zone.configure(border_color=theme.PRIMARY)
 
     def _set_answer_file(self, path: str):
         """设置答案文件路径并更新UI"""
-        if not os.path.isfile(path):
-            messagebox.showwarning("警告", f"文件不存在: {path}")
-            return
-        ext = FileMerger.get_format(path)
-        if ext not in FileMerger.SUPPORTED_EXTENSIONS:
-            messagebox.showwarning("警告",
-                f"不支持的文件格式 ({ext})\n仅支持: {', '.join(FileMerger.SUPPORTED_EXTENSIONS)}")
+        if not self._validate_merge_file(path):
             return
         self.answer_file_path = path
-        display = os.path.basename(path)
-        if len(display) > 50:
-            display = display[:47] + "..."
-        self._answer_status_label.config(text=display, fg="black")
+        self._answer_status_label.configure(
+            text=self._truncate_name(path), text_color=theme.TEXT)
+        self._answer_zone.configure(border_color=theme.PRIMARY)
 
     def _on_merge_click(self):
         """点击合并按钮 — 校验文件 → 弹窗选目录 → 执行合并"""
@@ -503,56 +601,76 @@ class MainApplication:
                 f"根目录下没有子文件夹，请先在「创建新文件夹」区域创建。\n{root_dir}")
             return None
 
-        dialog = tk.Toplevel(self.root)
+        dialog = ctk.CTkToplevel(self.root)
         dialog.title("选择保存目录")
-        dialog.geometry("420x380")
+        dialog.geometry("440x430")
+        dialog.configure(fg_color=theme.BG)
         dialog.transient(self.root)
-        dialog.grab_set()
         # 居中
         dialog.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() - 420) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - 380) // 2
+        x = self.root.winfo_x() + (self.root.winfo_width() - 440) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - 430) // 2
         dialog.geometry(f"+{x}+{y}")
+        try:
+            dialog.wait_visibility()
+            dialog.grab_set()
+        except Exception:
+            pass
 
         result = {"path": None}
+        selected = {"name": None}
 
-        ttk.Label(dialog, text="请选择保存的子目录:", font=("", 10)).pack(pady=(15, 5))
-        ttk.Label(dialog, text=root_dir, foreground="gray", font=("", 8)).pack()
+        ctk.CTkLabel(dialog, text="请选择保存的子目录", font=theme.font(14, "bold"),
+                     text_color=theme.TEXT).pack(pady=(20, 2))
+        ctk.CTkLabel(dialog, text=root_dir, font=theme.font(10),
+                     text_color=theme.TEXT_FAINT).pack()
 
-        # 列表
-        list_frame = ttk.Frame(dialog)
-        list_frame.pack(fill="both", expand=True, padx=15, pady=10)
+        # 目录列表(圆角滚动区 + 可选中条目)
+        list_frame = ctk.CTkScrollableFrame(
+            dialog, fg_color=theme.CARD, corner_radius=12,
+            border_width=1, border_color=theme.BORDER,
+            scrollbar_button_color=theme.TEXT_FAINT,
+            scrollbar_button_hover_color=theme.TEXT_MUTED)
+        list_frame.pack(fill="both", expand=True, padx=20, pady=14)
 
-        listbox = tk.Listbox(list_frame, font=("", 10))
-        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
-        listbox.configure(yscrollcommand=scrollbar.set)
+        item_buttons = {}
 
-        for d in subdirs:
-            listbox.insert("end", d)
-
-        listbox.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        # 按钮区
-        btn_frame = ttk.Frame(dialog)
-        btn_frame.pack(fill="x", padx=15, pady=(0, 15))
+        def on_select(name):
+            selected["name"] = name
+            for n, b in item_buttons.items():
+                if n == name:
+                    b.configure(fg_color=theme.PRIMARY_SOFT,
+                                text_color=theme.PRIMARY)
+                else:
+                    b.configure(fg_color="transparent",
+                                text_color=theme.TEXT)
 
         def on_confirm():
-            sel = listbox.curselection()
-            if not sel:
+            if not selected["name"]:
                 messagebox.showwarning("提示", "请选择一个子目录", parent=dialog)
                 return
-            result["path"] = os.path.join(root_dir, subdirs[sel[0]])
+            result["path"] = os.path.join(root_dir, selected["name"])
             dialog.destroy()
 
-        def on_cancel():
-            dialog.destroy()
+        for d in subdirs:
+            btn = ctk.CTkButton(
+                list_frame, text=d, font=theme.font(12), anchor="w",
+                height=36, corner_radius=8, fg_color="transparent",
+                hover_color=theme.PRIMARY_SOFT, text_color=theme.TEXT,
+                command=lambda n=d: on_select(n))
+            btn.pack(fill="x", pady=1)
+            # 双击直接确定
+            btn.bind("<Double-Button-1>", lambda e, n=d: (on_select(n), on_confirm()))
+            item_buttons[d] = btn
 
-        ttk.Button(btn_frame, text="确定", command=on_confirm).pack(side="right", padx=5)
-        ttk.Button(btn_frame, text="取消", command=on_cancel).pack(side="right", padx=5)
+        # 按钮区
+        btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=20, pady=(0, 20))
 
-        # 双击确定
-        listbox.bind("<Double-Button-1>", lambda e: on_confirm())
+        theme.primary_button(btn_frame, "确定", on_confirm,
+                             width=96).pack(side="right")
+        theme.ghost_button(btn_frame, "取消", dialog.destroy,
+                           width=96).pack(side="right", padx=(0, 10))
 
         dialog.wait_window()
         return result["path"]
@@ -586,6 +704,8 @@ class MainApplication:
             self.root.after(0, lambda: messagebox.showerror(
                 "合并失败", f"{err_msg}"))
 
+    # ==================== 文件夹管理 ====================
+
     def _create_folder(self):
         """
         创建新文件夹
@@ -593,35 +713,35 @@ class MainApplication:
         """
         school = self.school_entry.get().strip()
         grade = self.grade_combo.get()
-        
+
         if not school:
             messagebox.showwarning("警告", "请输入学校名称!")
             return
-        
+
         # 拼接文件夹名称
         folder_name = f"{school}{grade}"
         root_dir = self.config.root_dir
         folder_path = os.path.join(root_dir, folder_name)
-        
+
         # 检查是否已存在
         if os.path.exists(folder_path):
             messagebox.showwarning("警告", f"文件夹已存在: {folder_name}")
             return
-        
+
         try:
             # 创建文件夹
             os.makedirs(folder_path, exist_ok=True)
             messagebox.showinfo("成功", f"文件夹创建成功: {folder_name}")
-            
+
             # 清空输入框
             self.school_entry.delete(0, tk.END)
-            
+
             # 刷新列表
             self._refresh_folder_list()
-        
+
         except Exception as e:
             messagebox.showerror("错误", f"创建文件夹失败: {e}")
-    
+
     def _refresh_folder_list(self):
         """
         刷新文件夹列表
@@ -641,20 +761,20 @@ class MainApplication:
         for folder_name in sorted(os.listdir(root_dir)):
             folder_path = os.path.join(root_dir, folder_name)
             if os.path.isdir(folder_path):
-                # 插入到Treeview，操作列显示可点击链接文本
+                # 插入到Treeview，操作列显示可点击文本
                 iid = self.folder_tree.insert(
                     "", "end",
-                    values=(index, folder_name, "🧹 清空", "🗑️ 删除"),
+                    values=(index, folder_name, "清空", "删除"),
                     tags=("action_row",)
                 )
                 # 存储映射：iid -> (folder_path, folder_name)
                 self._folder_data[iid] = (folder_path, folder_name)
                 index += 1
-    
+
     def _clear_folder(self, folder_path: str, folder_name: str):
         """
         清空文件夹内的所有文件,并删除数据库记录
-        
+
         Args:
             folder_path: 文件夹完整路径
             folder_name: 文件夹名称
@@ -662,29 +782,29 @@ class MainApplication:
         # 确认对话框
         if not messagebox.askyesno("确认", f"确定要清空文件夹 '{folder_name}' 内的所有文件吗?\n此操作不可恢复!"):
             return
-        
+
         try:
             # 删除文件夹内所有文件
             for filename in os.listdir(folder_path):
                 file_path = os.path.join(folder_path, filename)
                 if os.path.isfile(file_path):
                     os.remove(file_path)
-            
+
             # 删除数据库记录
             self.db.delete_records_by_folder(folder_name)
-            
+
             messagebox.showinfo("成功", f"文件夹 '{folder_name}' 已清空")
-            
+
             # 刷新失败列表
             self._load_failed_records()
-        
+
         except Exception as e:
             messagebox.showerror("错误", f"清空文件夹失败: {e}")
-    
+
     def _delete_folder(self, folder_path: str, folder_name: str):
         """
         删除整个文件夹(含所有文件),并删除数据库记录
-        
+
         Args:
             folder_path: 文件夹完整路径
             folder_name: 文件夹名称
@@ -692,23 +812,23 @@ class MainApplication:
         # 确认对话框
         if not messagebox.askyesno("确认", f"确定要删除整个文件夹 '{folder_name}' 吗?\n此操作不可恢复!"):
             return
-        
+
         try:
             # 删除整个文件夹
             shutil.rmtree(folder_path)
-            
+
             # 删除数据库记录
             self.db.delete_records_by_folder(folder_name)
-            
+
             messagebox.showinfo("成功", f"文件夹 '{folder_name}' 已删除")
-            
+
             # 刷新列表
             self._refresh_folder_list()
             self._load_failed_records()
-        
+
         except Exception as e:
             messagebox.showerror("错误", f"删除文件夹失败: {e}")
-    
+
     def _on_folder_tree_click(self, event):
         """
         处理文件夹列表的点击事件
@@ -737,6 +857,8 @@ class MainApplication:
         else:
             self.folder_tree.configure(cursor="")
 
+    # ==================== 失败文件管理 ====================
+
     def _load_failed_records(self):
         """
         加载并显示失败的上传记录
@@ -764,19 +886,17 @@ class MainApplication:
             # Agent 接管结果展示
             agent_result = record.get('agent_retry_success')
             if agent_result == '是':
-                agent_display = '✅ 是'
+                agent_display = '成功'
             elif agent_result == '否':
-                agent_display = '❌ 否'
+                agent_display = '失败'
             else:
                 agent_display = '—'
 
             # 根据重试次数决定"重新上传"按钮状态
             if retry_count >= max_retry:
                 retry_text = "已达上限"
-                retry_tag = "action_disabled"
             else:
-                retry_text = "🔄 重传"
-                retry_tag = "action"
+                retry_text = "重传"
 
             iid = self.failed_tree.insert("", "end", values=(
                 rid,
@@ -785,16 +905,16 @@ class MainApplication:
                 retry_count,
                 agent_display,
                 retry_text,
-                "🗑️ 忽略"
+                "忽略"
             ), tags=("failed_row",))
 
             # 存储映射：iid -> (record_id, file_path, retry_count)
             self._failed_data[iid] = (rid, file_path, retry_count)
-    
+
     def _retry_upload(self, record_id: int, file_path: str):
         """
         重新上传失败的文件
-        
+
         Args:
             record_id: 数据库记录ID
             file_path: 文件路径
@@ -803,31 +923,31 @@ class MainApplication:
         if not os.path.exists(file_path):
             messagebox.showerror("错误", f"文件不存在: {file_path}")
             return
-        
+
         # 在新线程中执行重新上传,避免阻塞GUI
         thread = Thread(target=self.upload_processor.retry_upload, args=(record_id, file_path))
         thread.daemon = True
         thread.start()
-        
+
         messagebox.showinfo("提示", "重新上传任务已提交")
-    
+
     def _ignore_record(self, record_id: int):
         """
         忽略某条失败记录(从数据库中删除)
-        
+
         Args:
             record_id: 记录ID
         """
         if not messagebox.askyesno("确认", "确定要忽略这条记录吗?"):
             return
-        
+
         try:
             self.db.delete_record(record_id)
             self._load_failed_records()
             messagebox.showinfo("成功", "记录已忽略")
         except Exception as e:
             messagebox.showerror("错误", f"删除记录失败: {e}")
-    
+
     def _on_failed_tree_click(self, event):
         """
         处理失败文件列表的点击事件
@@ -870,6 +990,8 @@ class MainApplication:
         else:
             self.failed_tree.configure(cursor="")
 
+    # ==================== 日志与状态 ====================
+
     def _update_logs(self):
         """
         从日志队列中读取消息并显示在界面上
@@ -879,7 +1001,7 @@ class MainApplication:
             while True:
                 # 非阻塞方式读取日志队列
                 message = self.log_queue.get_nowait()
-                
+
                 # 如果是特殊指令,执行相应操作
                 if message == "REFRESH_FAILED_LIST":
                     self._load_failed_records()
@@ -888,37 +1010,35 @@ class MainApplication:
                 if message.startswith("BROWSER_STATUS:"):
                     status = message.split(":", 1)[1]
                     if status == "CONNECTED":
-                        self.status_label.config(
-                            text="🟢 已连接", foreground="green")
+                        self._set_browser_status("connected")
                     elif status == "DISCONNECTED":
-                        self.status_label.config(
-                            text="🔴 未启动 (等待文件...)", foreground="gray")
+                        self._set_browser_status("disconnected")
                     continue
-                
+
                 # 显示日志消息
                 self.log_text.configure(state="normal")
-                
+
                 # 根据消息类型设置颜色
                 tag = "info"
                 if "错误" in message or "失败" in message or "✗" in message:
                     tag = "error"
                 elif "成功" in message or "✓" in message:
                     tag = "success"
-                
+
                 self.log_text.insert("end", f"{message}\n", tag)
                 self.log_text.see("end")  # 滚动到底部
                 self.log_text.configure(state="disabled")
-        
+
         except Empty:
             # 队列为空,正常情况
             pass
-        
+
         except Exception as e:
             print(f"更新日志失败: {e}")
-        
+
         # 每100ms检查一次日志队列
         self.root.after(100, self._update_logs)
-    
+
     def _refresh_failed_list(self):
         """
         定时刷新失败列表
@@ -927,7 +1047,7 @@ class MainApplication:
         self._load_failed_records()
         # 每5秒刷新一次
         self.root.after(5000, self._refresh_failed_list)
-    
+
     def update_browser_status(self, status: str):
         """
         更新浏览器状态显示
@@ -936,12 +1056,14 @@ class MainApplication:
             status: 状态字符串,如"已连接"、"未连接"、"重启中"
         """
         if status == "已连接":
-            self.status_label.config(text="🟢 已连接", foreground="green")
+            self._set_browser_status("connected")
         elif status == "未连接":
-            self.status_label.config(text="🔴 未连接", foreground="red")
+            self._set_browser_status("error")
         elif status == "重启中":
-            self.status_label.config(text="🟡 重启中...", foreground="orange")
-    
+            self._set_browser_status("restarting")
+
+    # ==================== 系统托盘与退出 ====================
+
     def _setup_tray(self):
         """
         初始化系统托盘图标（延迟加载，仅在首次最小化时创建）
@@ -955,9 +1077,9 @@ class MainApplication:
             import pystray
             from PIL import Image, ImageDraw
 
-            # 生成托盘图标（蓝底白色上传箭头）
+            # 生成托盘图标（主题蓝底白色上传箭头）
             def _make_icon():
-                img = Image.new('RGB', (64, 64), color='#4A90D9')
+                img = Image.new('RGB', (64, 64), color=theme.PRIMARY)
                 draw = ImageDraw.Draw(img)
                 draw.rectangle([8, 14, 56, 50], fill='white')
                 draw.polygon([(32, 6), (8, 22), (56, 22)], fill='white')

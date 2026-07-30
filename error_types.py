@@ -39,6 +39,7 @@ class ErrorType(str, Enum):
     SCHOOL_SWITCH_FAIL = "school_switch_fail"
     SCHOOL_NOT_FOUND = "school_not_found"
     UPLOAD_SUBMIT_TIMEOUT = "upload_submit_timeout"
+    PIPELINE_STUCK = "pipeline_stuck"          # 流水线卡死（看门狗强制打断）
 
     # 文件处理类
     FILE_UNREADABLE = "file_unreadable"
@@ -125,6 +126,9 @@ STRATEGY_MAP: Dict[Tuple[UploadStage, ErrorType], Tuple[RetryLevel, int]] = {
     # 全局网络错误（任意阶段）
     (None, ErrorType.NETWORK_ERROR): (RetryLevel.L1_LIGHT_RETRY, 3),
 
+    # 流水线卡死（任意阶段）——看门狗已强制关闭浏览器，必须完整恢复
+    (None, ErrorType.PIPELINE_STUCK): (RetryLevel.L4_SERVICE_RESTART, 2),
+
     # 未知错误兜底（任意阶段/任意错误类型 → 人工处理）
     (None, ErrorType.UNKNOWN): (RetryLevel.L5_MANUAL, 0),
 }
@@ -136,6 +140,9 @@ STRATEGY_MAP: Dict[Tuple[UploadStage, ErrorType], Tuple[RetryLevel, int]] = {
 
 ERROR_CLASSIFICATION_RULES: List[tuple] = [
     # (关键词列表, ErrorCategory, ErrorType)
+    # 看门狗强制打断（必须排在"上传/超时"等泛化规则之前）
+    (["[WATCHDOG]", "流水线卡死"],
+     ErrorCategory.BROWSER_ERROR, ErrorType.PIPELINE_STUCK),
     # 浏览器相关
     (["浏览器启动失败", "browser_start", "chrome", "webdriver", "driver",
       "无法启动浏览器", "浏览器崩溃", "browser crash"],
@@ -252,6 +259,7 @@ ERROR_DESCRIPTIONS: Dict[str, Tuple[str, str]] = {
     'school_switch_fail': ('学校切换失败', '页面DOM结构变化或学校列表接口异常'),
     'school_not_found': ('学校不存在', '目标学校未在平台注册或名称不匹配'),
     'upload_submit_timeout': ('上传提交超时', '文件过大、平台限流或表单校验未通过'),
+    'pipeline_stuck': ('流水线卡死', '浏览器/页面长时间无响应，看门狗强制关闭浏览器打断，需完整恢复环境'),
     'file_not_exist': ('文件不存在', '文件已被删除、移动或路径变更'),
     'file_unreadable': ('文件无法读取', '文件损坏、加密或格式不兼容'),
     'file_corrupted': ('文件已损坏', '文件内容损坏无法解析，需重新获取源文件'),
@@ -278,6 +286,7 @@ ERROR_SUGGESTIONS: Dict[str, List[str]] = {
     'school_switch_fail': ['检查学校列表接口是否有变更', '添加学校搜索的模糊匹配'],
     'school_not_found': ['提供学校名称标准化映射表', '增加学校名称容错（去除空格/标点）'],
     'upload_submit_timeout': ['优化大文件分片上传', '增加提交结果轮询间隔'],
+    'pipeline_stuck': ['检查网络质量与平台服务器响应', '排查页面是否有未适配的弹窗/遮罩', '必要时调整WATCHDOG_STAGE_TIMEOUTS阈值'],
     'file_not_exist': ['检查文件路径是否变更', '确认源文件未被移动或重命名', '在文件监控阶段记录原始路径'],
     'file_unreadable': ['添加文件完整性预检', '扩展更多文件格式支持'],
     'file_corrupted': ['在文件监控阶段校验文件完整性', '要求重新提供原始文件'],

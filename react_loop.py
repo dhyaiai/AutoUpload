@@ -1,129 +1,168 @@
 """
-通用 ReAct (Reasoning + Acting) 循环引擎
-提供 LLM 驱动的 Thought → Action → Observation 自主决策循环
+通用 Agent 循环引擎 (Function Calling 版)
+基于 OpenAI 兼容的原生 tools 协议 (DeepSeek 支持) 驱动 LLM 自主决策循环
 不依赖任何项目模块，纯通用 AI Agent 执行引擎
+
+相比旧版文本 ReAct (正则解析 Thought/Action/Final):
+  - 工具调用由 API 返回结构化 tool_calls 字段，无需正则解析
+  - 工具参数为 JSON Schema 约束的结构化数据，支持类型
+  - 格式合法性由模型服务端保证，删除了全部降级正则/格式训话/逃生舱口
 """
+import inspect
 import json
 import re
 import traceback
 from typing import Any, Callable, Dict, List, Optional
 
 
+def tool(name: Optional[str] = None,
+         description: str = "",
+         params: Optional[Dict[str, str]] = None) -> Callable:
+    """
+    工具装饰器：将普通函数标记为 Agent 工具，并附加 Schema 元数据。
+    Schema 的参数名/必填性/类型仍由 inspect.signature 从函数签名自动生成，
+    装饰器只补充无法从签名推断的信息（工具名、功能描述、参数描述）。
+
+    Args:
+        name: 工具名（缺省用函数名，并自动剥离 'tool_' 前缀）
+        description: 工具功能描述（缺省取函数 docstring）
+        params: 参数名 → 参数描述 的映射（写入 Schema 参数的 description）
+
+    用法:
+        @tool(description="查询城市天气", params={"city": "城市名"})
+        def get_weather(city=""):
+            ...
+    """
+    def decorator(fn: Callable) -> Callable:
+        tool_name = name or fn.__name__
+        if tool_name.startswith("tool_"):
+            tool_name = tool_name[len("tool_"):]
+        fn.__tool__ = {
+            "name": tool_name,
+            "description": description or inspect.getdoc(fn) or "",
+            "params": params or {},
+        }
+        return fn
+    return decorator
+
+
+def _tool_meta(fn: Callable) -> Dict:
+    """读取工具元数据；未装饰的函数回退到函数名 + docstring"""
+    meta = getattr(fn, "__tool__", None)
+    if meta is not None:
+        return meta
+    return {
+        "name": getattr(fn, "__name__", str(fn)),
+        "description": inspect.getdoc(fn) or "",
+        "params": {},
+    }
+
+
 class ReActLoop:
     """
-    ReAct 循环引擎
+    Function Calling 循环引擎（保留 ReActLoop 类名，兼容既有调用方）
 
     工作流程：
-    1. LLM 收到任务 + 可用工具列表
-    2. LLM 输出 Thought（推理）+ Action（工具调用）
-    3. 引擎解析 Action → 执行工具 → 返回 Observation（观察结果）
-    4. 重复 2-3 直到 LLM 输出 Final（最终结果）
+    1. 将 @tool 装饰的工具函数签名转换为 JSON Schema，随请求发送给 LLM
+    2. LLM 返回结构化 tool_calls → 引擎执行工具 → 以 tool 消息回传结果
+    3. 重复 2 直到 LLM 不再调用工具，其最终文本回复解析为 JSON 结果
     """
-
-    # LLM 输出格式的正则
-    # ── Action 匹配 ──
-    # 主模式：Action: tool_name(key=value, ...)  —— 末尾不锚定 $，允许行尾有注释
-    ACTION_RE = re.compile(
-        r'(?:^|\n)\s*Action\s*[:：]\s*'             # Action: 或 Action：（中英文冒号）
-        r'([a-zA-Z_][a-zA-Z0-9_]*)'                  # 工具名
-        r'\s*\(\s*(.*?)\s*\)'                         # 参数（允许括号内空白）
-        r'(?:\s*(?:#.*)?)$',                          # 行尾（可选注释）
-        re.MULTILINE
-    )
-    # 降级模式1：无括号调用（无参工具省略了括号）
-    ACTION_NOARGS_RE = re.compile(
-        r'(?:^|\n)\s*Action\s*[:：]\s*'
-        r'([a-zA-Z_][a-zA-Z0-9_]*)'
-        r'(?:\s*\(\))?'                                # 可选空括号
-        r'\s*$',
-        re.MULTILINE
-    )
-    # 降级模式2：代码块包裹的 Action（LLM 习惯用 ``` 包裹）
-    ACTION_FENCED_RE = re.compile(
-        r'```(?:json|text|plain)?\s*\n?'
-        r'\s*Action\s*[:：]\s*'
-        r'([a-zA-Z_][a-zA-Z0-9_]*)'
-        r'\s*\(\s*(.*?)\s*\)'
-        r'\s*\n?```',
-        re.MULTILINE | re.DOTALL
-    )
-    # ── Final 匹配 ──
-    # 主模式：不要求 Final 在字符串绝对末尾，允许后面有空白或代码块结束符
-    FINAL_RE = re.compile(
-        r'(?:^|\n)\s*Final\s*[:：]\s*'
-        r'(\{.+?\}|\[.+?\]|.+?)'                       # JSON 对象/数组 或 自由文本
-        r'\s*$',
-        re.MULTILINE | re.DOTALL
-    )
-    # 降级：代码块包裹的 Final
-    FINAL_FENCED_RE = re.compile(
-        r'```(?:json)?\s*\n?'
-        r'(?:Final\s*[:：]\s*)?'                       # 代码块内可选的 Final: 前缀
-        r'(\{[\s\S]+?\}|\[[\s\S]+?\])'                 # JSON
-        r'\s*\n?```',
-        re.MULTILINE
-    )
-    THOUGHT_RE = re.compile(r'Thought\s*[:：]\s*(.+?)(?:\n\n|\n(?=Action|\n*Final)|\Z)', re.MULTILINE | re.DOTALL)
 
     def __init__(self,
                  llm,
                  system_prompt: str,
-                 tools: Dict[str, Callable],
-                 tool_descriptions: Dict[str, str],
+                 tools: List[Callable],
                  max_steps: int = 10,
                  log_fn: Optional[Callable] = None):
         """
         Args:
-            llm: LLM 客户端，必须有 chat_messages(messages, temperature) 方法
-            system_prompt: 系统提示词（应包含工具使用说明）
-            tools: 工具名 → 可调用函数的映射
-            tool_descriptions: 工具名 → 功能描述的映射（嵌入 system_prompt）
+            llm: LLM 客户端，必须有 chat_messages_raw(messages, tools) 方法
+            system_prompt: 系统提示词（任务角色与决策规则说明）
+            tools: @tool 装饰的工具函数列表（名称/描述/参数描述取自装饰器元数据）
             max_steps: 最大循环步数
             log_fn: 可选的日志回调，用于输出推理过程
         """
         self.llm = llm
-        self.tools = tools
-        self.tool_descriptions = tool_descriptions
+        # 工具名 → 可调用函数（名称来自 @tool 元数据，未装饰的回退函数名）
+        self.tools: Dict[str, Callable] = {
+            _tool_meta(fn)["name"]: fn for fn in tools
+        }
         self.max_steps = max_steps
         self.log = log_fn or (lambda _: None)
 
-        # 构建完整的系统提示词
+        # 从函数签名自动生成 OpenAI 兼容的工具 Schema
+        self.tool_schemas = self._build_tool_schemas()
         self.system_prompt = self._build_system_prompt(system_prompt)
 
+    # ─── Schema 构建 ───
+
+    def _build_tool_schemas(self) -> List[Dict]:
+        """
+        为每个工具生成 OpenAI 兼容的 JSON Schema：
+        - 参数名/必填性来自函数签名（inspect）
+        - 参数类型根据默认值推断（bool/int/float/其他→string）
+        - 工具描述/参数描述来自 @tool 装饰器元数据
+        """
+        schemas = []
+        for name, fn in self.tools.items():
+            meta = _tool_meta(fn)
+            param_descs: Dict[str, str] = meta.get("params", {})
+            properties: Dict[str, Dict] = {}
+            required: List[str] = []
+            try:
+                sig = inspect.signature(fn)
+                for pname, param in sig.parameters.items():
+                    if param.kind in (inspect.Parameter.VAR_POSITIONAL,
+                                      inspect.Parameter.VAR_KEYWORD):
+                        continue
+                    default = param.default
+                    if default is inspect.Parameter.empty:
+                        ptype = "string"
+                        required.append(pname)
+                    elif isinstance(default, bool):
+                        ptype = "boolean"
+                    elif isinstance(default, int):
+                        ptype = "integer"
+                    elif isinstance(default, float):
+                        ptype = "number"
+                    else:
+                        ptype = "string"
+                    prop: Dict[str, Any] = {"type": ptype}
+                    if param_descs.get(pname):
+                        prop["description"] = param_descs[pname]
+                    properties[pname] = prop
+            except (TypeError, ValueError):
+                pass  # 无法内省签名的可调用对象 → 空参数 Schema
+
+            schemas.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": meta.get("description", ""),
+                    "parameters": {
+                        "type": "object",
+                        "properties": properties,
+                        "required": required,
+                    },
+                },
+            })
+        return schemas
+
     def _build_system_prompt(self, base_prompt: str) -> str:
-        """将工具列表嵌入系统提示词"""
-        tool_list = "\n".join(
-            f"- {name}: {desc}"
-            for name, desc in self.tool_descriptions.items()
-        )
+        """追加工具调用与结束方式说明（工具清单由 Schema 携带，无需重复罗列）"""
         return f"""{base_prompt}
 
-## 可用工具
+## 工具调用与结束方式
 
-你可以调用以下工具来完成任务：
-{tool_list}
+- 通过原生函数调用(tool calls)使用工具，参数按工具 Schema 提供
+- 如果工具返回 Error，分析原因并尝试其他方案
+- 当任务完成、无需再调用工具时，直接回复最终结果：内容必须是一个合法的 JSON 对象，不要附加任何其他文字"""
 
-## 输出格式
-
-每轮你必须按以下格式输出：
-
-Thought: [你对当前状态的分析推理]
-Action: tool_name(param1=value1, param2=value2)
-
-当你认为任务已完成时，输出：
-
-Thought: [总结性推理]
-Final: [JSON格式的最终结果]
-
-注意：
-- 思考和行动放在同一轮输出中
-- Action 的参数用 key=value 格式，字符串值不需要引号
-- Final 必须是合法的 JSON 对象
-- 如果工具返回 Error，分析原因并尝试其他方案"""
+    # ─── 主循环 ───
 
     def run(self, task: str, context: Optional[Dict] = None) -> Dict:
         """
-        执行 ReAct 循环
+        执行 Function Calling 循环
 
         Args:
             task: 任务描述文本
@@ -132,286 +171,188 @@ Final: [JSON格式的最终结果]
         Returns:
             {
                 "success": bool,
-                "result": Any,       # Final 中解析的 JSON 结果
+                "result": Any,       # 最终回复解析出的 JSON 结果
                 "steps": int,        # 实际执行的步数
-                "reasoning": str,    # 最后一步的 Thought
-                "history": List[Dict]  # 完整对话历史
+                "reasoning": str,    # 最后一次的助手文本内容
+                "history": List[Dict]  # 完整对话历史（含 tool 消息）
             }
         """
-        messages = [{"role": "system", "content": self.system_prompt}]
+        messages: List[Dict] = [{"role": "system", "content": self.system_prompt}]
 
-        # 构建任务消息
         task_content = task
         if context:
             task_content += f"\n\n## 上下文信息\n```json\n{json.dumps(context, ensure_ascii=False, indent=2, default=str)}\n```"
-
         messages.append({"role": "user", "content": task_content})
 
         last_thought = ""
 
         for step in range(1, self.max_steps + 1):
-            self.log(f"[ReAct Step {step}/{self.max_steps}]")
+            self.log(f"[Agent Step {step}/{self.max_steps}]")
 
-            # 调用 LLM
-            response = self.llm.chat_messages(messages)
-            if not response:
-                self.log("[ReAct] LLM 调用失败，终止循环")
+            msg = self.llm.chat_messages_raw(messages, tools=self.tool_schemas)
+            if msg is None:
+                self.log("[Agent] LLM 调用失败，终止循环")
                 return {
                     "success": False,
                     "result": None,
                     "steps": step,
                     "reasoning": last_thought,
                     "error": "LLM 调用失败",
-                    "history": messages
+                    "history": messages,
                 }
 
-            messages.append({"role": "assistant", "content": response})
+            content = (msg.get("content") or "").strip()
+            tool_calls = msg.get("tool_calls") or []
 
-            # 提取 Thought
-            thought_match = self.THOUGHT_RE.search(response)
-            if thought_match:
-                last_thought = thought_match.group(1).strip()
-                self.log(f"  Thought: {last_thought[:100]}...")
+            # 助手消息原样入历史（含 tool_calls，API 要求成对出现）
+            assistant_msg: Dict[str, Any] = {"role": "assistant",
+                                             "content": msg.get("content") or ""}
+            if tool_calls:
+                assistant_msg["tool_calls"] = tool_calls
+            messages.append(assistant_msg)
 
-            # ── 检测 Final（含降级模式）──
-            final_match = self.FINAL_RE.search(response)
-            if not final_match:
-                final_match = self.FINAL_FENCED_RE.search(response)  # 代码块降级
-            if final_match:
-                final_text = final_match.group(1).strip()
-                self.log(f"  Final: {final_text[:200]}")
+            if content:
+                last_thought = content
+                self.log(f"  Thought: {content[:100]}")
 
-                # 尝试解析 JSON
-                try:
-                    result = json.loads(final_text)
-                except json.JSONDecodeError:
-                    # 尝试从代码块提取
-                    code_match = re.search(r'```(?:json)?\s*\n?([\s\S]*?)\n?```', final_text)
-                    if code_match:
-                        try:
-                            result = json.loads(code_match.group(1).strip())
-                        except json.JSONDecodeError:
-                            result = {"raw": final_text}
-                    else:
-                        result = {"raw": final_text}
-
+            # ── 无工具调用 → 最终结果 ──
+            if not tool_calls:
+                if not content:
+                    self.log("[Agent] LLM 返回空回复且无工具调用，终止")
+                    return {
+                        "success": False,
+                        "result": None,
+                        "steps": step,
+                        "reasoning": last_thought,
+                        "error": "LLM 返回空回复",
+                        "history": messages,
+                    }
+                result = self._parse_final(content)
+                self.log(f"  Final: {json.dumps(result, ensure_ascii=False, default=str)[:200]}")
                 return {
                     "success": True,
                     "result": result,
                     "steps": step,
                     "reasoning": last_thought,
-                    "history": messages
+                    "history": messages,
                 }
 
-            # ── 检测 Action（含降级模式）──
-            action_match = self.ACTION_RE.search(response)
-            if not action_match:
-                action_match = self.ACTION_FENCED_RE.search(response)  # 代码块降级
-            if not action_match:
-                # 无参降级：匹配 "Action: tool_name" 无括号形式
-                action_match = self.ACTION_NOARGS_RE.search(response)
-                # 过滤：排除 "Action: skip" / "Action: manual" 这类非工具调用词
-                if action_match and action_match.group(1) in self.tools:
-                    pass  # 有效无参调用
-                elif action_match:
-                    action_match = None  # 不匹配任何已知工具，继续找
+            # ── 执行工具调用（同一轮可能有多个）──
+            for tc in tool_calls:
+                fn_info = tc.get("function", {})
+                tool_name = fn_info.get("name", "")
+                kwargs = self._parse_tool_args(fn_info.get("arguments"))
 
-            if not action_match:
-                # LLM 没有输出可解析的 Action 或 Final，给予反馈
-                # 记录原始响应（截断）便于调试
-                self.log(f"  [ReAct] 未检测到 Action/Final，LLM原始响应(前200字): {response[:200]}")
-                self.log("  [ReAct] 未检测到 Action 或 Final，提示 LLM")
+                self.log(f"  Action: {tool_name}({json.dumps(kwargs, ensure_ascii=False, default=str)[:100]})")
 
-                # 动态反馈：第一第二次宽容提醒，第三次起给出强制格式示例
-                consecutive_failures = getattr(self, '_format_fail_count', 0) + 1
-                self._format_fail_count = consecutive_failures
-
-                # ── 逃生舱口：连续3次格式失败后，尝试直接从原始响应中提取 Final JSON ──
-                # 某些模型（如 Qwen）不遵循 ReAct 格式，但会在文本中输出 JSON 决策
-                if consecutive_failures >= 3:
-                    extracted = self._try_extract_final_from_text(response)
-                    if extracted:
-                        self.log(f"  [ReAct] 逃生舱口: 从原始响应中提取到 Final JSON (连续{consecutive_failures}次格式失败)")
-                        self._format_fail_count = 0
-                        try:
-                            result = json.loads(extracted) if isinstance(extracted, str) else extracted
-                        except json.JSONDecodeError:
-                            result = {"raw": str(extracted)}
-                        return {
-                            "success": True,
-                            "result": result,
-                            "steps": step,
-                            "reasoning": last_thought,
-                            "history": messages
-                        }
-
-                if consecutive_failures <= 2:
-                    hint = (
-                        "你的上一条回复没有包含 Action 或 Final 指令。\n\n"
-                        "请严格按以下格式回复（任选一种）：\n\n"
-                        "格式1 - 调用工具:\n"
-                        "Thought: 你的分析推理\n"
-                        "Action: tool_name(key1=value1)\n\n"
-                        "格式2 - 完成:\n"
-                        "Thought: 你的总结\n"
-                        "Final: {\"action\": \"enqueue\", \"retry_level\": \"L2\", \"reason\": \"...\"}\n\n"
-                        "注意：Action 必须在单独一行以 \"Action: \" 开头，"
-                        "Final 必须在单独一行以 \"Final: \" 开头。"
-                    )
+                if tool_name not in self.tools:
+                    observation = (f"Error: 工具 '{tool_name}' 不存在。"
+                                   f"可用工具: {', '.join(self.tools.keys())}")
                 else:
-                    # 第三次及以后：给出具体强制示例
-                    hint = (
-                        f"你已经连续 {consecutive_failures} 次没有输出正确的格式。\n\n"
-                        "现在你必须严格、一字不差地按以下格式回复。请选择一个行动：\n\n"
-                        "如果要调用工具，请输出：\n"
-                        "Thought: [一句话分析]\n"
-                        "Action: capture_page_error()\n\n"
-                        "如果要完成任务，请输出：\n"
-                        "Thought: 任务完成\n"
-                        "Final: {\"action\": \"enqueue\", \"retry_level\": \"L1\", \"reason\": \"页面干净可重试\"}\n\n"
-                        "现在就输出，不要输出其他额外内容，不要用中文冒号。"
-                    )
+                    try:
+                        result = self.tools[tool_name](**kwargs)
+                        observation = json.dumps(result, ensure_ascii=False, default=str)
+                    except TypeError as e:
+                        observation = f"Error: 参数错误 - {e}"
+                    except Exception as e:
+                        observation = f"Error: 工具执行异常 - {e}"
+                        traceback.print_exc()
 
-                messages.append({"role": "user", "content": hint})
-                continue
-            else:
-                # 格式匹配成功，重置失败计数
-                self._format_fail_count = 0
+                self.log(f"  Observation: {observation[:200]}")
 
-            tool_name = action_match.group(1)
-            args_str = action_match.group(2).strip()
-
-            self.log(f"  Action: {tool_name}({args_str[:100]})")
-
-            # 验证工具存在
-            if tool_name not in self.tools:
-                observation = f"Error: 工具 '{tool_name}' 不存在。可用工具: {', '.join(self.tools.keys())}"
-                self.log(f"  Observation: {observation}")
-                messages.append({"role": "user", "content": f"Observation: {observation}"})
-                continue
-
-            # 解析参数
-            kwargs = self._parse_args(args_str)
-
-            # 执行工具
-            try:
-                result = self.tools[tool_name](**kwargs)
-                observation = json.dumps(result, ensure_ascii=False, default=str)
-            except TypeError as e:
-                observation = f"Error: 参数错误 - {e}"
-            except Exception as e:
-                observation = f"Error: 工具执行异常 - {e}"
-                traceback.print_exc()
-
-            self.log(f"  Observation: {observation[:200]}")
-
-            # 将观察结果反馈给 LLM
-            messages.append({"role": "user", "content": f"Observation: {observation}"})
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id", ""),
+                    "name": tool_name,
+                    "content": observation,
+                })
 
         # 达到最大步数
-        self.log(f"[ReAct] 达到最大步数 {self.max_steps}，强制终止")
+        self.log(f"[Agent] 达到最大步数 {self.max_steps}，强制终止")
         return {
             "success": False,
             "result": None,
             "steps": self.max_steps,
             "reasoning": last_thought,
             "error": "达到最大步数限制",
-            "history": messages
+            "history": messages,
         }
 
+    # ─── 解析辅助 ───
+
     @staticmethod
-    def _parse_args(args_str: str) -> Dict[str, str]:
-        """
-        解析 key=value 格式的参数列表
-        支持 value 中包含空格（引号包裹时）
-        例如: 'file_path=C:\\test.docx, retry_level=L2'
-        """
-        if not args_str.strip():
+    def _parse_tool_args(arguments: Any) -> Dict:
+        """解析 tool_calls 中的 arguments 字段（标准为 JSON 字符串）"""
+        if isinstance(arguments, dict):
+            return arguments
+        if not arguments:
+            return {}
+        try:
+            parsed = json.loads(arguments)
+            return parsed if isinstance(parsed, dict) else {}
+        except (json.JSONDecodeError, TypeError):
             return {}
 
-        kwargs = {}
-        # 用逗号分割，.*? 允许空值（避免空值吞噬后续参数）
-        pattern = re.compile(r"""(\w+)\s*=\s*(.*?)(?=\s*,\s*\w+\s*=|\s*$)""")
-        for match in pattern.finditer(args_str):
-            key = match.group(1)
-            value = match.group(2).strip()
-            # 去除首尾引号
-            if len(value) >= 2:
-                if (value.startswith('"') and value.endswith('"')) or \
-                   (value.startswith("'") and value.endswith("'")):
-                    value = value[1:-1]
-            kwargs[key] = value
-        return kwargs
-
     @staticmethod
-    def _try_extract_final_from_text(text: str) -> Optional[str]:
+    def _parse_final(text: str) -> Any:
         """
-        逃生舱口：从 LLM 的任意文本响应中尝试提取 Final 决策 JSON。
-
-        当 LLM 连续多次不遵循 ReAct 格式时调用，作为最后的兜底尝试。
-        查找包含 action 字段的 JSON 对象（enqueue/manual/skip）。
-
-        Returns:
-            提取到的 JSON 字符串，或 None
+        将最终文本回复解析为 JSON。
+        模型偶尔会包一层代码块或附加说明文字，做轻量提取；
+        完全无法解析时包装为 {"raw": 原文}。
         """
-        # 策略1：匹配 {"action": "enqueue"|"manual"|"skip", ...} 的 JSON 对象
-        action_json_re = re.compile(
-            r'\{[^{}]*"action"\s*:\s*"(?:enqueue|manual|skip)"[^{}]*\}',
-            re.DOTALL
-        )
-        match = action_json_re.search(text)
-        if match:
-            return match.group(0)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
 
-        # 策略2：从代码块中提取 JSON
-        fenced_match = re.search(r'```(?:json)?\s*\n?([\s\S]+?)\n?```', text)
-        if fenced_match:
-            inner = fenced_match.group(1).strip()
-            if inner.startswith('{'):
-                return inner
-
-        # 策略3：匹配任意 JSON 对象（最宽松）
-        json_obj_re = re.compile(r'\{[^{}]*\}')
-        for m in json_obj_re.finditer(text):
-            candidate = m.group(0)
+        # 代码块内的 JSON
+        code_match = re.search(r'```(?:json)?\s*\n?([\s\S]*?)\n?```', text)
+        if code_match:
             try:
-                obj = json.loads(candidate)
-                if isinstance(obj, dict) and 'action' in obj:
-                    return candidate
+                return json.loads(code_match.group(1).strip())
             except json.JSONDecodeError:
-                continue
+                pass
 
-        return None
+        # 第一个 { 到最后一个 } 的片段
+        try:
+            start = text.index('{')
+            end = text.rindex('}') + 1
+            return json.loads(text[start:end])
+        except (ValueError, json.JSONDecodeError):
+            pass
+
+        return {"raw": text}
 
 
 # ─── CLI 独立测试入口 ───
 if __name__ == "__main__":
-    """用模拟工具测试 ReAct 循环"""
+    """用模拟工具测试 Function Calling 循环"""
     import sys
     sys.path.insert(0, '.')
     from deepseek_helper import DeepSeekHelper
 
     # 模拟工具
-    def get_weather(city):
+    @tool(description="查询城市天气", params={"city": "城市名"})
+    def get_weather(city=""):
         """模拟天气查询"""
         weather_data = {"北京": "晴天 25°C", "上海": "多云 28°C", "深圳": "阵雨 30°C"}
         return {"city": city, "weather": weather_data.get(city, "未知")}
 
-    def calculate(expression):
-        """模拟计算器"""
+    @tool(description="计算数学表达式", params={"expression": "数学表达式"})
+    def calculate(expression=""):
+        """模拟计算器（仅允许纯算术字符，防止任意代码执行）"""
+        if not re.fullmatch(r'[\d\s+\-*/().%]+', expression or ''):
+            return {"error": "表达式含非法字符，仅支持纯算术运算"}
         try:
-            return {"expression": expression, "result": eval(expression)}
+            return {"expression": expression, "result": eval(expression)}  # noqa: S307 — 已白名单过滤
         except Exception as e:
             return {"error": str(e)}
 
-    tools = {"get_weather": get_weather, "calculate": calculate}
-    tool_descs = {
-        "get_weather": "查询城市天气。参数: city=城市名",
-        "calculate": "计算数学表达式。参数: expression=数学表达式"
-    }
+    tools = [get_weather, calculate]
 
     system_prompt = """你是一个智能助手，可以使用工具来回答用户问题。
-遇到需要查询天气或计算的问题时，调用相应工具获取信息，然后给出最终答案。"""
+遇到需要查询天气或计算的问题时，调用相应工具获取信息，然后给出最终答案。
+最终答案输出 JSON: {"summary": "一句话总结"}"""
 
     llm = DeepSeekHelper()
     if not llm.api_key:
@@ -422,7 +363,6 @@ if __name__ == "__main__":
         llm=llm,
         system_prompt=system_prompt,
         tools=tools,
-        tool_descriptions=tool_descs,
         max_steps=5,
         log_fn=lambda msg: print(f"  {msg}")
     )

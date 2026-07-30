@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from deepseek_helper import DeepSeekHelper
-from react_loop import ReActLoop
+from react_loop import ReActLoop, tool
 from db_manager import DatabaseManager
 from config_manager import ConfigManager
 from error_types import (
@@ -172,13 +172,10 @@ class FailureAnalysisAgent:
 
 ## 输出格式
 
-每轮输出：
-Thought: [分析推理]
-Action: tool_name(key1=value1)
+数据探索通过原生工具调用(tool calls)完成。
+报告已通过 save_report 保存后，不再调用工具，直接回复最终结果，内容必须是一个合法的 JSON 对象（不要附加其他文字）：
 
-任务完成时：
-Thought: [总结]
-Final: {"status": "completed"}
+{"status": "completed"}
 
 注意：
 - 先查询再得出结论，不要编造数据
@@ -198,6 +195,7 @@ Final: {"status": "completed"}
 
         # ── 构建工具（闭包捕获 self + start_time/end_time）──
 
+        @tool(description="查询统计周期内的总体数据（总量、失败数、失败率、重试挽回数）。无参数")
         def tool_query_overview():
             stats = self.db.get_failed_stats_by_period(start_time, end_time)
             total = stats['total_uploads']
@@ -212,6 +210,7 @@ Final: {"status": "completed"}
                 "manual_pending": stats['manual_pending'],
             }
 
+        @tool(description="查询错误一级分类和二级类型的分布。无参数")
         def tool_query_error_distribution():
             stats = self.db.get_failed_stats_by_period(start_time, end_time)
             return {
@@ -219,6 +218,7 @@ Final: {"status": "completed"}
                 "type_distribution": stats['type_distribution'][:10],
             }
 
+        @tool(description="查询按天的失败率趋势。无参数")
         def tool_query_daily_trend():
             trend = self.db.get_daily_failure_trend(start_time, end_time)
             return [{
@@ -228,6 +228,7 @@ Final: {"status": "completed"}
                 "failure_rate_pct": round((d['failed'] / d['total'] * 100) if d['total'] > 0 else 0, 1)
             } for d in trend[:30]]
 
+        @tool(description="查询按学校+年级维度的失败率排行（Top 15）。无参数")
         def tool_query_school_grade_stats():
             stats = self.db.get_failure_rate_by_school_grade(start_time, end_time)
             result = []
@@ -243,6 +244,7 @@ Final: {"status": "completed"}
                 })
             return result
 
+        @tool(description="查询按科目维度的失败率。无参数")
         def tool_query_subject_stats():
             stats = self.db.get_failure_rate_by_subject(start_time, end_time)
             result = []
@@ -257,6 +259,7 @@ Final: {"status": "completed"}
                 })
             return result
 
+        @tool(description="查询各错误类型的重试挽回效果。无参数")
         def tool_query_retry_effectiveness():
             stats = self.db.get_error_type_retry_stats(start_time, end_time)
             return [{
@@ -266,6 +269,8 @@ Final: {"status": "completed"}
                 "avg_retry_count": round(s['avg_retry_count'], 1) if s['avg_retry_count'] else 0
             } for s in stats[:10]]
 
+        @tool(description="深入查询某类错误的具体案例。参数: error_type=错误类型, limit=数量(默认10)",
+              params={"error_type": "错误类型", "limit": "返回数量(默认10)"})
         def tool_drill_down_errors(error_type="", limit=10):
             records = self.db.get_failed_records_by_period(start_time, end_time)
             if error_type:
@@ -281,6 +286,8 @@ Final: {"status": "completed"}
                 "upload_time": r.get('upload_time', ''),
             } for r in records]
 
+        @tool(description="查询待人工处理的记录清单。参数: limit=数量(默认20)",
+              params={"limit": "返回数量(默认20)"})
         def tool_query_manual_pending(limit=20):
             records = self.db.get_failed_records_by_period(start_time, end_time)
             pending = [r for r in records
@@ -295,6 +302,8 @@ Final: {"status": "completed"}
                 "retry_count": r.get('retry_count', 0),
             } for r in pending]
 
+        @tool(description="保存最终 Markdown 报告到文件。参数: content=完整的Markdown报告内容",
+              params={"content": "完整的Markdown报告内容"})
         def tool_save_report(content=""):
             """保存报告到文件"""
             if not content or '#' not in content:
@@ -302,29 +311,17 @@ Final: {"status": "completed"}
             filepath = self._save_report(content, start_time, end_time, report_type)
             return {"success": True, "filepath": filepath}
 
-        tools = {
-            "query_overview": tool_query_overview,
-            "query_error_distribution": tool_query_error_distribution,
-            "query_daily_trend": tool_query_daily_trend,
-            "query_school_grade_stats": tool_query_school_grade_stats,
-            "query_subject_stats": tool_query_subject_stats,
-            "query_retry_effectiveness": tool_query_retry_effectiveness,
-            "drill_down_errors": tool_drill_down_errors,
-            "query_manual_pending": tool_query_manual_pending,
-            "save_report": tool_save_report,
-        }
-
-        tool_descs = {
-            "query_overview": "查询统计周期内的总体数据（总量、失败数、失败率、重试挽回数）。无参数",
-            "query_error_distribution": "查询错误一级分类和二级类型的分布。无参数",
-            "query_daily_trend": "查询按天的失败率趋势。无参数",
-            "query_school_grade_stats": "查询按学校+年级维度的失败率排行（Top 15）。无参数",
-            "query_subject_stats": "查询按科目维度的失败率。无参数",
-            "query_retry_effectiveness": "查询各错误类型的重试挽回效果。无参数",
-            "drill_down_errors": "深入查询某类错误的具体案例。参数: error_type=错误类型, limit=数量(默认10)",
-            "query_manual_pending": "查询待人工处理的记录清单。参数: limit=数量(默认20)",
-            "save_report": "保存最终 Markdown 报告到文件。参数: content=完整的Markdown报告内容",
-        }
+        tools = [
+            tool_query_overview,
+            tool_query_error_distribution,
+            tool_query_daily_trend,
+            tool_query_school_grade_stats,
+            tool_query_subject_stats,
+            tool_query_retry_effectiveness,
+            tool_drill_down_errors,
+            tool_query_manual_pending,
+            tool_save_report,
+        ]
 
         task = f"""请分析 {type_label} 数据并生成报告。
 
@@ -340,7 +337,6 @@ Final: {"status": "completed"}
             llm=self.deepseek,
             system_prompt=self.REACT_ANALYSIS_SYSTEM_PROMPT,
             tools=tools,
-            tool_descriptions=tool_descs,
             max_steps=max_steps,
             log_fn=lambda msg: self._log(f"AnalysisAgent ReAct: {msg}")
         )
@@ -349,20 +345,22 @@ Final: {"status": "completed"}
         if result["success"]:
             # 尝试从 save_report 的结果获取文件路径
             self._log(f"AI 分析完成 (steps={result['steps']})")
-            # 检查 Final 或历史中是否有 save_report 的结果
+            # 从历史中查找 save_report 工具的返回结果（role=tool 消息）
             for msg in reversed(result.get("history", [])):
-                content = msg.get("content", "")
-                if "save_report" in content and "filepath" in content:
-                    # 从 Observation 中提取路径
-                    match = re.search(r'"filepath":\s*"([^"]+)"', content)
-                    if match:
-                        saved_path = match.group(1)
-                        # 读取保存的报告内容
-                        try:
-                            with open(saved_path, 'r', encoding='utf-8') as f:
-                                return f.read()
-                        except Exception:
-                            pass
+                if msg.get("role") != "tool" or msg.get("name") != "save_report":
+                    continue
+                try:
+                    data = json.loads(msg.get("content", ""))
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                saved_path = data.get("filepath")
+                if saved_path:
+                    # 读取保存的报告内容
+                    try:
+                        with open(saved_path, 'r', encoding='utf-8') as f:
+                            return f.read()
+                    except Exception:
+                        pass
             # save_report 未被调用 → 回退模板，不读取旧报告避免返回错误周期的数据
 
         self._log(f"AI Agent 分析失败(steps={result['steps']}), 回退模板")

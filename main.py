@@ -9,7 +9,6 @@ import time
 import threading
 import traceback
 from queue import Queue
-import tkinter as tk
 
 # 导入各个功能模块
 from db_manager import DatabaseManager
@@ -19,6 +18,7 @@ from upload_processor import UploadProcessor
 from browser_automation import BrowserAutomation
 from gui_manager import MainApplication
 from auto_retry_agent import AutoRetryAgent
+from pipeline_watchdog import PipelineWatchdog
 
 
 def backend_worker(stop_event: threading.Event, task_queue: Queue,
@@ -66,6 +66,14 @@ def backend_worker(stop_event: threading.Event, task_queue: Queue,
         browser = BrowserAutomation(log_queue=log_queue)
         BrowserAutomation.start_idle_monitor(
             stop_event, task_queue, log_queue, upload_processor, db, browser=browser)
+
+        # 步骤4.5: 启动流水线看门狗（卡死检测，daemon 线程）
+        watchdog = PipelineWatchdog(
+            upload_processor.heartbeat, browser, upload_processor,
+            auto_retry_agent, log_queue, stop_event)
+        watchdog_thread = threading.Thread(
+            target=watchdog.run, daemon=True, name="PipelineWatchdog")
+        watchdog_thread.start()
 
         # 步骤5: 等待停止信号（监控器在独立 daemon 线程运行）
         while not stop_event.is_set():
@@ -146,11 +154,9 @@ def main():
 
         # 启动GUI主循环
         print("启动图形界面...")
-        try:
-            from tkinterdnd2 import TkinterDnD
-            root = TkinterDnD.Tk()
-        except ImportError:
-            root = tk.Tk()
+        # 创建现代化根窗口（CTk圆角控件 + 文件拖拽支持）
+        from ui_theme import create_root
+        root = create_root()
 
         # 创建主应用窗口
         app = MainApplication(root, stop_event, task_queue, log_queue, upload_processor)

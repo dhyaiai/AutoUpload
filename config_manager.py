@@ -81,7 +81,19 @@ class ConfigManager:
             "AI_AGENT_MAX_STEPS": 10,                                # ReAct循环最大步数
             "QWEN_API_KEY": "",                                      # 通义千问 API Key
             "QWEN_MODEL": "qwen3.7-plus",                           # 通义千问模型名
-            "QWEN_API_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",  # 通义千问 API 端点
+            "QWEN_API_URL": "https://llm-nwnb3n9ni4k5ebc2.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions",  # 通义千问 API 端点（MaaS 专属实例）
+            "QWEN_VL_MODEL": "qwen3.7-plus",                        # 截图理解用多模态模型（view_page_screenshot 工具）
+
+            # 流水线看门狗配置（卡死检测）
+            "WATCHDOG_ENABLE": True,                                 # 启用看门狗卡死检测
+            "WATCHDOG_CHECK_INTERVAL": 10,                           # 检查间隔(秒)
+            "WATCHDOG_STAGE_TIMEOUTS": {                             # 各阶段卡死判定阈值(秒)
+                "read_file": 60,
+                "ai_classify": 180,
+                "browser_init": 240,
+                "school_check": 240,
+                "submit_upload": 300                                 # 需大于 UPLOAD_TIMEOUT(120s)
+            },
 
             # API 服务配置（微信小程序对接）
             "API_SERVER_HOST": "0.0.0.0",                           # API服务监听地址
@@ -252,12 +264,12 @@ class ConfigManager:
     @property
     def qwen_api_url(self) -> str:
         """通义千问 API 端点 URL"""
-        return self.get("QWEN_API_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions")
+        return self.get("QWEN_API_URL", "https://llm-nwnb3n9ni4k5ebc2.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions")
 
     @property
     def qwen_model(self) -> str:
         """通义千问模型名"""
-        return self.get("QWEN_MODEL", "qwen-plus")
+        return self.get("QWEN_MODEL", "qwen3.7-plus")
 
     # ==================== API 服务配置 ====================
 

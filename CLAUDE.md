@@ -74,7 +74,8 @@ watchdog 检测新文件 → task_queue → UploadProcessor.run()
 | `error_types.py` | 274 | 结构化错误体系：`UploadStage`（8个阶段）、`ErrorCategory`（5大类）、`ErrorType`（19种具体错误）、`RetryLevel`（L1-L5 自愈级别）、`STRATEGY_MAP`（阶段×错误→策略映射表）、错误分类推断规则、根因描述与建议 |
 | `deepseek_helper.py` | 225 | DeepSeek API 通用封装，提供 `chat()` 和 `chat_json()` 两个方法，供 Agent 模块共用。支持多提供商（DeepSeek/Qwen），内置重试和超时 |
 | `react_loop.py` | 294 | 通用 ReAct 循环引擎，零项目依赖。LLM 输出 Thought（推理）→ Action（工具调用）→ 引擎执行工具 → Observation（观察结果）→ 循环直到 Final（最终结论）。`max_steps` 硬上限防止死循环 |
-| `auto_retry_agent.py` | 836 | 失败自动接管 Agent，后台常驻。含安全守护：熔断器（CircuitBreaker）、全局重试上限、LLM 无法绕过的硬编码安全约束。失败列表在 GUI 显示"Agent接管"状态 |
+| `auto_retry_agent.py` | 836 | 失败自动接管 Agent，后台常驻。含安全守护：熔断器（CircuitBreaker）、全局重试上限、LLM 无法绕过的硬编码安全约束。失败列表在 GUI 显示"Agent接管"状态。集成经验记忆：每次处置写入 `repair_experiences`，ReAct 前注入同指纹历史成功方案，上传结果回调回填成败 |
+| `experience_memory.py` | — | 经验记忆模块：错误指纹（error_type+fail_stage+page_state）→动作序列→是否成功。提供历史成功方案的 prompt 提示构建，并用成功率统计动态修正 `STRATEGY_MAP`（L5 永不修正）。底部有 CLI 测试入口 |
 | `failure_analysis_agent.py` | 698 | 按需触发的失败原因分析 Agent，ReAct 驱动 LLM 自主探索数据库、深度归因、生成 Markdown 分析报告。AI 禁用/失败时回退到模板报告 |
 
 **自愈策略分级：**
@@ -100,7 +101,7 @@ watchdog 检测新文件 → task_queue → UploadProcessor.run()
 | `info_extractor.py` | — | 年级正则：`^(.+?)(高一\|高二\|...\|小六)$`，支持 txt/docx/doc/pdf（.doc 通过 olefile 解析 OLE2 二进制格式） |
 | `subject_classifier.py` | — | 调用 `deepseek-chat`，temperature=0，限制 9 个科目，最多重试 3 次间隔 2 秒 |
 | `file_monitor.py` | — | watchdog `on_created` 事件，文件稳定等待 2 秒后入队，过滤根目录下的直接文件 |
-| `db_manager.py` | 766 | SQLite，`upload_records` + `analysis_records` 双表，`check_same_thread=False`。分析表支持按科目/学校年级/日期聚合查询。Agent 通过工具函数查询/更新失败记录 |
+| `db_manager.py` | 766 | SQLite，`upload_records` + `analysis_records` + `repair_experiences`（经验记忆）三表，`check_same_thread=False`。分析表支持按科目/学校年级/日期聚合查询。Agent 通过工具函数查询/更新失败记录 |
 | `config_manager.py` | — | 处理 PyInstaller 打包路径（`sys._MEIPASS`），`@property` 暴露配置项，自动清理 Unicode 控制字符 |
 | `file_merger.py` | — | 试题+答案合并（试题在前，分页符分隔，答案在后）。.doc/.docx 用 Word COM（支持 MS Word / WPS），.pdf 用 pypdf |
 | `stats_panel.py` | 544 | 数据统计标签页：matplotlib 柱状图（按科目/学校年级切换）+ 折线图（按日/周/月聚合）+ 上传/失败记录表 + openpyxl Excel 导出 + 失败分析报告入口 |

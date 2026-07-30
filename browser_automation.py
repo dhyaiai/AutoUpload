@@ -3,6 +3,7 @@
 功能:管理Chrome浏览器的生命周期,实现自动登录、学校校验、文件上传
 特点:单例模式复用浏览器实例,支持自动重启和状态检测
 """
+import base64
 import os
 import re
 import sys
@@ -40,6 +41,7 @@ class BrowserAutomation:
             cls._instance.is_logged_in = False
             cls._instance.last_active_time = time.time()
             cls._instance.last_upload_error = ""  # 最近一次 upload_file 的 error_text
+            cls._instance.watchdog_interrupt_reason = ""  # 看门狗强制打断原因（优先于 last_upload_error）
             cls._instance._lock = threading.RLock()  # 保护浏览器生命周期操作的线程安全
         # 每次调用都更新 log_queue（允许后续调用者注入有效的日志队列）
         if log_queue is not None:
@@ -1928,46 +1930,10 @@ class BrowserAutomation:
             self._log("开始环境复位...")
 
             # 1. 发送 ESC 关闭所有下拉/浮层/弹窗
-            for _ in range(3):
-                try:
-                    webdriver.ActionChains(self.driver).send_keys(Keys.ESCAPE).perform()
-                    time.sleep(0.3)
-                except Exception:
-                    break
+            self.press_escape(times=3)
 
-            # 2. 关闭残留对话框
-            close_selectors = [
-                # Element UI dialog 关闭按钮
-                (By.CSS_SELECTOR, ".el-dialog__close"),
-                (By.CSS_SELECTOR, ".el-dialog__headerbtn"),
-                # 上传对话框关闭
-                (By.CSS_SELECTOR, ".el-dialog .el-icon-close"),
-                # 通用关闭按钮
-                (By.XPATH, "//button[contains(@class, 'el-dialog__close')]"),
-                # 取消按钮（关闭对话框）
-                (By.XPATH, "//button[contains(., '取 消') or contains(., '取消')]"),
-                # 遮罩层点击关闭
-                (By.CSS_SELECTOR, ".v-modal"),
-            ]
-            for by, selector in close_selectors:
-                try:
-                    elements = self.driver.find_elements(by, selector)
-                    for el in elements:
-                        try:
-                            if el.is_displayed():
-                                el.click()
-                                time.sleep(0.3)
-                        except Exception:
-                            pass
-                except Exception:
-                    continue
-
-            # 再发送一次 ESC 确保关闭残留
-            try:
-                webdriver.ActionChains(self.driver).send_keys(Keys.ESCAPE).perform()
-                time.sleep(0.3)
-            except Exception:
-                pass
+            # 2. 关闭残留对话框（close_dialogs 末尾会再发一次 ESC 兜底）
+            self.close_dialogs()
 
             # 3. 导航回平台首页
             try:
@@ -2020,6 +1986,193 @@ class BrowserAutomation:
             import traceback
             traceback.print_exc()
             return False
+
+    # ─── 原子恢复动作（供 AutoRetryAgent 细粒度工具调用）───
+
+    def press_escape(self, times: int = 1) -> dict:
+        """
+        发送 ESC 键关闭下拉/浮层/弹窗（原子修复动作）
+
+        Args:
+            times: 发送次数（1~5）
+
+        Returns:
+            {"success": bool, "sent": int, "error": str}
+        """
+        if not self.driver:
+            return {"success": False, "sent": 0, "error": "浏览器未启动"}
+        try:
+            n = max(1, min(int(times), 5))
+        except (TypeError, ValueError):
+            n = 1
+        sent = 0
+        for _ in range(n):
+            try:
+                ActionChains(self.driver).send_keys(Keys.ESCAPE).perform()
+                time.sleep(0.3)
+                sent += 1
+            except Exception as e:
+                return {"success": sent > 0, "sent": sent, "error": str(e)[:200]}
+        return {"success": True, "sent": sent, "error": ""}
+
+    def close_dialogs(self) -> dict:
+        """
+        点击关闭页面上所有可见的残留对话框/弹窗（原子修复动作）
+        末尾追加一次 ESC 兜底关闭残留浮层
+
+        Returns:
+            {"success": bool, "closed_count": int, "error": str}
+        """
+        if not self.driver:
+            return {"success": False, "closed_count": 0, "error": "浏览器未启动"}
+        close_selectors = [
+            # Element UI dialog 关闭按钮
+            (By.CSS_SELECTOR, ".el-dialog__close"),
+            (By.CSS_SELECTOR, ".el-dialog__headerbtn"),
+            # 上传对话框关闭
+            (By.CSS_SELECTOR, ".el-dialog .el-icon-close"),
+            # 通用关闭按钮
+            (By.XPATH, "//button[contains(@class, 'el-dialog__close')]"),
+            # 取消按钮（关闭对话框）
+            (By.XPATH, "//button[contains(., '取 消') or contains(., '取消')]"),
+            # 遮罩层点击关闭
+            (By.CSS_SELECTOR, ".v-modal"),
+        ]
+        closed = 0
+        for by, selector in close_selectors:
+            try:
+                elements = self.driver.find_elements(by, selector)
+                for el in elements:
+                    try:
+                        if el.is_displayed():
+                            el.click()
+                            closed += 1
+                            time.sleep(0.3)
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+        # 再发送一次 ESC 确保关闭残留
+        try:
+            ActionChains(self.driver).send_keys(Keys.ESCAPE).perform()
+            time.sleep(0.3)
+        except Exception:
+            pass
+        return {"success": True, "closed_count": closed, "error": ""}
+
+    def refresh_page(self) -> dict:
+        """
+        刷新当前页面并等待加载完成（原子修复动作），用于清除卡住的 JS 状态
+
+        Returns:
+            {"success": bool, "page_state": str, "error": str}
+        """
+        if not self.driver:
+            return {"success": False, "page_state": "no_browser", "error": "浏览器未启动"}
+        try:
+            self.driver.refresh()
+            WebDriverWait(self.driver, 10).until(
+                lambda d: d.execute_script("return document.readyState;") == "complete"
+            )
+            time.sleep(1)
+            state = self.detect_page_state()
+            self.update_activity_time()
+            return {"success": True,
+                    "page_state": state.get("state", "unknown"), "error": ""}
+        except Exception as e:
+            return {"success": False, "page_state": "unknown", "error": str(e)[:200]}
+
+    def navigate_home(self) -> dict:
+        """
+        导航回平台首页并等待加载完成（原子修复动作）
+
+        Returns:
+            {"success": bool, "page_state": str, "error": str}
+        """
+        if not self.driver:
+            return {"success": False, "page_state": "no_browser", "error": "浏览器未启动"}
+        try:
+            base_url = self.config.website_url.rstrip('/')
+            self.driver.get(base_url)
+            WebDriverWait(self.driver, 10).until(
+                lambda d: d.execute_script("return document.readyState;") == "complete"
+            )
+            time.sleep(1)
+            state = self.detect_page_state()
+            self.update_activity_time()
+            return {"success": True,
+                    "page_state": state.get("state", "unknown"), "error": ""}
+        except Exception as e:
+            return {"success": False, "page_state": "unknown", "error": str(e)[:200]}
+
+    def verify_home_ready(self) -> dict:
+        """
+        修复后强制验证：页面必须回到 home 且关键元素可交互，才允许重试入队。
+        检查项：
+        1. detect_page_state == home
+        2. 无踢下线信号
+        3. 无可见遮罩/未关闭的对话框
+        4. 首页上传作业入口按钮可见（选择器与 upload_file 保持一致）
+
+        Returns:
+            {"success": bool, "verified": bool, "state": str, "details": str}
+            verified=True 表示验证通过，可以安全入队重试
+        """
+        if not self.driver:
+            return {"success": True, "verified": False,
+                    "state": "no_browser", "details": "浏览器未启动"}
+        try:
+            state_result = self.detect_page_state()
+            state = state_result.get("state", "unknown")
+            if state != "home":
+                return {"success": True, "verified": False, "state": state,
+                        "details": f"页面状态为 {state}，未回到首页: "
+                                   f"{state_result.get('details', '')}"}
+
+            # 踢下线信号检查（SPA 的 URL 不随会话丢失变化）
+            if self._detect_session_lost_on_page():
+                return {"success": True, "verified": False, "state": state,
+                        "details": "页面显示home但检测到踢下线信号，会话已丢失"}
+
+            # 遮罩/残留对话框检查
+            try:
+                overlays = self.driver.find_elements(
+                    By.CSS_SELECTOR, ".v-modal, .el-overlay")
+                if any(o.is_displayed() for o in overlays):
+                    return {"success": True, "verified": False, "state": state,
+                            "details": "存在可见遮罩层，页面被挡住"}
+            except Exception:
+                pass
+            try:
+                dialogs = self.driver.find_elements(
+                    By.CSS_SELECTOR,
+                    ".el-dialog__wrapper:not([style*='display: none'])")
+                if any(d.is_displayed() for d in dialogs):
+                    return {"success": True, "verified": False, "state": state,
+                            "details": "存在未关闭的对话框"}
+            except Exception:
+                pass
+
+            # 关键元素：上传作业入口按钮（多重选择器与 upload_file 一致）
+            upload_btn_selectors = [
+                (By.XPATH, "//*[@id='main']/section/div/div[1]/div/div[2]/span"),
+                (By.ID, "upload-homework-btn"),
+                (By.CSS_SELECTOR, "div.upload-btn"),
+                (By.XPATH, "//span[contains(text(), '上传')]/parent::div"),
+            ]
+            for by, sel in upload_btn_selectors:
+                try:
+                    el = self.driver.find_element(by, sel)
+                    if el.is_displayed():
+                        return {"success": True, "verified": True, "state": "home",
+                                "details": "首页就绪，上传入口可交互"}
+                except Exception:
+                    continue
+            return {"success": True, "verified": False, "state": state,
+                    "details": "首页上传入口按钮不可见，页面可能未加载完成"}
+        except Exception as e:
+            return {"success": False, "verified": False, "state": "unknown",
+                    "details": f"验证异常: {str(e)[:200]}"}
 
 
     # ─── 会话丢失检测 ───
@@ -2225,6 +2378,120 @@ class BrowserAutomation:
             self.driver.save_screenshot(path)
             self._log(f"截图已保存: {path}")
             return {"success": True, "path": os.path.abspath(path)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_screenshot_base64(self) -> dict:
+        """
+        截取当前页面并返回 base64 编码（供多模态视觉模型分析），同时落盘供审计
+
+        落盘保存原始 PNG 不变；返回给模型的 base64 压缩为 JPEG（长边≤1280、quality=80），
+        体积缩小约 90%，降低上传耗时与视觉 token 消耗
+
+        Returns:
+            {"success": bool, "base64": str, "mime": str, "path": str} 或 {"success": False, "error": str}
+        """
+        try:
+            if not self.driver:
+                return {"success": False, "error": "浏览器未初始化"}
+            png_bytes = self.driver.get_screenshot_as_png()
+            # 落盘保存原始 PNG（复用 get_page_screenshot 的命名规则）
+            path = ""
+            try:
+                os.makedirs("screenshots", exist_ok=True)
+                from datetime import datetime as dt
+                filename = f"page_{dt.now().strftime('%Y%m%d_%H%M%S')}.png"
+                path = os.path.join("screenshots", filename)
+                with open(path, "wb") as f:
+                    f.write(png_bytes)
+                path = os.path.abspath(path)
+                self._log(f"截图已保存: {path}")
+            except Exception:
+                pass  # 落盘失败不影响 base64 返回
+            b64, mime = self._compress_screenshot(png_bytes)
+            return {"success": True, "base64": b64, "mime": mime, "path": path}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    @staticmethod
+    def _compress_screenshot(png_bytes: bytes, max_side: int = 1280, quality: int = 80) -> tuple:
+        """
+        压缩截图供视觉模型分析：长边缩至 max_side 以内并转 JPEG
+
+        Pillow 不可用或压缩失败时回退为原始 PNG 的 base64
+
+        Returns:
+            (base64字符串, mime类型)
+        """
+        try:
+            import io
+            from PIL import Image
+            img = Image.open(io.BytesIO(png_bytes))
+            if max(img.size) > max_side:
+                ratio = max_side / max(img.size)
+                img = img.resize((max(1, int(img.width * ratio)),
+                                  max(1, int(img.height * ratio))),
+                                 Image.LANCZOS)
+            if img.mode != "RGB":
+                img = img.convert("RGB")  # JPEG 不支持透明通道
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=quality)
+            return base64.b64encode(buf.getvalue()).decode("ascii"), "image/jpeg"
+        except Exception:
+            return base64.b64encode(png_bytes).decode("ascii"), "image/png"
+
+    def get_interactable_elements(self) -> dict:
+        """
+        一次性收集页面可见的可交互元素与弹窗/遮罩状态（供 AI Agent 感知页面结构）
+
+        Returns:
+            {"success": bool, "dialogs": [...], "toasts": [...], "buttons": [...],
+             "inputs": [...], "has_overlay": bool} 或 {"success": False, "error": str}
+        """
+        try:
+            if not self.driver:
+                return {"success": False, "error": "浏览器未初始化"}
+            script = """
+                const MAX_ITEMS = 40, MAX_TEXT = 50;
+                const visible = el => {
+                    const r = el.getBoundingClientRect();
+                    const s = window.getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 &&
+                           s.display !== 'none' && s.visibility !== 'hidden';
+                };
+                const txt = el => (el.innerText || el.value ||
+                    el.getAttribute('placeholder') || '').trim().slice(0, MAX_TEXT);
+                const collect = (selector, mapper) =>
+                    Array.from(document.querySelectorAll(selector))
+                        .filter(visible).slice(0, MAX_ITEMS).map(mapper);
+                const dialogs = collect('.el-dialog', el => {
+                    const title = el.querySelector('.el-dialog__title');
+                    return {title: title ? txt(title) : '', text: txt(el)};
+                });
+                const toasts = collect('.el-message, .el-notification',
+                    el => ({text: txt(el)}));
+                const buttons = collect('button, a', el => ({
+                    tag: el.tagName.toLowerCase(), text: txt(el),
+                    disabled: !!el.disabled
+                })).filter(b => b.text);
+                const inputs = collect('input, select, textarea', el => ({
+                    tag: el.tagName.toLowerCase(),
+                    type: el.type || '', text: txt(el)
+                }));
+                const hasOverlay = Array.from(
+                    document.querySelectorAll('.el-overlay, .v-modal')
+                ).some(visible);
+                return {dialogs, toasts, buttons, inputs, has_overlay: hasOverlay};
+            """
+            data = self.driver.execute_script(script)
+            return {
+                "success": True,
+                "dialogs": data.get("dialogs", []),
+                "toasts": data.get("toasts", []),
+                "buttons": data.get("buttons", []),
+                "inputs": data.get("inputs", []),
+                "has_overlay": bool(data.get("has_overlay")),
+            }
         except Exception as e:
             return {"success": False, "error": str(e)}
 

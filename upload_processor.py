@@ -16,6 +16,7 @@ from subject_classifier import SubjectClassifier
 from browser_automation import BrowserAutomation
 from config_manager import ConfigManager
 from error_types import UploadStage, ErrorCategory, ErrorType, RetryLevel
+from pipeline_watchdog import PipelineHeartbeat, RECENT_LOGS
 
 
 class UploadProcessor:
@@ -50,6 +51,8 @@ class UploadProcessor:
         self.browser = BrowserAutomation(log_queue=log_queue)
         # 处理中标记，防止后端在任务处理期间误关浏览器
         self.processing = False
+        # 流水线心跳（供 PipelineWatchdog 检测卡死）
+        self.heartbeat = PipelineHeartbeat()
 
         # Agent 回调相关
         self.auto_retry_agent = None           # AutoRetryAgent 引用
@@ -283,6 +286,7 @@ class UploadProcessor:
         try:
             # 确保浏览器已启动（延迟初始化，首次调用时才打开浏览器）
             current_stage = UploadStage.BROWSER_INIT
+            self.heartbeat.beat(current_stage.value, file_path)
             if not self.browser.ensure_initialized():
                 error_msg = "浏览器启动失败"
                 self._send_log(f"错误: {error_msg}")
@@ -337,6 +341,7 @@ class UploadProcessor:
 
             # 校验并切换学校(每次上传前都实际检查网页上的学校)
             current_stage = UploadStage.SCHOOL_CHECK
+            self.heartbeat.beat(current_stage.value, file_path)
             self._send_log(f"正在校验学校: {school}")
             if not self.browser.check_and_switch_school(school):
                 # ── 分层检测：优先 detect_page_state，再回退到关键词/页面文本 ──
@@ -410,6 +415,7 @@ class UploadProcessor:
 
             # 执行上传(传递学校参数,用于在上传对话框中选择)
             current_stage = UploadStage.SUBMIT_UPLOAD
+            self.heartbeat.beat(current_stage.value, file_path)
             self._send_log(f"正在上传到平台...")
             upload_success = self.browser.upload_file(file_path, grade, subject, school)
             return upload_success, current_stage, False
@@ -553,12 +559,14 @@ class UploadProcessor:
 
         # 读取文件内容用于科目识别
         current_stage = UploadStage.READ_FILE
+        self.heartbeat.beat(current_stage.value, file_path)
         file_content = self.info_extractor.read_file_content(file_path)
         if not file_content:
             self._send_log("警告: 无法读取文件内容或文件格式不支持")
 
         # AI科目识别（用户未传subject时自动识别）
         current_stage = UploadStage.AI_CLASSIFY
+        self.heartbeat.beat(current_stage.value, file_path)
         if not subject:
             self._send_log("正在AI识别科目...")
             subject = self.classifier.classify(file_content, file_name=file_name)
@@ -581,6 +589,7 @@ class UploadProcessor:
             )
         finally:
             self.processing = False
+            self.heartbeat.clear()
             if source == 'desktop':
                 self._notify_agent_result(file_path, upload_success)
 
@@ -610,7 +619,15 @@ class UploadProcessor:
         else:
             # 通用失败处理
             current_stage = failed_stage
-            last_error = getattr(self.browser, 'last_upload_error', '')
+            # 优先读取看门狗强制打断原因（读后清空，避免污染后续任务），
+            # 不用 last_upload_error 是因为 upload_file 的兕底 except 会用
+            # Selenium 异常文本覆盖它，导致 [WATCHDOG] 标记丢失
+            watchdog_reason = getattr(self.browser, 'watchdog_interrupt_reason', '')
+            if watchdog_reason:
+                self.browser.watchdog_interrupt_reason = ""
+                last_error = watchdog_reason
+            else:
+                last_error = getattr(self.browser, 'last_upload_error', '')
             if self._is_school_not_activated_error(last_error):
                 error_msg = f"学校未开通数智作业服务: {school}"
             elif last_error and last_error.strip():
@@ -806,6 +823,9 @@ class UploadProcessor:
 
         if cls._is_session_lost_error(error_text):
             return (ErrorCategory.BROWSER_ERROR, ErrorType.LOGIN_EXPIRED)
+        if "[WATCHDOG]" in error_text or "流水线卡死" in error_text:
+            # 看门狗强制打断 → 流水线卡死（需 L4 完整恢复）
+            return (ErrorCategory.BROWSER_ERROR, ErrorType.PIPELINE_STUCK)
         if "只能上传一个文件" in error_text:
             # 可能是级联错误（上一文件因会话丢失已提交但响应丢失），
             # 也可能是真正的重复提交，先归类为表单校验失败
@@ -898,6 +918,10 @@ class UploadProcessor:
                 error_message=error_message
             )
 
+        # 失败落库后立即唤醒 Agent（替代纯轮询，秒级接管）
+        if self.auto_retry_agent is not None and hasattr(self.auto_retry_agent, 'wake'):
+            self.auto_retry_agent.wake()
+
         # 向GUI发送刷新失败列表的信号
         self._send_log("REFRESH_FAILED_LIST")
     
@@ -917,6 +941,7 @@ class UploadProcessor:
         error_context = {}
 
         self._send_log(f"重新上传文件: {file_name}")
+        self.heartbeat.beat(UploadStage.PARSE_FOLDER.value, file_path)
 
         # 先标记为 processing 防止 Agent 并发重试
         self.db.update_retry_status(record_id, 'processing')
@@ -933,6 +958,7 @@ class UploadProcessor:
                 fail_stage=UploadStage.SUBMIT_UPLOAD.value)
             self.db.update_retry_status(record_id, 'finished')
             self._send_log("REFRESH_FAILED_LIST")
+            self.heartbeat.clear()
             return
 
         # 解析学校/年级：小程序任务优先从数据库记录读取（文件夹名无法解析）
@@ -962,13 +988,16 @@ class UploadProcessor:
             self.db.update_retry_status(record_id, 'finished')
             self._send_log(f"错误: {error_msg}")
             self._send_log("REFRESH_FAILED_LIST")
+            self.heartbeat.clear()
             return
 
         # 读取文件内容并识别科目
         current_stage = UploadStage.READ_FILE
+        self.heartbeat.beat(current_stage.value, file_path)
         file_content = self.info_extractor.read_file_content(file_path)
 
         current_stage = UploadStage.AI_CLASSIFY
+        self.heartbeat.beat(current_stage.value, file_path)
         subject = self.classifier.classify(file_content, file_name=file_name)
 
         if not subject:
@@ -976,6 +1005,7 @@ class UploadProcessor:
 
         # 确保浏览器已启动（延迟初始化）
         current_stage = UploadStage.BROWSER_INIT
+        self.heartbeat.beat(current_stage.value, file_path)
         if not self.browser.ensure_initialized():
             error_msg = "浏览器启动失败"
             self.db.update_record_structured_error(
@@ -986,6 +1016,7 @@ class UploadProcessor:
             self.db.update_retry_status(record_id, 'pending')
             self._send_log(f"错误: {error_msg}")
             self._send_log("REFRESH_FAILED_LIST")
+            self.heartbeat.clear()
             return
 
         # 检查浏览器状态
@@ -994,6 +1025,7 @@ class UploadProcessor:
 
         # 校验学校(每次上传前都实际检查网页上的学校)
         current_stage = UploadStage.SCHOOL_CHECK
+        self.heartbeat.beat(current_stage.value, file_path)
         if not self.browser.check_and_switch_school(school):
             # 检查是否因学校未开通导致
             page_info = self.browser.get_page_text()
@@ -1015,10 +1047,12 @@ class UploadProcessor:
                 self.db.update_retry_status(record_id, 'pending')
             self._send_log(f"错误: {error_msg}")
             self._send_log("REFRESH_FAILED_LIST")
+            self.heartbeat.clear()
             return
 
         # 执行上传
         current_stage = UploadStage.SUBMIT_UPLOAD
+        self.heartbeat.beat(current_stage.value, file_path)
         upload_success = self.browser.upload_file(file_path, grade, subject, school)
 
         if upload_success:
@@ -1037,8 +1071,13 @@ class UploadProcessor:
             )
             self._send_log(f"✓ 重新上传成功: {file_name}")
         else:
-            # 更新错误信息，检查是否为学校未开通错误
-            last_error = getattr(self.browser, 'last_upload_error', '')
+            # 更新错误信息：优先读取看门狗强制打断原因（读后清空），再检查是否为学校未开通错误
+            watchdog_reason = getattr(self.browser, 'watchdog_interrupt_reason', '')
+            if watchdog_reason:
+                self.browser.watchdog_interrupt_reason = ""
+                last_error = watchdog_reason
+            else:
+                last_error = getattr(self.browser, 'last_upload_error', '')
             if self._is_school_not_activated_error(last_error):
                 error_msg = f"学校未开通数智作业服务: {school}"
                 self.db.update_record_structured_error(
@@ -1048,26 +1087,29 @@ class UploadProcessor:
                     error_type=ErrorType.SCHOOL_NOT_ACTIVATED.value)
                 self.db.update_retry_status(record_id, 'finished')
             else:
-                # 优先使用网页实际错误信息
+                # 优先使用网页实际错误信息，并根据错误文本推断错误类型
                 error_msg = self._clean_error_marker(last_error) if last_error and last_error.strip() else "重新上传失败"
+                error_cat, error_type = self._classify_browser_error(error_msg)
                 self.db.update_record_structured_error(
                     record_id, error_message=error_msg,
                     fail_stage=current_stage.value,
-                    error_category=ErrorCategory.BROWSER_ERROR.value,
-                    error_type=ErrorType.UPLOAD_SUBMIT_TIMEOUT.value)
+                    error_category=error_cat.value,
+                    error_type=error_type.value)
                 self.db.update_retry_status(record_id, 'pending')
             self._send_log(f"✗ 重新上传失败: {file_name} - {error_msg}")
 
         # 刷新失败列表
         self._send_log("REFRESH_FAILED_LIST")
+        self.heartbeat.clear()
     
     def _send_log(self, message: str):
         """
-        向日志队列发送消息
+        向日志队列发送消息，同时写入近期日志缓冲（供 Agent 回看）
         
         Args:
             message: 日志消息
         """
+        RECENT_LOGS.append(message)
         try:
             self.log_queue.put(message)
         except Exception as e:

@@ -26,6 +26,7 @@ from upload_processor import UploadProcessor
 from browser_automation import BrowserAutomation
 from auto_retry_agent import AutoRetryAgent
 from failure_analysis_agent import FailureAnalysisAgent
+from pipeline_watchdog import PipelineWatchdog
 
 
 # ==================== 全局状态（供 lifespan 注入） ====================
@@ -87,6 +88,15 @@ async def lifespan(app: FastAPI):
         print("自动重试Agent已启动")
     else:
         print("自动重试Agent已禁用")
+
+    # --- 启动流水线看门狗线程（卡死检测） ---
+    watchdog = PipelineWatchdog(
+        upload_processor.heartbeat, browser, upload_processor,
+        auto_retry_agent, log_queue, stop_event)
+    watchdog_thread = threading.Thread(
+        target=watchdog.run, daemon=True, name="PipelineWatchdog")
+    watchdog_thread.start()
+    print("流水线看门狗已启动")
 
     # --- 初始化分析Agent ---
     analysis_agent = FailureAnalysisAgent(log_queue)

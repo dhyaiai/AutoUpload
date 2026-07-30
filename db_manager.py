@@ -105,6 +105,28 @@ class DatabaseManager:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_analysis_grade ON analysis_records(grade)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_analysis_upload_time ON analysis_records(upload_time)')
 
+        # 创建修复经验表(经验记忆: 错误指纹→动作序列→结果, 供Agent复用历史成功方案)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS repair_experiences (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,   -- 自增主键
+                fingerprint TEXT NOT NULL,              -- 错误指纹: error_type|fail_stage|page_state
+                error_type TEXT,                        -- 错误类型(指纹组成部分)
+                fail_stage TEXT,                        -- 失败阶段(指纹组成部分)
+                page_state TEXT,                        -- 决策时页面状态(指纹组成部分)
+                record_id INTEGER,                      -- 关联的upload_records记录ID(溯源)
+                file_name TEXT,                         -- 文件名(溯源)
+                action_sequence TEXT,                   -- 动作序列JSON数组,如["close_dialog","enqueue_retry(L2)"]
+                decision_action TEXT,                   -- 最终决策: enqueue/manual/skip
+                retry_level TEXT,                       -- 重试级别 L1~L4
+                decision_source TEXT,                   -- 决策来源: react/rule/fastpath
+                outcome TEXT DEFAULT 'pending',         -- 处置结果: pending/success/failed/manual/skip
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,  -- 处置时间
+                outcome_time DATETIME                   -- 结果回填时间
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_exp_fingerprint ON repair_experiences(fingerprint)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_exp_stage_type ON repair_experiences(fail_stage, error_type)')
+
         # 执行表结构迁移（兼容旧数据库，新增字段不存在时自动添加）
         self._migrate_schema()
 
@@ -625,6 +647,103 @@ class DatabaseManager:
             (value, record_id)
         )
         self._connection.commit()
+
+    # ─── 修复经验表操作（经验记忆系统） ───
+
+    def add_repair_experience(self, fingerprint: str, error_type: str = None,
+                              fail_stage: str = None, page_state: str = None,
+                              record_id: int = None, file_name: str = None,
+                              action_sequence: str = None, decision_action: str = None,
+                              retry_level: str = None, decision_source: str = None,
+                              outcome: str = 'pending') -> int:
+        """
+        插入一条修复经验记录
+
+        Args:
+            fingerprint: 错误指纹 error_type|fail_stage|page_state
+            error_type/fail_stage/page_state: 指纹组成字段
+            record_id: 关联的上传记录ID
+            file_name: 文件名
+            action_sequence: 动作序列JSON字符串
+            decision_action: enqueue/manual/skip
+            retry_level: L1~L4
+            decision_source: react/rule/fastpath
+            outcome: 初始结果(入队为pending, manual/skip立即定格)
+
+        Returns:
+            新插入记录的ID
+        """
+        cursor = self._connection.cursor()
+        cursor.execute('''
+            INSERT INTO repair_experiences
+            (fingerprint, error_type, fail_stage, page_state, record_id, file_name,
+             action_sequence, decision_action, retry_level, decision_source, outcome)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (fingerprint, error_type, fail_stage, page_state, record_id, file_name,
+              action_sequence, decision_action, retry_level, decision_source, outcome))
+        self._connection.commit()
+        return cursor.lastrowid
+
+    def update_experience_outcome(self, exp_id: int, outcome: str):
+        """
+        回填修复经验的最终结果
+
+        Args:
+            exp_id: 经验记录ID
+            outcome: 'success' / 'failed' / 'manual' / 'skip'
+        """
+        cursor = self._connection.cursor()
+        cursor.execute('''
+            UPDATE repair_experiences
+            SET outcome = ?, outcome_time = CURRENT_TIMESTAMP
+            WHERE id = ?
+        ''', (outcome, exp_id))
+        self._connection.commit()
+
+    def get_experiences_by_fingerprint(self, fingerprint: str, limit: int = 50) -> List[Dict]:
+        """
+        查询同指纹的历史经验（仅含已知成败结果的记录，近期优先）
+
+        Args:
+            fingerprint: 错误指纹
+            limit: 最大返回条数
+
+        Returns:
+            经验记录字典列表
+        """
+        cursor = self._connection.cursor()
+        cursor.execute('''
+            SELECT * FROM repair_experiences
+            WHERE fingerprint = ? AND outcome IN ('success', 'failed')
+            ORDER BY created_at DESC
+            LIMIT ?
+        ''', (fingerprint, limit))
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_experience_strategy_stats(self, fail_stage: str, error_type: str) -> List[Dict]:
+        """
+        按重试级别聚合 (fail_stage, error_type) 的历史成功率统计
+        用于动态修正 STRATEGY_MAP 静态映射
+
+        Args:
+            fail_stage: 失败阶段
+            error_type: 错误类型
+
+        Returns:
+            [{'retry_level': str, 'total': int, 'success_count': int}, ...]
+        """
+        cursor = self._connection.cursor()
+        cursor.execute('''
+            SELECT retry_level,
+                   COUNT(*) as total,
+                   SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) as success_count
+            FROM repair_experiences
+            WHERE fail_stage = ? AND error_type = ?
+              AND outcome IN ('success', 'failed')
+              AND retry_level IS NOT NULL
+            GROUP BY retry_level
+        ''', (fail_stage, error_type))
+        return [dict(row) for row in cursor.fetchall()]
 
     def get_failed_stats_by_period(self, start_time: str, end_time: str) -> Dict:
         """
