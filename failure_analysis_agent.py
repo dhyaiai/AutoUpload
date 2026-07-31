@@ -20,6 +20,7 @@ from deepseek_helper import DeepSeekHelper
 from react_loop import ReActLoop, tool
 from db_manager import DatabaseManager
 from config_manager import ConfigManager
+import run_logger
 from error_types import (
     UploadStage, ErrorCategory, ErrorType,
     classify_error, ERROR_CLASSIFICATION_RULES,
@@ -157,18 +158,20 @@ class FailureAnalysisAgent:
 3. 针对占比高的错误类型，用 drill_down_errors 深入分析具体案例
 4. 用 query_daily_trend 检查时间趋势，用 query_school_grade_stats 检查是否有特定学校/年级的问题
 5. 用 query_retry_effectiveness 评估自动重试的效果
-6. 收集到足够的洞察后，生成完整的 Markdown 报告，调用 save_report 保存
+6. 必须用 query_runtime_errors 查看软件运行日志中收集到的错误（即使数据库无失败记录，运行日志中也可能有错误），对这些错误进行归纳，分析出现原因和可能的修复方向
+7. 收集到足够的洞察后，生成完整的 Markdown 报告，调用 save_report 保存
 
 ## 报告要求
 
-报告必须包含以下六大部分：
+报告必须包含以下七大部分：
 
 ## 一、统计概览 — 总上传量、失败量、失败率、重试挽回数、待人工处理数
 ## 二、错误类型分布 — 一级+二级分类表格，Top 3 深度分析
 ## 三、分维度深度分析 — 3.1 时间趋势 3.2 学校年级分布 3.3 科目与文件格式
 ## 四、根因分析与迭代建议 — 基于数据的具体根因和可落地建议（每条至少2条建议）
-## 五、待人工处理清单 — 表格形式
-## 六、附录 — 生成时间、数据来源、统计周期
+## 五、运行日志错误分析 — 对运行日志收集到的错误分组归纳（表格：错误模式/分类/次数/首次末次时间），逐组分析错误出现的原因和可能的修复方向；若无错误则说明运行健康
+## 六、待人工处理清单 — 表格形式
+## 七、附录 — 生成时间、数据来源（SQLite upload_records 表 + logs/ 运行日志）、统计周期
 
 ## 输出格式
 
@@ -181,7 +184,7 @@ class FailureAnalysisAgent:
 - 先查询再得出结论，不要编造数据
 - 优化建议必须具体可执行，避免空话套话
 - Markdown 表格要对齐
-- 如果数据很少（无失败记录），生成简短的"无异常"报告即可"""
+- 即使数据库无失败记录，也必须检查运行日志错误；两者都无异常时，生成简短的“无异常”报告即可"""
 
     def _run_analysis_react_loop(self, start_time: str, end_time: str,
                                   report_type: str) -> Optional[str]:
@@ -302,6 +305,15 @@ class FailureAnalysisAgent:
                 "retry_count": r.get('retry_count', 0),
             } for r in pending]
 
+        @tool(description="查询运行日志中收集到的错误（已按同类消息聚合）。返回错误总数与分组列表（模式/分类/次数/首末次时间/样例）。无参数")
+        def tool_query_runtime_errors():
+            entries = run_logger.collect_errors(start_time, end_time)
+            groups = run_logger.aggregate_errors(entries, top_n=15)
+            return {
+                "total_errors": len(entries),
+                "error_groups": groups,
+            }
+
         @tool(description="保存最终 Markdown 报告到文件。参数: content=完整的Markdown报告内容",
               params={"content": "完整的Markdown报告内容"})
         def tool_save_report(content=""):
@@ -320,6 +332,7 @@ class FailureAnalysisAgent:
             tool_query_retry_effectiveness,
             tool_drill_down_errors,
             tool_query_manual_pending,
+            tool_query_runtime_errors,
             tool_save_report,
         ]
 
@@ -359,8 +372,9 @@ class FailureAnalysisAgent:
                     try:
                         with open(saved_path, 'r', encoding='utf-8') as f:
                             return f.read()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # AI 报告已保存但读回失败 → 会回退模板覆盖 AI 结果, 需留痕排查
+                        self._log(f"读取已保存的 AI 报告失败({saved_path}): {e}, 将回退模板重新生成")
             # save_report 未被调用 → 回退模板，不读取旧报告避免返回错误周期的数据
 
         self._log(f"AI Agent 分析失败(steps={result['steps']}), 回退模板")
@@ -415,6 +429,11 @@ class FailureAnalysisAgent:
 
         # 12. 文件格式分布（从文件扩展名推断）
         data['format_stats'] = self._analyze_file_formats(failed_records)
+
+        # 13. 运行日志错误（logs/ 目录初步收集的错误，聚合后供归纳分析）
+        runtime_entries = run_logger.collect_errors(start_time, end_time)
+        data['runtime_error_total'] = len(runtime_entries)
+        data['runtime_error_groups'] = run_logger.aggregate_errors(runtime_entries, top_n=15)
 
         return data
 
@@ -604,8 +623,11 @@ class FailureAnalysisAgent:
             lines.append("该周期内无失败数据，无需分析")
             lines.append("")
 
-        # ── 五、待人工处理清单 ──
-        lines.append("## 五、待人工处理清单")
+        # ── 五、运行日志错误分析 ──
+        lines.extend(self._build_runtime_error_section(data))
+
+        # ── 六、待人工处理清单 ──
+        lines.append("## 六、待人工处理清单")
         lines.append("")
         manual = data['manual_pending']
         if manual:
@@ -623,15 +645,97 @@ class FailureAnalysisAgent:
             lines.append("无待人工处理项目")
         lines.append("")
 
-        # ── 六、附录 ──
-        lines.append("## 六、附录")
+        # ── 七、附录 ──
+        lines.append("## 七、附录")
         lines.append("")
         lines.append(f"- 报告生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        lines.append(f"- 数据来源：SQLite upload_records 表")
+        lines.append(f"- 数据来源：SQLite upload_records 表 + logs/ 运行日志")
         lines.append(f"- 统计周期：{display_start} ~ {display_end}")
         lines.append("")
 
         return "\n".join(lines)
+
+    def _build_runtime_error_section(self, data: Dict) -> List[str]:
+        """
+        构建“运行日志错误分析”章节
+        先展示初步收集的错误分组表格，再由 LLM 归纳原因与修复方向（失败则规则兜底）
+        """
+        lines = []
+        lines.append("## 五、运行日志错误分析")
+        lines.append("")
+
+        total = data.get('runtime_error_total', 0)
+        groups = data.get('runtime_error_groups', [])
+
+        if not groups:
+            lines.append("该周期内运行日志未收集到错误，软件运行健康")
+            lines.append("")
+            return lines
+
+        lines.append(f"该周期内运行日志共收集到 {total} 条错误，归纳为 {len(groups)} 类：")
+        lines.append("")
+        lines.append("| 错误模式 | 分类 | 次数 | 首次出现 | 末次出现 |")
+        lines.append("| :--- | :--- | ---: | :--- | :--- |")
+        for g in groups:
+            lines.append(
+                f"| {self._e(g['pattern'])} | {self._e(g.get('category', ''))}"
+                f"/{self._e(g.get('error_type', ''))} | {g['count']} "
+                f"| {g.get('first_time', '')} | {g.get('last_time', '')} |")
+        lines.append("")
+
+        # LLM 归纳分析：错误原因 + 修复方向
+        ai_analysis = self._summarize_runtime_errors_llm(groups, total)
+        if ai_analysis:
+            lines.append("### 智能体归纳分析")
+            lines.append("")
+            lines.append(ai_analysis)
+        else:
+            # 规则兜底：基于错误类型给出预定义的原因与建议
+            lines.append("### 错误原因与修复方向（规则归纳）")
+            lines.append("")
+            seen_types = set()
+            for g in groups[:5]:
+                etype = g.get('error_type', 'unknown')
+                if etype in seen_types:
+                    continue
+                seen_types.add(etype)
+                desc = ERROR_DESCRIPTIONS.get(etype, ERROR_DESCRIPTIONS['unknown'])
+                sug = ERROR_SUGGESTIONS.get(etype, ERROR_SUGGESTIONS['unknown'])
+                lines.append(f"- **{desc[0]}**（{g['count']} 次）")
+                lines.append(f"  - 可能原因：{desc[1]}")
+                lines.append(f"  - 修复方向：{'；'.join(sug)}")
+        lines.append("")
+        return lines
+
+    def _summarize_runtime_errors_llm(self, groups: List[Dict],
+                                      total: int) -> Optional[str]:
+        """
+        调用 LLM 对运行日志错误进行归纳：分析出现原因与可能的修复方向
+
+        Returns:
+            Markdown 分析文本，LLM 不可用或调用失败返回 None
+        """
+        if not self.deepseek.api_key or not groups:
+            return None
+        try:
+            system_prompt = (
+                "你是一个作业自动上传软件的运维分析专家。用户会提供软件运行日志中收集的错误分组数据（JSON）。"
+                "请对这些错误进行归纳，输出 Markdown（不要代码块包裹）："
+                "按错误组逐一分析，每组包含：**错误归纳**（一句话概括）、**出现原因**（结合错误消息推断根因）、"
+                "**修复方向**（至少 2 条具体可执行的建议）。"
+                "同类错误可合并分析，优先分析高频错误，不要编造数据中不存在的信息。"
+            )
+            user_content = json.dumps({
+                "error_total": total,
+                "error_groups": groups,
+            }, ensure_ascii=False)
+            result = self.deepseek.chat(system_prompt, user_content)
+            if result and result.strip():
+                self._log("运行日志错误 LLM 归纳分析完成")
+                return result.strip()
+        except Exception as e:
+            self._log(f"运行日志错误 LLM 分析失败，使用规则兜底: {e}")
+        return None
 
     # ─── 报告文件管理 ───
 

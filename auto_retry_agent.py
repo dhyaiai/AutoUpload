@@ -371,8 +371,9 @@ class AutoRetryAgent:
                     # 标记为 pending 避免卡住
                     try:
                         self.db.update_retry_status(record['id'], 'pending')
-                    except Exception:
-                        pass
+                    except Exception as e2:
+                        # 回写失败会导致记录永久卡在 processing 状态, 必须留痕
+                        self._log(f"AutoRetryAgent: 回写重试状态失败, 记录 {record.get('id')} 可能卡在 processing - {e2}")
 
             # ── 汇总日志 ──
             if skipped_trip_count > 0:
@@ -2002,10 +2003,17 @@ Step 1: 按破坏性从小到大逐级试探，每次修复后必须 verify_reco
         避免之前级联失败触发的熔断继续拦截可恢复的待重试文件。
         同时清除 _session_lost 标志（成功上传证明会话正常）。
         """
+        counts = self.circuit_breaker.error_counts
+        had_state = (
+            self.circuit_breaker.global_tripped
+            or bool(self.circuit_breaker.get_tripped_types() & self._TRANSIENT_ERROR_TYPES)
+            or any(counts.get(et, 0) > 0 for et in self._TRANSIENT_ERROR_TYPES)
+        )
         for et in self._TRANSIENT_ERROR_TYPES:
             self.circuit_breaker.reset_error(et)
         self.circuit_breaker.reset_global_trip()
-        self._log("AutoRetryAgent: 上传成功，已重置临时性错误熔断（环境已恢复正常）")
+        if had_state:
+            self._log("AutoRetryAgent: 上传成功，已重置临时性错误熔断（环境已恢复正常）")
         # 成功上传证明会话正常，清除 session_lost 以避免阻塞后续任务
         if self.upload_processor is not None:
             self.upload_processor._session_lost.clear()

@@ -34,7 +34,6 @@ pyinstaller build.spec --clean
 echo.
 echo [4/4] 清理临时文件...
 if exist build rmdir /s /q build
-if exist *.spec del /q *.spec
 if exist __pycache__ rmdir /s /q __pycache__
 
 echo.

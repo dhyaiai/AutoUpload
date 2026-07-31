@@ -251,14 +251,14 @@ class MainApplication:
         self.grade_combo = ctk.CTkComboBox(
             row, width=110, height=34, corner_radius=8, state="readonly",
             font=theme.font(12), dropdown_font=theme.font(12),
-            values=['高一', '高二', '高三', '初一', '初二', '初三',
-                    '小一', '小二', '小三', '小四', '小五', '小六'],
+            values=['高三', '高二', '高一', '九年级', '八年级', '七年级',
+                    '六年级', '五年级', '四年级', '三年级', '二年级', '一年级'],
             fg_color=theme.CARD_INNER, border_color=theme.BORDER,
             button_color=theme.CARD_INNER, button_hover_color=theme.PRIMARY_SOFT,
             text_color=theme.TEXT, dropdown_fg_color=theme.CARD,
             dropdown_hover_color=theme.PRIMARY_SOFT,
             dropdown_text_color=theme.TEXT)
-        self.grade_combo.set('高一')
+        self.grade_combo.set('高三')
         self.grade_combo.pack(side="left", padx=(10, 24))
 
         theme.primary_button(row, "创建", self._create_folder,

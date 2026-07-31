@@ -63,14 +63,14 @@ class StatsPanel:
         # === 1. 数据报告区 ===
         self._create_action_bar()
 
-        # === 2. 柱状图: 作业上传数量 ===
+        # === 2. 上传记录表 ===
+        self._create_upload_table_section()
+
+        # === 3. 柱状图: 作业上传数量 ===
         self._create_bar_chart_section()
 
-        # === 3. 折线图: 作业上传趋势 ===
+        # === 4. 折线图: 作业上传趋势 ===
         self._create_line_chart_section()
-
-        # === 4. 上传记录表 ===
-        self._create_upload_table_section()
 
         # === 5. 失败记录表 ===
         self._create_failed_table_section()
@@ -203,19 +203,59 @@ class StatsPanel:
         self._refresh_line_chart()
 
     def _create_upload_table_section(self):
-        """上传记录表"""
-        card = self._new_card("上传记录")
+        """上传记录表(支持学校/年级/科目筛选，可勾选是否完成布置)"""
+        card = self._new_card("上传记录", "点击行末方框可勾选是否完成布置")
 
+        # 筛选行: 学校/年级/科目下拉框 + 导出按钮
         btn_row = ctk.CTkFrame(card, fg_color="transparent")
         btn_row.pack(fill="x", padx=20, pady=(0, 8))
+
+        self._filter_combos = {}
+        for field, label in (("school", "学校"), ("grade", "年级"), ("subject", "科目")):
+            ctk.CTkLabel(btn_row, text=label, font=theme.font(12),
+                         text_color=theme.TEXT_MUTED).pack(side="left", padx=(0, 6))
+            combo = ctk.CTkComboBox(
+                btn_row, width=120, height=30, corner_radius=8, state="readonly",
+                font=theme.font(12), dropdown_font=theme.font(12),
+                values=["全部"],
+                fg_color=theme.CARD_INNER, border_color=theme.BORDER,
+                button_color=theme.CARD_INNER, button_hover_color=theme.PRIMARY_SOFT,
+                text_color=theme.TEXT, dropdown_fg_color=theme.CARD,
+                dropdown_hover_color=theme.PRIMARY_SOFT,
+                command=lambda _v: self._refresh_upload_table())
+            combo.set("全部")
+            combo.pack(side="left", padx=(0, 14))
+            self._filter_combos[field] = combo
+
+        # 是否完成布置筛选(固定三项,不参与动态选项刷新)
+        ctk.CTkLabel(btn_row, text="布置", font=theme.font(12),
+                     text_color=theme.TEXT_MUTED).pack(side="left", padx=(0, 6))
+        self._assigned_combo = ctk.CTkComboBox(
+            btn_row, width=100, height=30, corner_radius=8, state="readonly",
+            font=theme.font(12), dropdown_font=theme.font(12),
+            values=["全部", "已完成", "未完成"],
+            fg_color=theme.CARD_INNER, border_color=theme.BORDER,
+            button_color=theme.CARD_INNER, button_hover_color=theme.PRIMARY_SOFT,
+            text_color=theme.TEXT, dropdown_fg_color=theme.CARD,
+            dropdown_hover_color=theme.PRIMARY_SOFT,
+            command=lambda _v: self._refresh_upload_table())
+        self._assigned_combo.set("全部")
+        self._assigned_combo.pack(side="left", padx=(0, 14))
+
         theme.ghost_button(btn_row, "导出到 Excel",
                            self._export_upload_table,
                            width=110).pack(side="right")
 
-        columns = ("file_name", "school", "grade", "subject", "upload_time")
-        headers = ("作业名称", "学校", "年级", "科目", "上传时间")
+        columns = ("file_name", "school", "grade", "subject", "upload_time", "assigned")
+        headers = ("作业名称", "学校", "年级", "科目", "上传时间", "是否完成布置")
         upload_frame, self._upload_tree = self._create_treeview(card, columns, headers, height=8)
         upload_frame.pack(fill="both", expand=True, padx=20, pady=(0, 18))
+
+        # 未勾选行红色、已勾选行绿色
+        self._upload_tree.tag_configure("unassigned", foreground=theme.DANGER)
+        self._upload_tree.tag_configure("assigned", foreground=theme.SUCCESS)
+        # 点击"是否完成布置"列切换勾选状态
+        self._upload_tree.bind("<Button-1>", self._on_upload_tree_click)
 
     def _create_failed_table_section(self):
         """失败记录表"""
@@ -250,6 +290,9 @@ class StatsPanel:
             elif col == "upload_time":
                 width = 150
                 anchor = "center"
+            elif col == "assigned":
+                width = 110
+                anchor = "center"
             else:
                 width = 100
                 anchor = "center"
@@ -258,6 +301,17 @@ class StatsPanel:
         sb = theme.attach_tree_scrollbar(tree_frame, tree)
         tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y", padx=(6, 0))
+
+        # 鼠标悬停在表格上时由表格自身滚动，返回"break"阻断事件
+        # 传递给外层CTkScrollableFrame，避免整个统计面板跟着滚动
+        def _on_mousewheel(event, t=tree):
+            first, last = t.yview()
+            if first <= 0.0 and last >= 1.0:
+                # 表格内容不足一屏，放行事件让外层面板滚动
+                return None
+            t.yview_scroll(-1 * (event.delta // 120), "units")
+            return "break"
+        tree.bind("<MouseWheel>", _on_mousewheel)
         return tree_frame, tree
 
     # ==================== 图表刷新 ====================
@@ -376,16 +430,83 @@ class StatsPanel:
 
     # ==================== 表格刷新 ====================
 
+    # 勾选框字符: □ 未勾选 / ☑ 已勾选
+    _CHECK_ON = "☑ 已完成"
+    _CHECK_OFF = "□ 未完成"
+
+    def _refresh_filter_options(self):
+        """刷新筛选下拉框的可选项(保留当前选中值)"""
+        options = self.db.get_analysis_filter_options()
+        for field, combo in self._filter_combos.items():
+            current = combo.get()
+            values = ["全部"] + options.get(field, [])
+            combo.configure(values=values)
+            if current not in values:
+                combo.set("全部")
+
     def _refresh_upload_table(self):
-        """刷新上传记录表（从分析表读取，数据持久不受上传记录清理影响）"""
+        """刷新上传记录表(从分析表读取，支持筛选，数据持久不受上传记录清理影响)"""
+        # 先刷新筛选项(首次或数据变化时)
+        if hasattr(self, "_filter_combos"):
+            self._refresh_filter_options()
+            filters = {}
+            for field, combo in self._filter_combos.items():
+                val = combo.get()
+                filters[field] = None if val == "全部" else val
+        else:
+            filters = {"school": None, "grade": None, "subject": None}
+
+        # 是否完成布置筛选: 全部=None / 已完成=True / 未完成=False
+        assigned_filter = None
+        if hasattr(self, "_assigned_combo"):
+            assigned_val = self._assigned_combo.get()
+            if assigned_val == "已完成":
+                assigned_filter = True
+            elif assigned_val == "未完成":
+                assigned_filter = False
+
         for item in self._upload_tree.get_children():
             self._upload_tree.delete(item)
-        records = self.db.get_all_analysis_records()
+        records = self.db.get_all_analysis_records(
+            school=filters["school"], grade=filters["grade"], subject=filters["subject"],
+            assigned=assigned_filter)
         for r in records:
-            self._upload_tree.insert("", "end", values=(
+            assigned = bool(r.get("assigned"))
+            tag = "assigned" if assigned else "unassigned"
+            self._upload_tree.insert("", "end", iid=str(r["id"]), tags=(tag,), values=(
                 r["file_name"], r["school"], r["grade"],
-                r["subject"], r["upload_time"]
+                r["subject"], r["upload_time"],
+                self._CHECK_ON if assigned else self._CHECK_OFF
             ))
+
+    def _on_upload_tree_click(self, event):
+        """点击"是否完成布置"列切换勾选状态"""
+        tree = self._upload_tree
+        if tree.identify_region(event.x, event.y) != "cell":
+            return
+        if tree.identify_column(event.x) != "#6":  # 第6列 assigned
+            return
+        item = tree.identify_row(event.y)
+        if not item:
+            return
+        try:
+            record_id = int(item)
+        except (TypeError, ValueError):
+            return
+        # 当前是否已勾选
+        is_assigned = "assigned" in tree.item(item, "tags")
+        new_state = not is_assigned
+        self.db.set_analysis_assigned(record_id, new_state)
+        # 布置筛选生效时，切换后该行可能不再满足筛选条件，直接刷新表格
+        if hasattr(self, "_assigned_combo") and self._assigned_combo.get() != "全部":
+            self._refresh_upload_table()
+            return "break"
+        # 更新行显示
+        values = list(tree.item(item, "values"))
+        values[5] = self._CHECK_ON if new_state else self._CHECK_OFF
+        tree.item(item, values=values,
+                  tags=("assigned" if new_state else "unassigned",))
+        return "break"
 
     def _refresh_failed_table(self):
         """刷新失败记录表（从分析表读取，数据持久保留不受上传记录清理影响）"""
@@ -419,7 +540,7 @@ class StatsPanel:
             ws.title = "上传记录"
 
             # 表头
-            headers = ["作业名称", "学校", "年级", "科目", "上传时间"]
+            headers = ["作业名称", "学校", "年级", "科目", "上传时间", "是否完成布置"]
             header_fill = PatternFill(start_color="5B7CFA", end_color="5B7CFA", fill_type="solid")
             header_font_white = Font(bold=True, size=11, color="FFFFFF")
 
@@ -441,6 +562,7 @@ class StatsPanel:
             ws.column_dimensions['C'].width = 10  # 年级
             ws.column_dimensions['D'].width = 10  # 科目
             ws.column_dimensions['E'].width = 22  # 上传时间
+            ws.column_dimensions['F'].width = 14  # 是否完成布置
 
             wb.save(path)
             count = len(self._upload_tree.get_children())

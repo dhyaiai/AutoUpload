@@ -19,6 +19,7 @@ from browser_automation import BrowserAutomation
 from gui_manager import MainApplication
 from auto_retry_agent import AutoRetryAgent
 from pipeline_watchdog import PipelineWatchdog
+from run_logger import init_run_logger, install_tk_exception_hook
 
 
 def backend_worker(stop_event: threading.Event, task_queue: Queue,
@@ -133,7 +134,8 @@ def main():
     task_queue = Queue()
 
     # 创建日志队列(用于后台向GUI发送日志)
-    log_queue = Queue()
+    # 使用 RunLogQueue: 日志同时写入 logs/ 目录的运行日志文件, 并自动收集错误
+    log_queue = init_run_logger()
 
     # 创建共享的上传处理器实例（唯一实例，供后台线程和GUI共同使用）
     upload_processor = UploadProcessor(task_queue, stop_event, log_queue)
@@ -157,6 +159,9 @@ def main():
         # 创建现代化根窗口（CTk圆角控件 + 文件拖拽支持）
         from ui_theme import create_root
         root = create_root()
+
+        # 捕获 GUI 事件回调中的未处理异常(tkinter 会拦截, 不触发 sys.excepthook)
+        install_tk_exception_hook(root)
 
         # 创建主应用窗口
         app = MainApplication(root, stop_event, task_queue, log_queue, upload_processor)

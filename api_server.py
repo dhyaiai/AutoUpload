@@ -58,7 +58,9 @@ async def lifespan(app: FastAPI):
     # --- 创建基础设施 ---
     stop_event = threading.Event()
     task_queue = Queue()
-    log_queue = Queue()
+    # 日志队列同时落盘到 logs/ 目录并自动收集错误
+    from run_logger import init_run_logger
+    log_queue = init_run_logger()
 
     # --- 创建 upload_temp 目录 ---
     upload_temp = os.path.abspath(config.upload_temp_dir)
@@ -212,6 +214,7 @@ async def submit_upload(
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: open(file_path, 'wb').write(content))
     except Exception as e:
+        print(f"API错误: 小程序上传文件保存失败 {original_name} - {e}")
         return api_response(code=1, msg=f"文件保存失败: {e}")
 
     # 写入待处理记录
@@ -227,6 +230,7 @@ async def submit_upload(
             source='miniprogram'
         )
     except Exception as e:
+        print(f"API错误: 小程序上传数据库写入失败 {original_name} - {e}")
         # 删除已保存的文件，避免磁盘残留
         try:
             os.remove(file_path)
@@ -391,6 +395,7 @@ async def generate_report(
         else:
             return api_response(code=1, msg="报告生成失败")
     except Exception as e:
+        print(f"API错误: 报告生成异常 - {e}")
         return api_response(code=1, msg=f"报告生成异常: {e}")
 
 
@@ -402,6 +407,7 @@ async def get_stats_overview():
         stats = db.get_stats_overview()
         return api_response(data=stats)
     except Exception as e:
+        print(f"API错误: 统计查询失败 - {e}")
         return api_response(code=1, msg=f"统计查询失败: {e}")
 
 

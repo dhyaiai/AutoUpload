@@ -38,6 +38,7 @@ env/
 
 # Logs
 *.log
+logs/
 
 # Configuration (包含敏感信息)
 config.json

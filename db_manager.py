@@ -97,7 +97,8 @@ class DatabaseManager:
                 status TEXT NOT NULL DEFAULT 'success',
                 error_message TEXT,
                 retry_count INTEGER DEFAULT 0,
-                upload_time DATETIME DEFAULT CURRENT_TIMESTAMP
+                upload_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+                assigned INTEGER DEFAULT 0            -- 是否完成布置: 0未勾选 1已勾选
             )
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_analysis_subject ON analysis_records(subject)')
@@ -154,6 +155,18 @@ class DatabaseManager:
                     cursor.execute(f"ALTER TABLE upload_records ADD COLUMN {col_name} {col_def}")
                 except Exception as e:
                     print(f"数据库迁移警告 (添加列 {col_name}): {e}")
+
+        # analysis_records 表迁移
+        analysis_columns = {
+            'assigned': 'INTEGER DEFAULT 0',
+        }
+        existing_analysis = {row[1] for row in cursor.execute("PRAGMA table_info(analysis_records)").fetchall()}
+        for col_name, col_def in analysis_columns.items():
+            if col_name not in existing_analysis:
+                try:
+                    cursor.execute(f"ALTER TABLE analysis_records ADD COLUMN {col_name} {col_def}")
+                except Exception as e:
+                    print(f"数据库迁移警告 (添加列 analysis_records.{col_name}): {e}")
     
     def add_record(self, file_name: str, file_path: str, folder_name: str,
                    school: str, grade: str, subject: str, 
@@ -376,6 +389,10 @@ class DatabaseManager:
             复制的记录数
         """
         cursor = self._connection.cursor()
+        # 保留已勾选"完成布置"的记录标记(按文件名+文件夹+上传时间匹配恢复)
+        assigned_keys = cursor.execute(
+            "SELECT file_name, folder_name, upload_time FROM analysis_records WHERE assigned = 1"
+        ).fetchall()
         cursor.execute("DELETE FROM analysis_records")
         cursor.execute('''
             INSERT INTO analysis_records
@@ -385,8 +402,14 @@ class DatabaseManager:
                    status, error_message, retry_count, upload_time
             FROM upload_records WHERE status = 'success'
         ''')
+        copied = cursor.rowcount
+        for key in assigned_keys:
+            cursor.execute('''
+                UPDATE analysis_records SET assigned = 1
+                WHERE file_name = ? AND folder_name = ? AND upload_time = ?
+            ''', (key[0], key[1], key[2]))
         self._connection.commit()
-        return cursor.rowcount
+        return copied
 
     def add_analysis_record(self, file_name: str, file_path: str, folder_name: str,
                             school: str, grade: str, subject: str,
@@ -425,13 +448,49 @@ class DatabaseManager:
         )
         return [dict(row) for row in cursor.fetchall()]
 
-    def get_all_analysis_records(self) -> List[Dict]:
-        """获取分析表中所有记录,按上传时间倒序"""
+    def get_all_analysis_records(self, school: str = None, grade: str = None,
+                                 subject: str = None,
+                                 assigned: bool = None) -> List[Dict]:
+        """获取分析表中所有记录,支持按学校/年级/科目/是否完成布置筛选,按上传时间倒序"""
+        conditions, params = [], []
+        if school:
+            conditions.append("school = ?")
+            params.append(school)
+        if grade:
+            conditions.append("grade = ?")
+            params.append(grade)
+        if subject:
+            conditions.append("subject = ?")
+            params.append(subject)
+        if assigned is not None:
+            conditions.append("assigned = ?")
+            params.append(1 if assigned else 0)
+        sql = "SELECT * FROM analysis_records"
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY upload_time DESC"
         cursor = self._connection.cursor()
-        cursor.execute(
-            "SELECT * FROM analysis_records ORDER BY upload_time DESC"
-        )
+        cursor.execute(sql, params)
         return [dict(row) for row in cursor.fetchall()]
+
+    def set_analysis_assigned(self, record_id: int, assigned: bool):
+        """更新分析表记录的"是否完成布置"勾选状态"""
+        cursor = self._connection.cursor()
+        cursor.execute("UPDATE analysis_records SET assigned = ? WHERE id = ?",
+                       (1 if assigned else 0, record_id))
+        self._connection.commit()
+
+    def get_analysis_filter_options(self) -> Dict[str, List[str]]:
+        """获取分析表中学校/年级/科目的去重取值列表,用于筛选下拉框"""
+        cursor = self._connection.cursor()
+        options = {}
+        for field in ("school", "grade", "subject"):
+            cursor.execute(
+                f"SELECT DISTINCT {field} FROM analysis_records "
+                f"WHERE {field} IS NOT NULL AND {field} != '' ORDER BY {field}"
+            )
+            options[field] = [row[0] for row in cursor.fetchall()]
+        return options
 
     def get_failed_records_for_stats(self) -> List[Dict]:
         """获取失败记录的关键字段,用于统计面板显示(从分析表读取,持久保留)"""

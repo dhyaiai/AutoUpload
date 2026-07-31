@@ -127,6 +127,11 @@ class BrowserAutomation:
                 options = ChromeOptions()
                 options.page_load_strategy = "eager"  # DOM就绪即返回，不等图片加载
                 options.add_argument('--start-maximized')  # 最大化窗口
+                # 防止窗口最小化/被遮挡时 Chrome 暂停渲染与 rAF 节流
+                # （否则 Element UI 下拉菜单展开动画永远完不成，visibility 等待全部超时）
+                options.add_argument('--disable-background-timer-throttling')
+                options.add_argument('--disable-backgrounding-occluded-windows')
+                options.add_argument('--disable-renderer-backgrounding')
 
                 # 持久化用户数据目录：浏览器重启后保留登录 Cookie，跳过重新登录
                 profile_dir = self.config.chrome_profile_dir
@@ -504,6 +509,8 @@ class BrowserAutomation:
     def check_and_switch_school(self, target_school: str) -> bool:
         try:
             self.update_activity_time()
+            # 窗口最小化会导致页面渲染暂停、下拉菜单无法展开，先恢复窗口
+            self._ensure_window_visible()
             self._log(f"正在校验学校: {target_school}")
             self._log(f"当前页面URL: {self.driver.current_url}")
 
@@ -1528,6 +1535,8 @@ class BrowserAutomation:
         """
         try:
             self.last_upload_error = ""  # 每次上传前重置错误记录
+            # 窗口最小化会导致渲染暂停、弹窗/下拉交互失效，先恢复窗口
+            self._ensure_window_visible()
             display_name = re.sub(r'^[0-9a-f]{32}_', '', os.path.basename(file_path))
             self._log(f"开始上传: {display_name} (学校={school}, 年级={grade}, 科目={subject})")
 
@@ -2595,7 +2604,39 @@ class BrowserAutomation:
         每次成功执行操作后调用,用于空闲超时检测
         """
         self.last_active_time = time.time()
-    
+
+    def _ensure_window_visible(self):
+        """
+        检测浏览器窗口是否被最小化，是则通过 CDP 恢复为正常/最大化状态。
+        背景：Chrome 窗口最小化后会暂停渲染与 requestAnimationFrame，
+        Element UI 的下拉菜单/弹窗展开动画永远无法完成，导致所有
+        visibility 等待超时（表现为"4种方案均无法打开教师下拉菜单"）。
+        """
+        if not self.driver:
+            return
+        try:
+            win = self.driver.execute_cdp_cmd("Browser.getWindowForTarget", {})
+            window_id = win.get("windowId")
+            state = win.get("bounds", {}).get("windowState", "normal")
+            if state == "minimized":
+                self._log("检测到浏览器窗口已最小化，正在恢复窗口...")
+                # CDP 要求先恢复为 normal，再切换到 maximized
+                self.driver.execute_cdp_cmd(
+                    "Browser.setWindowBounds",
+                    {"windowId": window_id, "bounds": {"windowState": "normal"}})
+                self.driver.execute_cdp_cmd(
+                    "Browser.setWindowBounds",
+                    {"windowId": window_id, "bounds": {"windowState": "maximized"}})
+                time.sleep(0.3)  # 等待窗口恢复渲染
+                self._log("浏览器窗口已恢复")
+        except Exception as e:
+            # 非致命：CDP 不可用时退回 Selenium 原生方法尝试
+            try:
+                self.driver.maximize_window()
+            except Exception:
+                pass
+            self._log(f"窗口状态检测/恢复异常(非致命): {e}")
+
     def is_idle_for(self, seconds: float) -> bool:
         """
         检查浏览器是否已空闲超过指定秒数
