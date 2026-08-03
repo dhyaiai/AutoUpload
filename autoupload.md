@@ -192,7 +192,7 @@ regex
 | :------- | :------------ | :--------------------------------------------------- |
 | `.txt`   | 内置 `open`   | `f.read(200)`                                        |
 | `.docx`  | `python-docx` | 遍历段落累加文本至 ≥200 字                           |
-| `.pdf`   | `pdfplumber`  | 逐页提取文本累加至 ≥200 字                           |
+| `.pdf`   | `pypdf`  | 逐页提取文本累加至 ≥200 字                           |
 | 其他格式 | —             | 返回空文本，科目标记为“未知”，上传后作为失败记录处理 |
 
 ### 3.4 AI 科目识别
@@ -367,7 +367,7 @@ json
 | :----------- | :----------------------------------- |
 | 桌面 GUI     | Python tkinter                       |
 | 文件监控     | watchdog                             |
-| 文档内容读取 | python-docx (docx), pdfplumber (pdf) |
+| 文档内容读取 | python-docx (docx), pypdf (pdf) |
 | AI 科目识别  | DeepSeek Chat API (requests)         |
 | 浏览器自动化 | Selenium WebDriver + Chrome          |
 | 数据库       | SQLite3 (Python 内置)                |
@@ -382,7 +382,7 @@ json
    bash
 
    ```
-   pip install watchdog python-docx pdfplumber selenium requests pyinstaller
+   pip install watchdog python-docx pypdf selenium requests pyinstaller
    ```
 
    

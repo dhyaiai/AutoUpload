@@ -222,35 +222,38 @@ class InfoExtractor:
     def _read_pdf(file_path: str) -> str:
         """
         读取PDF文件的前200个字符
-        使用pdfplumber库逐页读取,累加到200字符
-        
+        使用pypdf库逐页读取,累加到200字符
+
         Args:
             file_path: PDF文件路径
-        
+
         Returns:
             前200个字符
         """
         try:
-            import pdfplumber
-            
+            from pypdf import PdfReader
+
             text_parts = []
             current_length = 0
-            
-            # 打开PDF文件
-            with pdfplumber.open(file_path) as pdf:
-                # 逐页提取文本
-                for page in pdf.pages:
-                    page_text = page.extract_text()
-                    if page_text:
-                        text_parts.append(page_text)
-                        current_length += len(page_text)
-                        if current_length >= InfoExtractor.TEXT_EXTRACT_LENGTH:
-                            break
-            
+
+            # 打开PDF文件(pypdf无上下文管理器)
+            reader = PdfReader(file_path)
+            # 逐页提取文本(pypdf的extract_text()可能返回None)
+            for page in reader.pages:
+                page_text = page.extract_text() or ""
+                if page_text:
+                    text_parts.append(page_text)
+                    current_length += len(page_text)
+                    if current_length >= InfoExtractor.TEXT_EXTRACT_LENGTH:
+                        break
+
             # 合并所有文本并截取前200字符
             full_text = ''.join(text_parts)
             return full_text[:InfoExtractor.TEXT_EXTRACT_LENGTH]
-        
+
         except ImportError:
-            print("错误: 未安装pdfplumber库,请运行: pip install pdfplumber")
+            print("错误: 未安装pypdf库,请运行: pip install pypdf")
+            return ""
+        except Exception as e:
+            print(f"错误: 读取PDF文件失败 {file_path} - {e}")
             return ""

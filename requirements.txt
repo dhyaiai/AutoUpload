@@ -12,9 +12,8 @@ watchdog>=3.0.0
 
 # 文档解析
 python-docx>=0.8.11    # .docx文件解析
-pdfplumber>=0.9.0      # .pdf文件解析
 olefile>=0.47          # .doc文件解析(Word 97-2003 OLE2格式)
-pypdf>=3.0.0           # PDF文件合并
+pypdf>=3.0.0           # .pdf文件解析与合并
 pywin32>=305           # Windows COM自动化(Word文档合并)
 
 # HTTP请求(AI科目识别)
@@ -31,8 +30,7 @@ Pillow>=10.0.0         # 托盘图标生成
 tkinterdnd2>=0.3.0     # 拖拽文件上传支持
 customtkinter>=5.2.0   # 现代化圆角UI控件库
 
-# 数据可视化与统计
-matplotlib>=3.7.0
+# 数据导出
 openpyxl>=3.1.0
 
 # Web API 服务（微信小程序对接）

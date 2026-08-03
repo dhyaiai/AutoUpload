@@ -156,7 +156,7 @@ pyinstaller --onefile --windowed --name "作业自动上传工具" main.py
 |------|---------|
 | GUI界面 | Python tkinter + ttk |
 | 文件监控 | watchdog |
-| 文档读取 | python-docx, pdfplumber |
+| 文档读取 | python-docx, pypdf |
 | AI识别 | DeepSeek Chat API |
 | 浏览器自动化 | Selenium WebDriver + Chrome |
 | 数据库 | SQLite3 |

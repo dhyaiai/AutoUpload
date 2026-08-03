@@ -1,18 +1,15 @@
 """
 作业上传数据统计面板模块
 功能: 提供数据报告、柱状图、折线图、上传记录表、失败记录表及Excel导出
-技术: customtkinter + matplotlib + openpyxl (卡片化布局 + 扁平化图表)
+技术: customtkinter + tkinter.Canvas + openpyxl (卡片化布局 + 扁平化图表)
 """
 import os
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, messagebox, filedialog
 from datetime import datetime, timedelta
 
 import customtkinter as ctk
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.ticker import MaxNLocator
-import matplotlib.pyplot as plt
 
 import ui_theme as theme
 
@@ -32,23 +29,17 @@ class StatsPanel:
         self._bar_mode = "subject"       # "subject" | "school_grade"
         self._line_mode = "daily"        # "daily" | "weekly" | "monthly"
 
-        # matplotlib figure 引用(用于内存清理)
-        self._bar_figure = None
-        self._line_figure = None
+        # 图表画布与重绘状态
         self._bar_canvas = None
         self._line_canvas = None
-
-        # 中文字体
-        self._setup_chinese_font()
+        self._bar_after_id = None
+        self._line_after_id = None
+        # 页面隐藏时 winfo_width() 返回1,用上次有效宽度兜底(默认800)
+        self._chart_widths = {"bar": 800, "line": 800}
+        self._measure_fonts = {}
 
         # 构建界面
         self._create_widgets()
-
-    @staticmethod
-    def _setup_chinese_font():
-        """配置matplotlib中文字体(与全局UI字体保持一致)"""
-        plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'WenQuanYi Micro Hei', 'Arial Unicode MS']
-        plt.rcParams['axes.unicode_minus'] = False
 
     # ==================== 界面构建 ====================
 
@@ -78,6 +69,9 @@ class StatsPanel:
         # 初始加载表格数据
         self._refresh_upload_table()
         self._refresh_failed_table()
+
+        # 修复滚动残影(在表格创建完成后绑定)
+        self._bind_scroll_ghost_fix()
 
     def _new_card(self, title: str, subtitle: str = None):
         """创建一张带标题的卡片并返回卡片容器"""
@@ -172,10 +166,10 @@ class StatsPanel:
         self._bar_segment.set("按科目")
         self._bar_segment.pack(anchor="w", padx=20, pady=(0, 8))
 
-        self._bar_figure = Figure(figsize=(8, 3.5), dpi=100,
-                                  facecolor=theme.CARD)
-        self._bar_canvas = FigureCanvasTkAgg(self._bar_figure, master=card)
-        self._bar_canvas.get_tk_widget().pack(fill="x", padx=20, pady=(0, 18))
+        self._bar_canvas = tk.Canvas(card, height=350, bg=theme.CARD,
+                                     bd=0, highlightthickness=0)
+        self._bar_canvas.pack(fill="x", padx=20, pady=(0, 18))
+        self._bar_canvas.bind("<Configure>", self._on_bar_resize)
 
         # 初始尝试加载数据
         self._refresh_bar_chart()
@@ -195,10 +189,10 @@ class StatsPanel:
         self._line_segment.set("按日")
         self._line_segment.pack(anchor="w", padx=20, pady=(0, 8))
 
-        self._line_figure = Figure(figsize=(8, 3.5), dpi=100,
-                                   facecolor=theme.CARD)
-        self._line_canvas = FigureCanvasTkAgg(self._line_figure, master=card)
-        self._line_canvas.get_tk_widget().pack(fill="x", padx=20, pady=(0, 18))
+        self._line_canvas = tk.Canvas(card, height=350, bg=theme.CARD,
+                                      bd=0, highlightthickness=0)
+        self._line_canvas.pack(fill="x", padx=20, pady=(0, 18))
+        self._line_canvas.bind("<Configure>", self._on_line_resize)
 
         self._refresh_line_chart()
 
@@ -314,6 +308,40 @@ class StatsPanel:
         tree.bind("<MouseWheel>", _on_mousewheel)
         return tree_frame, tree
 
+    # ==================== 滚动残影修复 ====================
+
+    def _bind_scroll_ghost_fix(self):
+        """
+        修复 Windows 下滚动统计面板时表格区域出现残影的问题
+
+        根因: CTkScrollableFrame 通过移动内部 canvas window item 滚动整个
+        内容区, 滚动过程中 ttk.Treeview 未能及时全量重绘, 旧内容残留形成残影。
+        修复: 在滚轮滚动与滚动条拖动之后强制 update_idletasks() 完成重绘。
+        """
+        trees = (self._upload_tree, self._failed_tree)
+
+        def _redraw(_event=None):
+            for t in trees:
+                try:
+                    t.update_idletasks()
+                except Exception:
+                    pass
+
+        # 滚轮: CTkScrollableFrame 通过 bind_all 全局处理滚轮事件,
+        # 内部滚动回调先注册先执行, 我们的回调追加在其后触发重绘
+        try:
+            self.root.bind_all("<MouseWheel>", _redraw, add="+")
+        except Exception:
+            pass
+        # 拖动滚动条: CTkScrollbar 内部在 _canvas 上处理 B1-Motion/点击
+        sbar = getattr(self._scroll, "_scrollbar", None)
+        if sbar is not None:
+            for seq in ("<B1-Motion>", "<Button-1>", "<ButtonRelease-1>"):
+                try:
+                    sbar.bind(seq, _redraw, add=True)
+                except Exception:
+                    pass
+
     # ==================== 图表刷新 ====================
 
     def _on_bar_segment_change(self, value: str):
@@ -327,106 +355,179 @@ class StatsPanel:
         self._line_mode = mapping.get(value, "daily")
         self._refresh_line_chart()
 
+    # ==================== Canvas 图表绘制 ====================
+
+    # 绘图区边距(像素): 左(y轴刻度)/右/上(标题)/下(基础,45°x标签时自适应加高)
+    _CHART_H = 350
+    _M_LEFT = 44
+    _M_RIGHT = 12
+    _M_TOP = 34
+    _M_BOTTOM_BASE = 46
+
+    def _chart_width(self, key: str) -> int:
+        """取画布当前宽度;页面隐藏时(winfo_width()==1)用上次有效宽度兜底"""
+        cv = self._bar_canvas if key == "bar" else self._line_canvas
+        w = cv.winfo_width()
+        if w >= 50:
+            self._chart_widths[key] = w
+        return self._chart_widths[key]
+
+    def _measure(self, text: str, size: int) -> int:
+        """测量文本像素宽度(字体按点尺寸与create_text一致,缓存避免反复创建)"""
+        f = self._measure_fonts.get(size)
+        if f is None:
+            f = tkfont.Font(family=theme.FONT_FAMILY, size=size)
+            self._measure_fonts[size] = f
+        return f.measure(text)
+
+    def _plot_rect(self, width: int, labels):
+        """计算绘图区 (x0, x1, y0, y1);底部边距按最长标签自适应(45°旋转水平投影≈0.71×字宽)"""
+        max_w = max((self._measure(lbl, 8) for lbl in labels), default=0)
+        m_bottom = min(96, max(self._M_BOTTOM_BASE, 30 + int(max_w * 0.71)))
+        return self._M_LEFT, width - self._M_RIGHT, self._M_TOP, self._CHART_H - m_bottom
+
     @staticmethod
-    def _style_axes(ax):
-        """扁平化坐标轴样式: 去顶右边框、浅色网格、灰色刻度文字"""
-        ax.set_facecolor(theme.CARD)
-        for side in ("top", "right"):
-            ax.spines[side].set_visible(False)
-        for side in ("left", "bottom"):
-            ax.spines[side].set_color(theme.BORDER)
-        ax.tick_params(colors=theme.TEXT_MUTED, labelsize=8, length=0)
-        ax.yaxis.grid(True, color=theme.BORDER, linewidth=0.8, alpha=0.6)
-        ax.set_axisbelow(True)
+    def _nice_y_max(raw: int) -> int:
+        """y轴最大值取整(1/2/5×10^n 步进,保证刻度为整数),最小5"""
+        if raw <= 0:
+            return 5
+        exp = 10 ** (len(str(int(raw))) - 1)
+        for factor in (1, 2, 5, 10):
+            nice = factor * exp
+            if nice >= raw:
+                return max(nice, 5)
+        return max(10 * exp, 5)
+
+    def _draw_axes(self, cv, width, title, labels, y_max):
+        """绘制标题、网格线、y轴刻度与"上传数量"标签,返回绘图区坐标"""
+        x0, x1, y0, y1 = self._plot_rect(width, labels)
+        n_ticks = 5
+        # 网格线先画(数据绘制在其上);i==0 的线兼作x轴
+        for i in range(n_ticks + 1):
+            y = y1 - (i / n_ticks) * (y1 - y0)
+            cv.create_line(x0, y, x1, y, fill=theme.BORDER, width=1)
+            cv.create_text(x0 - 8, y, text=str(int(round(i * y_max / n_ticks))),
+                           anchor="e", font=(theme.FONT_FAMILY, 8), fill=theme.TEXT_MUTED)
+        cv.create_line(x0, y0, x0, y1, fill=theme.BORDER, width=1)  # 左侧轴
+        cv.create_text(12, (y0 + y1) / 2, text="上传数量", angle=90, anchor="center",
+                       font=(theme.FONT_FAMILY, 9), fill=theme.TEXT_MUTED)
+        cv.create_text(width / 2, 18, text=title, anchor="center",
+                       font=(theme.FONT_FAMILY, 10), fill=theme.TEXT)
+        return x0, x1, y0, y1
+
+    @staticmethod
+    def _draw_x_label(cv, cx, y1, label):
+        """x轴标签45°右对齐(Tk 8.6 canvas text支持angle);若出现镜像文字,改为angle=45, anchor="ne" """
+        cv.create_text(cx, y1 + 6, text=label, angle=-45, anchor="se",
+                       font=(theme.FONT_FAMILY, 8), fill=theme.TEXT_MUTED)
+
+    def _draw_empty(self, cv, width):
+        """空数据: 居中"暂无数据"提示"""
+        cv.create_text(width / 2, self._CHART_H / 2, text="暂无数据", anchor="center",
+                       font=(theme.FONT_FAMILY, 13), fill=theme.TEXT_FAINT)
+
+    def _on_bar_resize(self, event):
+        """窗口尺寸变化防抖重绘(100ms)"""
+        if event.width < 50:
+            return
+        if self._bar_after_id is not None:
+            self.root.after_cancel(self._bar_after_id)
+        self._bar_after_id = self.root.after(100, self._refresh_bar_chart)
+
+    def _on_line_resize(self, event):
+        """窗口尺寸变化防抖重绘(100ms)"""
+        if event.width < 50:
+            return
+        if self._line_after_id is not None:
+            self.root.after_cancel(self._line_after_id)
+        self._line_after_id = self.root.after(100, self._refresh_line_chart)
 
     def _refresh_bar_chart(self):
-        """重绘柱状图"""
-        if self._bar_mode == "subject":
-            data = self.db.get_upload_count_by_subject()
-            title = "各科目上传数量统计"
-        else:
-            data = self.db.get_upload_count_by_school_grade()
-            title = "各学校年级上传数量统计"
+        """重绘柱状图(纯tkinter Canvas)"""
+        try:
+            if self._bar_mode == "subject":
+                data = self.db.get_upload_count_by_subject()
+                title = "各科目上传数量统计"
+            else:
+                data = self.db.get_upload_count_by_school_grade()
+                title = "各学校年级上传数量统计"
 
-        self._bar_figure.clear()
-        ax = self._bar_figure.add_subplot(111)
+            cv = self._bar_canvas
+            width = self._chart_width("bar")
+            cv.delete("all")
 
-        if not data:
-            ax.text(0.5, 0.5, "暂无数据", ha="center", va="center",
-                    fontsize=13, color=theme.TEXT_FAINT, transform=ax.transAxes)
-            ax.axis("off")
-            self._bar_figure.tight_layout()
-            self._bar_canvas.draw()
-            return
+            if not data:
+                self._draw_empty(cv, width)
+                return
 
-        if self._bar_mode == "subject":
-            labels = [d["subject"] for d in data]
-        else:
-            labels = [f"{d['school']}{d['grade']}" for d in data]
-        counts = [d["count"] for d in data]
+            if self._bar_mode == "subject":
+                labels = [d["subject"] for d in data]
+            else:
+                labels = [f"{d['school']}{d['grade']}" for d in data]
+            counts = [d["count"] for d in data]
 
-        self._style_axes(ax)
-        bars = ax.bar(range(len(labels)), counts, color=theme.PRIMARY,
-                      width=0.55, zorder=3)
-        ax.set_xticks(range(len(labels)))
-        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
-        ax.set_ylabel("上传数量", fontsize=9, color=theme.TEXT_MUTED)
-        ax.yaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
-        ax.set_title(title, fontsize=10, color=theme.TEXT, pad=10)
+            y_max = self._nice_y_max(max(counts))
+            x0, x1, y0, y1 = self._draw_axes(cv, width, title, labels, y_max)
 
-        # 柱顶数值标签
-        for bar, count in zip(bars, counts):
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
-                    str(count), ha="center", va="bottom", fontsize=8,
-                    color=theme.TEXT_MUTED)
-
-        self._bar_figure.tight_layout()
-        self._bar_canvas.draw()
+            n = len(labels)
+            slot = (x1 - x0) / n
+            bar_w = slot * 0.55
+            for i, (label, count) in enumerate(zip(labels, counts)):
+                cx = x0 + slot * i + slot / 2
+                top = y1 - (count / y_max) * (y1 - y0)
+                cv.create_rectangle(cx - bar_w / 2, top, cx + bar_w / 2, y1,
+                                    fill=theme.PRIMARY, outline="")
+                cv.create_text(cx, top - 4, text=str(count), anchor="s",
+                               font=(theme.FONT_FAMILY, 8), fill=theme.TEXT_MUTED)
+                self._draw_x_label(cv, cx, y1, label)
+        except Exception as e:
+            print(f"统计面板柱状图绘制失败: {e}")
 
     def _refresh_line_chart(self):
-        """重绘折线图"""
-        data = self.db.get_upload_count_by_date(self._line_mode)
+        """重绘折线图(纯tkinter Canvas)"""
+        try:
+            data = self.db.get_upload_count_by_date(self._line_mode)
 
-        self._line_figure.clear()
-        ax = self._line_figure.add_subplot(111)
+            cv = self._line_canvas
+            width = self._chart_width("line")
+            cv.delete("all")
 
-        if not data:
-            ax.text(0.5, 0.5, "暂无数据", ha="center", va="center",
-                    fontsize=13, color=theme.TEXT_FAINT, transform=ax.transAxes)
-            ax.axis("off")
-            self._line_figure.tight_layout()
-            self._line_canvas.draw()
-            return
+            if not data:
+                self._draw_empty(cv, width)
+                return
 
-        labels = [d["date_label"] for d in data]
-        counts = [d["count"] for d in data]
+            labels = [d["date_label"] for d in data]
+            counts = [d["count"] for d in data]
+            mode_title = {"daily": "每日", "weekly": "每周", "monthly": "每月"}
+            title = f"作业上传趋势 ({mode_title[self._line_mode]})"
 
-        mode_title = {"daily": "每日", "weekly": "每周", "monthly": "每月"}
+            y_max = self._nice_y_max(max(counts))
+            x0, x1, y0, y1 = self._draw_axes(cv, width, title, labels, y_max)
 
-        self._style_axes(ax)
-        ax.plot(range(len(labels)), counts, marker="o", linestyle="-",
-                color=theme.PRIMARY, linewidth=1.6, markersize=4, zorder=3)
-        ax.fill_between(range(len(labels)), counts, alpha=0.10,
-                        color=theme.PRIMARY, zorder=2)
-        ax.set_xticks(range(len(labels)))
+            n = len(labels)
+            xs = ([x0 + i * (x1 - x0) / (n - 1) for i in range(n)]
+                  if n > 1 else [(x0 + x1) / 2])
+            ys = [y1 - (c / y_max) * (y1 - y0) for c in counts]
 
-        # 标签过多时每隔N个显示一个
-        n = max(1, len(labels) // 20)
-        visible_labels = [label if i % n == 0 else "" for i, label in enumerate(labels)]
-        ax.set_xticklabels(visible_labels, rotation=45, ha="right", fontsize=8)
+            # 面积填充: PRIMARY_SOFT 恰为 PRIMARY 10%透明度叠加白色
+            cv.create_polygon([(x0, y1)] + list(zip(xs, ys)) + [(xs[-1], y1)],
+                              fill=theme.PRIMARY_SOFT, outline="")
+            # 单点时create_line需至少2个点,跳过(仍显示圆点与数值)
+            if n > 1:
+                cv.create_line([p for pair in zip(xs, ys) for p in pair],
+                               fill=theme.PRIMARY, width=1.6)
 
-        ax.set_ylabel("上传数量", fontsize=9, color=theme.TEXT_MUTED)
-        ax.yaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
-        ax.set_title(f"作业上传趋势 ({mode_title[self._line_mode]})",
-                     fontsize=10, color=theme.TEXT, pad=10)
-
-        # 数值标注
-        for i, (x, y) in enumerate(zip(range(len(labels)), counts)):
-            ax.text(x, y + 0.3, str(y), ha="center", va="bottom", fontsize=7,
-                    color=theme.TEXT_MUTED)
-
-        self._line_figure.tight_layout()
-        self._line_canvas.draw()
+            # 标签过多时每隔N个显示一个(与matplotlib版一致)
+            step = max(1, n // 20)
+            for i, (x, y) in enumerate(zip(xs, ys)):
+                cv.create_oval(x - 2, y - 2, x + 2, y + 2,
+                               fill=theme.PRIMARY, outline="")
+                cv.create_text(x, y - 6, text=str(counts[i]), anchor="s",
+                               font=(theme.FONT_FAMILY, 7), fill=theme.TEXT_MUTED)
+                if i % step == 0:
+                    self._draw_x_label(cv, x, y1, labels[i])
+        except Exception as e:
+            print(f"统计面板折线图绘制失败: {e}")
 
     # ==================== 表格刷新 ====================
 
@@ -619,10 +720,19 @@ class StatsPanel:
     # ==================== 资源清理 ====================
 
     def destroy(self):
-        """释放matplotlib figure资源"""
-        if self._bar_figure is not None:
-            plt.close(self._bar_figure)
-            self._bar_figure = None
-        if self._line_figure is not None:
-            plt.close(self._line_figure)
-            self._line_figure = None
+        """取消待定重绘、解绑事件并清空画布(窗口随后整体销毁)"""
+        for key in ("_bar_after_id", "_line_after_id"):
+            after_id = getattr(self, key, None)
+            if after_id:
+                try:
+                    self.root.after_cancel(after_id)
+                except Exception:
+                    pass
+                setattr(self, key, None)
+        for cv in (self._bar_canvas, self._line_canvas):
+            if cv is not None:
+                try:
+                    cv.unbind("<Configure>")
+                    cv.delete("all")
+                except Exception:
+                    pass

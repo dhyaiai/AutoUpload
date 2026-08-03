@@ -141,7 +141,7 @@ UploadProcessor 每个阶段调用 `heartbeat.beat(stage, file)` 上报心跳，
 | `db_manager.py` | SQLite，`upload_records` + `analysis_records` + `repair_experiences` 三表，`check_same_thread=False`。分析表支持按科目/学校年级/日期聚合查询。Agent 通过工具函数查询/更新失败记录 |
 | `config_manager.py` | 处理 PyInstaller 打包路径（`sys._MEIPASS`），`@property` 暴露配置项，自动清理 Unicode 控制字符 |
 | `file_merger.py` | 试题+答案合并（试题在前，分页符分隔，答案在后）。.doc/.docx 用 Word COM（支持 MS Word / WPS），.pdf 用 pypdf |
-| `stats_panel.py` | 数据统计页：matplotlib 柱状图（按科目/学校年级切换）+ 折线图（按日/周/月聚合）+ 上传/失败记录表 + openpyxl Excel 导出 + 失败分析报告入口 |
+| `stats_panel.py` | 数据统计页：tkinter Canvas 自绘柱状图（按科目/学校年级切换）+ 折线图（按日/周/月聚合）+ 上传/失败记录表 + openpyxl Excel 导出 + 失败分析报告入口 |
 | `main.py` | 入口，协调线程启停。`--api-only` 参数切换到纯 API 模式。优雅退出：等队列清空（最多30秒）→ 停监控 → 关浏览器 → 关数据库 |
 
 ### Element UI 适配策略（browser_automation.py）

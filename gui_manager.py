@@ -1132,7 +1132,7 @@ class MainApplication:
     def _perform_exit(self):
         """统一的退出流程：设停止信号、等队列清空、在主线程中销毁窗口"""
         self.stop_event.set()
-        # 清理matplotlib资源（线程安全：在事件循环线程中执行）
+        # 清理统计面板资源（线程安全：在事件循环线程中执行）
         if hasattr(self, 'stats_panel'):
             try:
                 self.stats_panel.destroy()

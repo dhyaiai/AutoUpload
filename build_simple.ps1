@@ -19,7 +19,7 @@ Write-Host ""
 
 # Install dependencies
 Write-Host "[2/3] Installing dependencies..." -ForegroundColor Yellow
-pip install pyinstaller selenium watchdog python-docx pdfplumber requests
+pip install pyinstaller selenium watchdog python-docx pypdf requests
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: Failed to install dependencies!" -ForegroundColor Red
     Read-Host "Press Enter to exit"
