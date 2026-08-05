@@ -5,7 +5,9 @@ GUI管理界面模块
 支持:关闭窗口时最小化到系统托盘
 """
 import os
+import json
 import shutil
+import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from queue import Queue, Empty
@@ -60,6 +62,10 @@ class MainApplication:
         self.tray_icon = None
         self.tray_thread = None
         self._tray_setup_done = False
+        self._tray_ready = threading.Event()  # 托盘图标创建完成信号（NIM_ADD 完成后置位）
+
+        # 批次完成通知窗口（自绘右下角置顶 toast，不依赖系统通知）
+        self._batch_toast = None
 
         # 当前页面: "upload" | "stats"
         self._current_page = "upload"
@@ -1015,6 +1021,11 @@ class MainApplication:
                         self._set_browser_status("disconnected")
                     continue
 
+                if message.startswith("BATCH_DONE:"):
+                    # 批次上传完成 → 右下角托盘气泡通知
+                    self._notify_batch_done(message[len("BATCH_DONE:"):])
+                    continue
+
                 # 显示日志消息
                 self.log_text.configure(state="normal")
 
@@ -1064,6 +1075,172 @@ class MainApplication:
 
     # ==================== 系统托盘与退出 ====================
 
+    def _notify_batch_done(self, stats_json: str):
+        """
+        批次上传完成通知：右下角自绘置顶 toast 窗口提醒本次上传统计。
+        在 tkinter 主线程中调用（由 _update_logs 分发）。
+        不依赖系统通知/托盘气泡（部分系统会拦截 Shell_NotifyIcon 气泡），
+        窗口最小化到托盘时 toast 同样可见。
+
+        Args:
+            stats_json: BATCH_DONE 指令携带的统计 JSON
+                        {total, direct_success, agent_recovered, manual, retrying}
+        """
+        if self.stop_event.is_set():
+            return  # 程序正在退出，不再通知
+        try:
+            stats = json.loads(stats_json)
+        except (ValueError, TypeError):
+            stats = {}
+        self._show_batch_toast(stats)
+
+    def _get_toast_position(self, w: int, h: int):
+        """
+        计算通知卡片在屏幕右下角的位置（物理像素，与 Tk geometry 一致）。
+
+        实测（125% DPI）：Tk 窗口 geometry 坐标与 GetWindowRect 物理像素 1:1
+        对应，GetMonitorInfo 的 Work 区域同为物理像素，可直接使用，无需按
+        DPI 缩放换算（winfo_screenwidth 报告的是缩放后的逻辑尺寸，用于定位
+        会偏到屏幕中间）。优先主窗口所在显示器，其次鼠标所在显示器，支持
+        多屏——主窗口/鼠标在副屏时按副屏右下角定位。
+
+        Returns:
+            (x, y) 或 None（win32 不可用时调用方回退）
+        """
+        try:
+            import win32api
+            try:
+                import win32con
+                _nearest = win32con.MONITOR_DEFAULTTONEAREST
+            except Exception:
+                _nearest = 2  # MONITOR_DEFAULTTONEAREST
+
+            # 目标点：主窗口中心（窗口可见时），否则鼠标位置
+            tk_x, tk_y = self.root.winfo_pointerx(), self.root.winfo_pointery()
+            if self.root.state() != "withdrawn":
+                cx = self.root.winfo_x() + max(self.root.winfo_width() // 2, 0)
+                cy = self.root.winfo_y() + max(self.root.winfo_height() // 2, 0)
+            elif tk_x > 0:
+                cx, cy = tk_x, tk_y
+            else:
+                return None
+
+            # 找到该点所在显示器的工作区（排除任务栏）
+            monitor = win32api.MonitorFromPoint((int(cx), int(cy)), _nearest)
+            work = win32api.GetMonitorInfo(monitor)['Work']
+            right, bottom = work[2], work[3]
+            return (right - w - 24, bottom - h - 16)
+        except Exception:
+            return None
+
+    def _show_batch_toast(self, stats: dict):
+        """
+        显示批次完成通知卡片（右下角置顶，淡入淡出，约6秒自动关闭，
+        点击任意处恢复主窗口）。新的批次通知会替换旧的。
+        """
+        # 关闭上一个 toast（连续批次只显示最新）
+        if self._batch_toast is not None:
+            try:
+                self._batch_toast.destroy()
+            except Exception:
+                pass
+            self._batch_toast = None
+
+        total = stats.get('total', 0)
+        success = stats.get('direct_success', 0)
+        agent_recovered = stats.get('agent_recovered', 0)
+        manual = stats.get('manual', 0)
+        retrying = stats.get('retrying', 0)
+
+        # 用原生 Toplevel:CTkToplevel 的 geometry() 会被 customtkinter 按 DPI
+        # 缩放改写(尺寸缩小、查询值漂移),无法精确贴右下角;原生 Toplevel 的
+        # geometry 与 win32 物理像素 1:1 对应,定位精确,内部放 CTk 控件保持主题
+        toast = tk.Toplevel(self.root)
+        toast.overrideredirect(True)          # 无系统边框
+        toast.attributes("-topmost", True)    # 始终置顶
+        toast.configure(bg=theme.CARD)        # 圆角外露背景与卡片同色
+        self._batch_toast = toast
+
+        body = ctk.CTkFrame(toast, fg_color=theme.CARD_INNER, corner_radius=10)
+        body.pack(fill="both", expand=True, padx=8, pady=8)
+
+        # 标题行 + 关闭按钮
+        title_row = ctk.CTkFrame(body, fg_color="transparent")
+        title_row.pack(fill="x", padx=16, pady=(12, 6))
+        ctk.CTkLabel(title_row, text="作业上传完成",
+                     font=theme.font(16, "bold"), text_color=theme.PRIMARY).pack(side="left")
+        close_btn = ctk.CTkLabel(title_row, text="×",
+                                 font=theme.font(17, "bold"), text_color=theme.TEXT_MUTED,
+                                 cursor="hand2")
+        close_btn.pack(side="right")
+
+        # 统计行（四项）
+        rows = [
+            ("作业总数", total, theme.TEXT),
+            ("上传成功", success, theme.SUCCESS),
+            ("智能体修复", agent_recovered, theme.PRIMARY),
+            ("需手动处理", manual, theme.DANGER if manual > 0 else theme.TEXT_MUTED),
+        ]
+        for label, value, color in rows:
+            row = ctk.CTkFrame(body, fg_color="transparent")
+            row.pack(fill="x", padx=16, pady=2)
+            ctk.CTkLabel(row, text=label, font=theme.font(14),
+                         text_color=theme.TEXT_MUTED).pack(side="left")
+            ctk.CTkLabel(row, text=str(value), font=theme.font(14, "bold"),
+                         text_color=color).pack(side="right")
+        if retrying > 0:
+            ctk.CTkLabel(body, text=f"另有 {retrying} 个正在重试中",
+                         font=theme.font(13), text_color=theme.WARNING).pack(
+                anchor="w", padx=16, pady=(4, 12))
+
+        # 定位到屏幕右下角（避开任务栏）：
+        # 优先主窗口所在显示器，其次鼠标所在显示器（支持多屏），
+        # winfo_screenwidth 只覆盖主屏，窗口/鼠标在副屏时位置会跑偏。
+        # 坐标直接用物理像素（与 Tk geometry 1:1 对应，实测无需 DPI 换算）。
+        toast.update_idletasks()
+        h = toast.winfo_reqheight()
+        width = 420
+        pos = self._get_toast_position(width, h)
+        if pos is None:
+            try:
+                import win32api
+                import win32con
+                screen_w = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
+                screen_h = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
+            except Exception:
+                screen_w = self.root.winfo_screenwidth()
+                screen_h = self.root.winfo_screenheight()
+            pos = (max(0, screen_w - width - 24), max(0, screen_h - h - 16))
+        toast.geometry(f"{width}x{h}+{pos[0]}+{pos[1]}")
+
+        # 点击任意处（除关闭按钮）恢复主窗口
+        for widget in (toast, body, title_row):
+            widget.bind("<Button-1>", lambda e: self._toast_clicked())
+
+        def _close():
+            """直接销毁（关闭按钮 / 6秒自动关闭共用）"""
+            if self._batch_toast is not toast:
+                return
+            try:
+                toast.destroy()
+            except Exception:
+                pass
+            if self._batch_toast is toast:
+                self._batch_toast = None
+
+        close_btn.bind("<Button-1>", lambda e: _close())
+        self.root.after(8000, _close)  # 8秒后自动关闭
+
+    def _toast_clicked(self):
+        """点击通知卡片：关闭 toast 并恢复主窗口"""
+        if self._batch_toast is not None:
+            try:
+                self._batch_toast.destroy()
+            except Exception:
+                pass
+            self._batch_toast = None
+        self._restore_window()
+
     def _setup_tray(self):
         """
         初始化系统托盘图标（延迟加载，仅在首次最小化时创建）
@@ -1097,7 +1274,18 @@ class MainApplication:
                 "作业自动上传 - 运行中",
                 menu
             )
-            self.tray_thread = Thread(target=self.tray_icon.run, daemon=True)
+
+            # 自定义 setup：图标 NIM_ADD 完成后置位就绪事件。
+            # notify() 底层是同步 Shell_NotifyIcon(NIM_MODIFY)，图标未创建前调用会
+            # 静默失败（气泡不显示），必须先等就绪再通知
+            self._tray_ready.clear()
+
+            def _tray_setup_cb(icon):
+                icon.visible = True
+                self._tray_ready.set()
+
+            self.tray_thread = Thread(
+                target=lambda: self.tray_icon.run(setup=_tray_setup_cb), daemon=True)
             self.tray_thread.start()
 
             self._tray_setup_done = True
@@ -1190,10 +1378,12 @@ class MainApplication:
                     self.root.withdraw()
                     if self.tray_icon and hasattr(self.tray_icon, 'notify'):
                         try:
-                            self.tray_icon.notify(
-                                "作业自动上传工具仍在后台运行\n双击托盘图标可恢复窗口",
-                                title="作业自动上传"
-                            )
+                            # 等待图标 NIM_ADD 完成再通知，否则气泡静默丢失
+                            if self._tray_ready.wait(timeout=2):
+                                self.tray_icon.notify(
+                                    "作业自动上传工具仍在后台运行\n双击托盘图标可恢复窗口",
+                                    title="作业自动上传"
+                                )
                         except Exception:
                             pass
                     return  # 成功隐藏到托盘，不退出

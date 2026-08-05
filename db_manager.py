@@ -599,6 +599,84 @@ class DatabaseManager:
         self._connection.commit()
         return cursor.lastrowid
 
+    def count_pending_by_paths(self, file_paths: list) -> int:
+        """
+        统计指定文件路径集合中仍处于待重试状态
+        （status='failed' AND retry_status='pending'）的记录数。
+
+        供批次完成判定使用：pending>0 说明 Agent 还在修复，批次未结束。
+
+        Args:
+            file_paths: 文件完整路径列表
+
+        Returns:
+            待重试记录数量
+        """
+        paths = [p for p in (file_paths or []) if p]
+        if not paths:
+            return 0
+        placeholder = ','.join('?' * len(paths))
+        cursor = self._connection.cursor()
+        cursor.execute(f'''
+            SELECT COUNT(*) FROM upload_records
+            WHERE file_path IN ({placeholder})
+              AND status = 'failed' AND retry_status = 'pending'
+        ''', paths)
+        return cursor.fetchone()[0]
+
+    def get_batch_stats(self, file_paths: list) -> Dict:
+        """
+        按文件路径聚合统计一批上传任务的最终状态（批次完成通知用）。
+
+        同一文件可能有多条记录（先失败后成功时，旧失败记录会被
+        resolve_pending_by_file 置为 success），必须按 file_path 分组取
+        最高终态，避免同一文件重复计数：
+          - agent_retry_success='是' 且 success → 智能体修复 (2)
+          - success（无 agent 标记）            → 直接上传成功 (1)
+          - failed 且 retry_status='finished'   → 需手动处理 (0)
+          - failed 且 retry_status='pending'    → 仍在重试 (-1)
+        无记录的文件（如"已上传过"被跳过）不计入 total。
+
+        Args:
+            file_paths: 文件完整路径列表
+
+        Returns:
+            {'total': int, 'direct_success': int, 'agent_recovered': int,
+             'manual': int, 'retrying': int}
+        """
+        result = {'total': 0, 'direct_success': 0, 'agent_recovered': 0,
+                  'manual': 0, 'retrying': 0}
+        paths = [p for p in (file_paths or []) if p]
+        if not paths:
+            return result
+
+        placeholder = ','.join('?' * len(paths))
+        cursor = self._connection.cursor()
+        cursor.execute(f'''
+            SELECT file_path,
+                   MAX(CASE WHEN status='success' AND agent_retry_success='是' THEN 2
+                            WHEN status='success' THEN 1
+                            WHEN status='failed' AND retry_status='finished' THEN 0
+                            ELSE -1 END) AS final_state
+            FROM upload_records
+            WHERE file_path IN ({placeholder})
+            GROUP BY file_path
+        ''', paths)
+        for row in cursor.fetchall():
+            state = row[1] if row[1] is not None else -1
+            if state == 2:
+                result['agent_recovered'] += 1
+            elif state == 1:
+                result['direct_success'] += 1
+            elif state == 0:
+                result['manual'] += 1
+            else:
+                result['retrying'] += 1
+
+        result['total'] = (result['direct_success'] + result['agent_recovered']
+                           + result['manual'] + result['retrying'])
+        return result
+
     def get_pending_failed_records(self, limit: int = 20) -> List[Dict]:
         """
         获取待处理的失败记录（retry_status='pending' 且 status='failed'）

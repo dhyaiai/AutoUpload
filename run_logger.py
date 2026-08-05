@@ -34,7 +34,7 @@ _ERROR_MARKERS = (
 )
 
 # GUI 控制指令消息，不属于运行日志
-_CONTROL_PREFIXES = ("REFRESH_FAILED_LIST", "BROWSER_STATUS:")
+_CONTROL_PREFIXES = ("REFRESH_FAILED_LIST", "BROWSER_STATUS:", "BATCH_DONE:")
 
 # 文件写入锁（log_queue 会被多线程并发 put）
 _write_lock = threading.Lock()

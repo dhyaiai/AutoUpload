@@ -19,6 +19,11 @@ from error_types import UploadStage, ErrorCategory, ErrorType, RetryLevel
 from pipeline_watchdog import PipelineHeartbeat, RECENT_LOGS
 
 
+# 批次完成通知的超时兜底（秒）：失败记录长时间未落定时强制结束批次并通知，
+# 避免 Agent 持续重试导致用户永远收不到提醒
+BATCH_DONE_TIMEOUT = 1200
+
+
 class UploadProcessor:
     """
     上传处理器
@@ -68,12 +73,64 @@ class UploadProcessor:
         # 浏览器定时重启计数器：累计上传次数，达到阈值自动重启浏览器防内存泄漏
         self._upload_count = 0
 
+        # 批次跟踪：批次 = 从队列取到第一个桌面端文件开始，到队列空且所有失败
+        # 记录落定（Agent 处置完毕）结束。结束后发 BATCH_DONE 指令通知 GUI 弹托盘气泡。
+        self._batch_active = False       # 当前是否处于一个上传批次中
+        self._batch_files: set = set()   # 本批次涉及的桌面端文件路径（去重）
+        self._batch_start_time = 0.0     # 批次开始时间（超时兜底用）
+
     def _on_session_lost(self):
         """会话丢失时置位标志，Agent 主循环检测到后自动切换为 5s 快速轮询。
         同时立即释放 processing 锁，让 Agent 可以接管浏览器执行恢复，
         避免死锁：UploadProcessor 等浏览器响应 → Agent 等 UploadProcessor 释放锁。"""
         self._session_lost.set()
         self.processing = False  # 立即释放浏览器锁，让 Agent 可以恢复
+
+    def _check_batch_complete(self):
+        """
+        批次结束判定：队列已空、无任务处理中、本批次失败记录均已落定
+        （无 pending 待重试记录，即 Agent 已处置完毕或无需处置）。
+
+        兜底策略：
+        - Agent 未启用时失败记录不会落定，直接结束（失败归入需手动处理）
+        - 超过 BATCH_DONE_TIMEOUT 仍不落定，强制结束，避免永远不通知
+        """
+        if not self._batch_active:
+            return
+        if not self.task_queue.empty() or self.processing:
+            return
+        if not self._batch_files:
+            # 防御性重置（激活时必有文件，正常不会走到）
+            self._batch_active = False
+            return
+
+        pending = self.db.count_pending_by_paths(list(self._batch_files))
+        agent_enabled = bool(getattr(self.config, 'auto_retry_enable', True))
+        timed_out = time.time() - self._batch_start_time > BATCH_DONE_TIMEOUT
+        if pending > 0 and agent_enabled and not timed_out:
+            return  # Agent 还在修复，等待本批次失败记录落定
+
+        self._finalize_batch()
+
+    def _finalize_batch(self):
+        """
+        批次结束：汇总本批次统计，经 log_queue 发送 BATCH_DONE 指令
+        （GUI 消费后弹右下角托盘气泡）。API 模式无 GUI 消费者，指令经
+        RunLogQueue 控制前缀过滤，不写日志文件，天然无害。
+        """
+        try:
+            stats = self.db.get_batch_stats(list(self._batch_files))
+            payload = json.dumps(stats, ensure_ascii=False)
+            self._send_log(f"BATCH_DONE:{payload}")
+            self._send_log(
+                f"✓ 批次上传完成: 共{stats['total']}个, 成功{stats['direct_success']}个, "
+                f"智能体修复{stats['agent_recovered']}个, 需手动处理{stats['manual']}个"
+            )
+        except Exception as e:
+            self._send_log(f"批次统计通知失败: {e}")
+        finally:
+            self._batch_active = False
+            self._batch_files.clear()
 
     def set_agent(self, agent):
         """
@@ -199,6 +256,15 @@ class UploadProcessor:
                 # 从队列中获取任务(超时1秒,以便检查停止信号)
                 raw_task = self.task_queue.get(timeout=1)
 
+                # 桌面端文件任务纳入批次跟踪：批次从取到第一个文件开始，
+                # 持续到队列空且所有失败记录落定（Agent 处置完毕），结束后发通知。
+                # 小程序结构化任务不纳入批次（API 模式无 GUI 通知消费者）。
+                if isinstance(raw_task, str):
+                    if not self._batch_active:
+                        self._batch_active = True
+                        self._batch_start_time = time.time()
+                    self._batch_files.add(raw_task)
+
                 # 根据任务类型分发
                 if isinstance(raw_task, str):
                     # 桌面端：纯文件路径
@@ -227,8 +293,12 @@ class UploadProcessor:
                     # 标记任务完成（仅在未重新排队时调用）
                     self.task_queue.task_done()
 
+                # 批次结束判定（队列空 + 空闲 + 失败记录已落定）
+                self._check_batch_complete()
+
             except Empty:
-                # 队列为空,继续循环
+                # 队列为空,继续循环（同时检查批次是否结束）
+                self._check_batch_complete()
                 continue
 
             except Exception as e:
