@@ -108,7 +108,7 @@ UploadProcessor 每个阶段调用 `heartbeat.beat(stage, file)` 上报心跳，
 
 **Agent 工具集（20个）分为四类：**
 
-1. **诊断**（只读）：`capture_page_error`（【必须第一步调用】抓取页面错误并判断是否永久性业务错误）、`detect_page_state`、`check_current_school`、`query_error_history`、`check_circuit_breaker`、`check_file_exists`、`view_page_screenshot`（多模态视觉模型分析截图，用 `QWEN_VL_MODEL`）、`get_page_elements`、`read_recent_logs`
+1. **诊断**（只读）：`capture_page_error`（【必须第一步调用】抓取页面错误并判断是否永久性业务错误）、`detect_page_state`、`check_current_school`、`query_error_history`、`check_circuit_breaker`、`check_file_exists`、`view_page_screenshot`（多模态视觉模型分析截图，用 `LLM_VL_*` 配置，三键齐全才可用）、`get_page_elements`、`read_recent_logs`
 2. **原子修复**：`close_dialog`、`press_escape`、`refresh_page`、`navigate_home`、`re_login`（仅 login/role_select 页可执行）、`restart_browser`（受熔断器硬约束）、`full_recovery`（一键完整恢复流程）
 3. **验证**：`verify_recovery`（【修复后必须调用】确认页面回到 home 且关键元素可交互）
 4. **终态动作**：`enqueue_retry`（硬闸门：修复后未通过验证自动执行验证，不通过拒绝入队）、`mark_manual_review`、`skip_and_wait`
@@ -137,9 +137,9 @@ UploadProcessor 每个阶段调用 `heartbeat.beat(stage, file)` 上报心跳，
 | `api_server.py` | FastAPI 后端（微信小程序对接）。lifespan 中初始化全部组件（DB/浏览器/上传处理器/Agent/看门狗）。接口：`/api/upload/submit`（multipart 上传到 `upload_temp/` 后入队）、`/api/upload/status/{id}`、`/api/failed/list`、`/api/upload/retry/{id}`、`/api/report/generate`、`/api/stats/overview`、`/api/health`。统一响应格式 `{code, msg, data}` |
 | `info_extractor.py` | 年级正则：`^(.+?)(高一\|高二\|...\|小六)$`，支持 txt/docx/doc/pdf（.doc 通过 olefile 解析 OLE2 二进制格式） |
 | `subject_classifier.py` | 调用 `deepseek-chat`，temperature=0，限制 9 个科目，最多重试 3 次间隔 2 秒 |
-| `file_monitor.py` | watchdog `on_created` 事件，文件稳定等待 2 秒后入队，过滤根目录下的直接文件 |
+| `file_monitor.py` | watchdog `on_created` 事件，文件稳定等待 2 秒后入队，过滤根目录下的直接文件。用**墓碑窗口**区分"编辑器保存重建"与"真新文件"：`on_deleted` 记录路径→删除时间戳，`on_created` 时若同路径重建发生在 `RECREATE_SUPPRESS_SECONDS`(5秒) 内视为删旧写新跳过，超过窗口照常入队（旧实现 `_known_paths` 集合只增不减，删除后同路径重建会被永久压制，已移除） |
 | `db_manager.py` | SQLite，`upload_records` + `analysis_records` + `repair_experiences` 三表，`check_same_thread=False`。分析表支持按科目/学校年级/日期聚合查询。Agent 通过工具函数查询/更新失败记录 |
-| `config_manager.py` | 处理 PyInstaller 打包路径（`sys._MEIPASS`），`@property` 暴露配置项，自动清理 Unicode 控制字符 |
+| `config_manager.py` | 处理 PyInstaller 打包路径（`sys._MEIPASS`），`@property` 暴露配置项，自动清理 Unicode 控制字符。默认值统一在模块级 `DEFAULT_CONFIG`（`get_all_editable` 设置页默认值派生自它，避免两处漂移）。`set_many()` 批量保存 + `.tmp`+`os.replace` 原子写盘。LLM 配置回退链只存在于属性中（见下） |
 | `file_merger.py` | 试题+答案合并（试题在前，分页符分隔，答案在后）。.doc/.docx 用 Word COM（支持 MS Word / WPS），.pdf 用 pypdf |
 | `stats_panel.py` | 数据统计页：tkinter Canvas 自绘柱状图（按科目/学校年级切换）+ 折线图（按日/周/月聚合）+ 上传/失败记录表 + openpyxl Excel 导出 + 失败分析报告入口 |
 | `main.py` | 入口，协调线程启停。`--api-only` 参数切换到纯 API 模式。优雅退出：等队列清空（最多30秒）→ 停监控 → 关浏览器 → 关数据库 |
@@ -162,9 +162,10 @@ UploadProcessor 每个阶段调用 `heartbeat.beat(stage, file)` 上报心跳，
 - `WEBSITE_URL`：`https://zuoye.7net.cc`
 - `ROLE`：`"超级管理员"` 或 `"老师"`
 - `CHROME_PROFILE_DIR`：Chrome 用户数据目录（留空=临时目录，填写则复用登录态）
-- `DEEPSEEK_API_KEY`：DeepSeek API 密钥
-- `QWEN_API_KEY` / `QWEN_MODEL` / `QWEN_API_URL`：通义千问 MaaS 专属实例（deepseek_helper 支持多提供商切换）
-- `QWEN_VL_MODEL`：截图理解用多模态模型（view_page_screenshot 工具）
+- `LLM_API_URL` / `LLM_MODEL` / `LLM_API_KEY`：默认大模型配置（科目识别 + Agent ReAct 主循环）。`LLM_API_KEY` 留空自动回退 `DEEPSEEK_API_KEY` → `QWEN_API_KEY`；URL/模型留空回退 DeepSeek 默认端点
+- `LLM_VL_API_URL` / `LLM_VL_MODEL` / `LLM_VL_API_KEY`：截图理解多模态配置（view_page_screenshot 工具）。三者齐全才启用视觉，缺一禁用——**绝不**回退到文本模型端点
+- `DEEPSEEK_API_KEY`：DeepSeek API 密钥（旧配置，经 `llm_api_key` 属性回退链兼容）
+- `QWEN_API_KEY` / `QWEN_MODEL` / `QWEN_API_URL` / `QWEN_VL_MODEL`：通义千问 MaaS 旧配置（仅作 LLM_* 的迁移回退来源，`config_manager` 属性已统一解析；新配置请填 LLM_* 键）
 - `BROWSER_IDLE_TIMEOUT` / `UPLOAD_IDLE_TIMEOUT`：浏览器空闲关闭超时（各 1800 秒）
 - `BROWSER_RESTART_INTERVAL`：每 N 次上传定时重启浏览器（默认 50，0=不重启）
 - `MINIMIZE_TO_TRAY`：关闭窗口时最小化到系统托盘（默认 true）

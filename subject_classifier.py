@@ -24,9 +24,6 @@ class SubjectClassifier:
         '|'.join(SUBJECTS)
     )
 
-    # DeepSeek API地址
-    API_URL = "https://api.deepseek.com/v1/chat/completions"
-
     # 系统提示词:指导AI如何根据文件内容分类
     SYSTEM_PROMPT_CONTENT = """你是一个科目分类助手。根据提供的作业内容前200字,判断它属于哪个科目。
 只回复科目名称:语文、数学、英语、物理、化学、生物、历史、地理、政治。"""
@@ -34,10 +31,12 @@ class SubjectClassifier:
     def __init__(self):
         """
         初始化科目分类器
-        从配置管理器获取API密钥和重试次数
+        统一从 ConfigManager 属性读取配置（llm_api_key 含 LLM→DEEPSEEK→QWEN 回退链）
         """
         self.config = ConfigManager()
-        self.api_key = self.config.deepseek_api_key
+        self.api_key = self.config.llm_api_key
+        self.api_url = self.config.llm_api_url
+        self.model = self.config.llm_model
         self.max_retries = self.config.max_retry_count
 
     @staticmethod
@@ -131,7 +130,7 @@ class SubjectClassifier:
         }
 
         payload = {
-            "model": "deepseek-chat",
+            "model": self.model,
             "messages": [
                 {
                     "role": "system",
@@ -146,7 +145,7 @@ class SubjectClassifier:
         }
 
         response = requests.post(
-            self.API_URL,
+            self.api_url,
             headers=headers,
             json=payload,
             timeout=30

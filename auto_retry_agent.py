@@ -196,21 +196,29 @@ class AutoRetryAgent:
         self.db = DatabaseManager()
         self.config = ConfigManager()
 
-        # LLM 分工：ReAct 主循环固定使用 DeepSeek 文本模型；
-        # 截图理解单独使用 Qwen 多模态模型（view_page_screenshot 工具）
+        # LLM 分工：ReAct 主循环使用 LLM_* 配置的文本模型；
+        # 截图理解使用 LLM_VL_* 配置的多模态模型（view_page_screenshot 工具）。
+        # 视觉启用条件: 模型名/端点/Key 三者齐全（经 ConfigManager 属性解析，
+        # 含 LLM_VL_* → 旧 QWEN_* 自动迁移）。缺一即禁用——绝不回退到文本模型的
+        # 端点和 Key（多模态请求发往文本端点必失败, 且与"留空=禁用"语义矛盾）。
         self.deepseek = DeepSeekHelper()
-        self._log("AutoRetryAgent: ReAct 主循环使用 DeepSeek")
+        self._log(f"AutoRetryAgent: ReAct 主循环使用 {self.deepseek.model}")
 
-        qwen_key = self.config.qwen_api_key
-        if qwen_key:
+        if self.config.llm_vl_model and self.config.llm_vl_api_url and self.config.llm_vl_api_key:
             self.vision_llm = DeepSeekHelper(
-                api_url=self.config.qwen_api_url,
-                api_key=qwen_key,
-                model=self.config.get("QWEN_VL_MODEL", self.config.qwen_model)
+                api_url=self.config.llm_vl_api_url,
+                api_key=self.config.llm_vl_api_key,
+                model=self.config.llm_vl_model
             )
-            self._log(f"AutoRetryAgent: 视觉模型使用 Qwen/{self.vision_llm.model}")
+            self._log(f"AutoRetryAgent: 视觉模型使用 {self.vision_llm.model}")
         else:
             self.vision_llm = None
+            missing = [name for name, val in (
+                ("LLM_VL_MODEL", self.config.llm_vl_model),
+                ("LLM_VL_API_URL", self.config.llm_vl_api_url),
+                ("LLM_VL_API_KEY", self.config.llm_vl_api_key),
+            ) if not val]
+            self._log(f"AutoRetryAgent: 未配置完整多模态配置(缺 {'/'.join(missing)})，截图识别已禁用")
 
         # 复用全局浏览器单例（不传参避免覆盖已有实例的 log_queue）
         self.browser = BrowserAutomation()
@@ -1569,7 +1577,8 @@ Step 1: 按破坏性从小到大逐级试探，每次修复后必须 verify_reco
                         "error": "浏览器未启动，无法截图，请改用 full_recovery"}
             if self.vision_llm is None:
                 return {"success": False,
-                        "error": "未配置视觉模型(QWEN_API_KEY为空)，请改用 detect_page_state/get_page_elements"}
+                        "error": "未配置视觉模型(需同时填写 LLM_VL_MODEL/LLM_VL_API_URL/LLM_VL_API_KEY)，"
+                                 "请改用 detect_page_state/get_page_elements"}
             shot = self.browser.get_screenshot_base64()
             if not shot.get("success"):
                 return {"success": False, "error": f"截图失败: {shot.get('error', '')}"}

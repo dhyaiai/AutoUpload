@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 import customtkinter as ctk
 
 import ui_theme as theme
+import win32_helpers
 
 
 class StatsPanel:
@@ -312,35 +313,23 @@ class StatsPanel:
 
     def _bind_scroll_ghost_fix(self):
         """
-        修复 Windows 下滚动统计面板时表格区域出现残影的问题
+        修复 Windows 下滚动统计面板时表格区域出现残影的问题(委托共享的
+        win32_helpers.ScrollGhostFix, 与设置页同一份实现)。
 
-        根因: CTkScrollableFrame 通过移动内部 canvas window item 滚动整个
-        内容区, 滚动过程中 ttk.Treeview 未能及时全量重绘, 旧内容残留形成残影。
-        修复: 在滚轮滚动与滚动条拖动之后强制 update_idletasks() 完成重绘。
+        根因: CTkScrollableFrame 用 Canvas 内嵌真实 HWND Frame，滚动时
+        Windows 发送 WM_ERASEBKGND 擦除背景再 WM_PAINT 重绘，与内容帧
+        移动不同步产生残影；且 Tk 的重绘是异步的，快速拖动时 WM_PAINT
+        被鼠标事件抢占，内容绘制滞后于滑块。
+        修复: 1) 用 64 位正确的 GetWindowLongPtrW/SetWindowLongPtrW 子类化
+        画布与内容帧窗口过程抑制 WM_ERASEBKGND（旧实现用 32 位
+        SetWindowLongW，64 位下静默失败从未生效）；
+        2) 滚动事件(拖动中/滚轮)后经 after_idle 合并调度一次 update()
+        同步完成重绘(直接调用 update() 会嵌套排空事件队列导致递归重入)。
+        失败静默回退，不崩溃。destroy() 时 handle.uninstall() 精确还原。
         """
-        trees = (self._upload_tree, self._failed_tree)
-
-        def _redraw(_event=None):
-            for t in trees:
-                try:
-                    t.update_idletasks()
-                except Exception:
-                    pass
-
-        # 滚轮: CTkScrollableFrame 通过 bind_all 全局处理滚轮事件,
-        # 内部滚动回调先注册先执行, 我们的回调追加在其后触发重绘
-        try:
-            self.root.bind_all("<MouseWheel>", _redraw, add="+")
-        except Exception:
-            pass
-        # 拖动滚动条: CTkScrollbar 内部在 _canvas 上处理 B1-Motion/点击
-        sbar = getattr(self._scroll, "_scrollbar", None)
-        if sbar is not None:
-            for seq in ("<B1-Motion>", "<Button-1>", "<ButtonRelease-1>"):
-                try:
-                    sbar.bind(seq, _redraw, add=True)
-                except Exception:
-                    pass
+        self._ghost_fix = win32_helpers.ScrollGhostFix(self._scroll, self.root)
+        # 面板被 tkraise 盖住(切到其他页)时跳过重绘, 避免对隐藏页无谓 update()
+        self._ghost_fix.active = False
 
     # ==================== 图表刷新 ====================
 
@@ -736,3 +725,12 @@ class StatsPanel:
                     cv.delete("all")
                 except Exception:
                     pass
+        # 还原子类化窗口过程 + 精确解绑滚动条/全局滚轮绑定
+        # (unbind_all(seq, funcid) 只接受一个参数会抛 TypeError, 旧代码
+        # 的清理从未真正执行; ScrollGhostFix.uninstall 用 tk.call 精确移除)
+        ghost_fix = getattr(self, "_ghost_fix", None)
+        if ghost_fix is not None:
+            try:
+                ghost_fix.uninstall()
+            except Exception:
+                pass

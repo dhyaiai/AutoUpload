@@ -177,3 +177,53 @@ def bind_click_recursive(widget, callback):
         pass
     for child in widget.winfo_children():
         bind_click_recursive(child, callback)
+
+
+# ==================== 设置页专用控件工厂 ====================
+
+def settings_entry(parent, variable: ctk.StringVar, **kwargs) -> ctk.CTkEntry:
+    """设置页文本输入框"""
+    defaults = dict(width=360, height=34, corner_radius=8,
+                    font=font(12), fg_color=CARD_INNER,
+                    border_color=BORDER, text_color=TEXT,
+                    textvariable=variable)
+    defaults.update(kwargs)
+    return ctk.CTkEntry(parent, **defaults)
+
+
+def settings_switch(parent, variable: ctk.BooleanVar, **kwargs) -> ctk.CTkSwitch:
+    """设置页开关（不需要 command 参数，**kwargs 会原样转发给 CTkSwitch）"""
+    defaults = dict(font=font(12), text_color=TEXT,
+                    variable=variable,
+                    progress_color=SUCCESS,
+                    button_color=BORDER, button_hover_color=PRIMARY)
+    defaults.update(kwargs)
+    return ctk.CTkSwitch(parent, **defaults)
+
+
+def settings_combo(parent, variable: ctk.StringVar, values: list, **kwargs) -> ctk.CTkComboBox:
+    """设置页下拉框"""
+    defaults = dict(width=360, height=34, corner_radius=8,
+                    font=font(12), dropdown_font=font(12),
+                    fg_color=CARD_INNER, border_color=BORDER,
+                    button_color=CARD_INNER, button_hover_color=PRIMARY_SOFT,
+                    text_color=TEXT, dropdown_fg_color=CARD,
+                    dropdown_hover_color=PRIMARY_SOFT,
+                    dropdown_text_color=TEXT, variable=variable,
+                    values=values, state="readonly")
+    defaults.update(kwargs)
+    return ctk.CTkComboBox(parent, **defaults)
+
+
+def settings_label(parent, text: str, **kwargs) -> ctk.CTkLabel:
+    """设置页标签"""
+    defaults = dict(text=text, font=font(12), text_color=TEXT_MUTED, anchor="w")
+    defaults.update(kwargs)
+    return ctk.CTkLabel(parent, **defaults)
+
+
+def settings_help(parent, text: str, **kwargs) -> ctk.CTkLabel:
+    """设置页帮助文字"""
+    defaults = dict(text=text, font=font(10), text_color=TEXT_FAINT, anchor="w")
+    defaults.update(kwargs)
+    return ctk.CTkLabel(parent, **defaults)

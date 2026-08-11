@@ -17,6 +17,7 @@ from typing import Optional
 import customtkinter as ctk
 
 import ui_theme as theme
+import win32_helpers
 from db_manager import DatabaseManager
 from config_manager import ConfigManager
 from file_merger import FileMerger
@@ -64,6 +65,10 @@ class MainApplication:
         self._tray_setup_done = False
         self._tray_ready = threading.Event()  # 托盘图标创建完成信号（NIM_ADD 完成后置位）
 
+        # 保存原始窗口样式（供任务栏隐藏/恢复用）
+        self._original_exstyle = None
+        self._taskbar_hidden = False
+
         # 批次完成通知窗口（自绘右下角置顶 toast，不依赖系统通知）
         self._batch_toast = None
 
@@ -94,6 +99,13 @@ class MainApplication:
         # 绑定窗口关闭事件
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
 
+        # 监听窗口隐藏/恢复, 普通最小化路径恢复时用透明重绘避免黑屏首帧
+        # (托盘路径由 _restore_window_impl 主动处理, 通过 _taskbar_hidden 区分)
+        self._ever_unmapped = False
+        self._restoring_from_tray = False
+        self.root.bind("<Unmap>", self._on_window_unmap)
+        self.root.bind("<Map>", self._on_window_map)
+
     # ==================== 整体布局 ====================
 
     def _create_widgets(self):
@@ -107,20 +119,37 @@ class MainApplication:
         # ===== 右侧内容区 =====
         self.content = ctk.CTkFrame(self.root, fg_color="transparent")
         self.content.grid(row=0, column=1, sticky="nsew", padx=(4, 16), pady=16)
+        self.content.grid_columnconfigure(0, weight=1)
+        self.content.grid_rowconfigure(0, weight=1)
 
+        # 三个页面预先 grid 到同一个 cell, 切换时用 tkraise 改变 Z 序,
+        # 避免 pack_forget/pack 全量重排导致的界面消失与跳动抽搐
         # 页面1: 上传管理
         self.page_upload = ctk.CTkFrame(self.content, fg_color="transparent")
+        self.page_upload.grid(row=0, column=0, sticky="nsew")
         self._create_upload_page()
 
         # 页面2: 数据统计
         self.page_stats = ctk.CTkFrame(self.content, fg_color="transparent")
+        self.page_stats.grid(row=0, column=0, sticky="nsew")
         self._create_stats_page()
+
+        # 页面3: 设置
+        self.page_settings = ctk.CTkFrame(self.content, fg_color="transparent")
+        self.page_settings.grid(row=0, column=0, sticky="nsew")
+        self._create_settings_page()
 
         # 默认显示上传管理页
         self._show_page("upload")
 
         # 启动统计面板定时刷新
         self._start_stats_refresh()
+
+        # 保存顶层窗口 HWND 与原始扩展样式(供任务栏隐藏/恢复)
+        # winfo_id 返回的是客户区子窗口(TkChild),其父级(TkTopLevel)才是
+        # 顶层窗口;旧代码用 winfo_id 操作样式,任务栏隐藏从未生效
+        self._top_hwnd = win32_helpers.get_top_level_hwnd(self.root)
+        self._original_exstyle = win32_helpers.get_ex_style(self._top_hwnd)
 
     def _create_sidebar(self):
         """左侧导航栏: 应用标题 + 页面导航 + 浏览器状态"""
@@ -146,7 +175,7 @@ class MainApplication:
         nav_box.grid(row=2, column=0, sticky="ew", padx=12)
 
         self._nav_buttons = {}
-        for key, label in [("upload", "上传管理"), ("stats", "数据统计")]:
+        for key, label in [("upload", "上传管理"), ("stats", "数据统计"), ("settings", "设置")]:
             btn = ctk.CTkButton(
                 nav_box, text=label, font=theme.font(13),
                 anchor="w", height=40, corner_radius=8,
@@ -177,12 +206,34 @@ class MainApplication:
         self.status_label.pack(side="left", fill="x", expand=True)
 
     def _show_page(self, name: str):
-        """切换页面并更新导航高亮"""
+        """切换页面并更新导航高亮
+
+        三个页面已预先 grid 在同一 cell, 这里只改变 Z 顺序(tkraise),
+        不触发任何布局重算, 切换无闪烁
+        """
         self._current_page = name
-        self.page_upload.pack_forget()
-        self.page_stats.pack_forget()
-        page = self.page_upload if name == "upload" else self.page_stats
-        page.pack(fill="both", expand=True)
+        if name == "upload":
+            page = self.page_upload
+        elif name == "stats":
+            page = self.page_stats
+        else:
+            page = self.page_settings
+        page.tkraise()
+
+        # 同步滚动修复的活动页标记: 被盖住(隐藏)的页面跳过 after_idle 重绘,
+        # 避免对不可见窗口做无谓 update() 阻塞主循环
+        stats_panel = getattr(self, "stats_panel", None)
+        if stats_panel is not None:
+            try:
+                stats_panel._ghost_fix.active = (name == "stats")
+            except Exception:
+                pass
+        settings_fix = getattr(self, "_settings_ghost_fix", None)
+        if settings_fix is not None:
+            try:
+                settings_fix.active = (name == "settings")
+            except Exception:
+                pass
 
         for key, btn in self._nav_buttons.items():
             if key == name:
@@ -433,10 +484,11 @@ class MainApplication:
         self.stats_panel = StatsPanel(self.page_stats, self.db, self.root)
 
     def _start_stats_refresh(self):
-        """定时刷新统计面板（仅当统计页可见时）"""
+        """定时刷新统计面板（仅当统计页可见且窗口未隐藏时）"""
         def _auto_refresh():
             try:
-                if hasattr(self, 'stats_panel') and self._is_stats_tab_selected():
+                if (hasattr(self, 'stats_panel') and self._is_stats_tab_selected()
+                        and self.root.state() == "normal"):
                     self.stats_panel._refresh_bar_chart()
                     self.stats_panel._refresh_line_chart()
                     self.stats_panel._refresh_upload_table()
@@ -1004,13 +1056,20 @@ class MainApplication:
         使用after方法定时检查,确保线程安全
         """
         try:
+            # 每回调最多处理50条普通日志,避免恢复窗口瞬间被整队列排空
+            # 阻塞主循环
+            processed = 0
+            failed_list_dirty = False
             while True:
                 # 非阻塞方式读取日志队列
                 message = self.log_queue.get_nowait()
 
                 # 如果是特殊指令,执行相应操作
                 if message == "REFRESH_FAILED_LIST":
-                    self._load_failed_records()
+                    # 同一轮 drain 内合并为一次刷新(批量失败会连发多条,
+                    # 每条都做 SQLite 查询 + 失败树全量重建, 100条就是
+                    # 100次全量重建)。合并后一批只重建一次。
+                    failed_list_dirty = True
                     continue
 
                 if message.startswith("BROWSER_STATUS:"):
@@ -1027,18 +1086,15 @@ class MainApplication:
                     continue
 
                 # 显示日志消息
-                self.log_text.configure(state="normal")
-
-                # 根据消息类型设置颜色
                 tag = "info"
                 if "错误" in message or "失败" in message or "✗" in message:
                     tag = "error"
                 elif "成功" in message or "✓" in message:
                     tag = "success"
-
-                self.log_text.insert("end", f"{message}\n", tag)
-                self.log_text.see("end")  # 滚动到底部
-                self.log_text.configure(state="disabled")
+                self._append_log_line(message, tag)
+                processed += 1
+                if processed >= 50:
+                    break
 
         except Empty:
             # 队列为空,正常情况
@@ -1047,15 +1103,45 @@ class MainApplication:
         except Exception as e:
             print(f"更新日志失败: {e}")
 
-        # 每100ms检查一次日志队列
-        self.root.after(100, self._update_logs)
+        if failed_list_dirty:
+            try:
+                self._load_failed_records()
+            except Exception as e:
+                print(f"刷新失败列表失败: {e}")
+
+        # 队列仍有积压则 25ms 内续排(保持最小节拍而非 0ms 自续排:
+        # 0ms 链会独占事件循环, 挤压统计刷新/透明重绘/toast 等其他回调)
+        if processed >= 50 and not self.log_queue.empty():
+            self.root.after(25, self._update_logs)
+        else:
+            self.root.after(100, self._update_logs)
+
+    def _append_log_line(self, message: str, tag: str):
+        """追加日志行并裁剪超限行数(两处插入共用的唯一入口,上限1000行)"""
+        try:
+            self.log_text.configure(state="normal")
+            self.log_text.insert("end", f"{message}\n", tag)
+            try:
+                line_count = int(self.log_text.index("end-1c").split(".")[0])
+                if line_count > 1000:
+                    # 保留最近1000行: line_count-999 而不是 line_count-1000,
+                    # 否则 1001 行时 delete("1.0","1.0") 是空区间 no-op,
+                    # 上限实际漂移到 1001-1002 行
+                    self.log_text.delete("1.0", f"{line_count - 999}.0")
+            except Exception:
+                pass
+            self.log_text.see("end")  # 滚动到底部
+            self.log_text.configure(state="disabled")
+        except Exception:
+            pass
 
     def _refresh_failed_list(self):
         """
         定时刷新失败列表
-        每5秒检查一次是否有新的失败记录
+        每5秒检查一次是否有新的失败记录（窗口隐藏时暂停重建，避免恢复时阻塞）
         """
-        self._load_failed_records()
+        if self.root.state() == "normal":
+            self._load_failed_records()
         # 每5秒刷新一次
         self.root.after(5000, self._refresh_failed_list)
 
@@ -1239,7 +1325,7 @@ class MainApplication:
             except Exception:
                 pass
             self._batch_toast = None
-        self._restore_window()
+        self._restore_window_impl()
 
     def _setup_tray(self):
         """
@@ -1305,13 +1391,126 @@ class MainApplication:
 
     def _show_window(self):
         """从系统托盘恢复显示主窗口"""
-        self.root.after(0, self._restore_window)
+        self.root.after(0, self._restore_window_impl)
 
-    def _restore_window(self):
-        """在主线程中恢复窗口"""
-        self.root.deiconify()
-        self.root.lift()
-        self.root.focus_force()
+    def _restore_window_impl(self):
+        """在主线程中恢复窗口（从托盘恢复）"""
+        self._restoring_from_tray = True  # 抑制 deiconify 触发的 <Map> 重复处理
+        try:
+            # 1. 先恢复任务栏样式（顶层窗口，64 位 API）
+            self._show_on_taskbar()
+            # 2. 透明重绘恢复: 最小化恢复时 Windows 需全量重绘, 重绘完成前
+            #    窗口显示背景色(黑屏)。先置透明→强制完成首帧绘制→恢复可见,
+            #    用户看到的始终是完整内容
+            self._reveal_window_after_redraw(do_deiconify=True)
+            self.root.lift()
+            self.root.focus_force()
+            # 统一走 win32_helpers 封装(已配置 argtypes), 替代裸 ctypes 调用
+            win32_helpers.set_foreground_window(self._top_hwnd)
+        finally:
+            self._restoring_from_tray = False
+
+    def _reveal_window_after_redraw(self, do_deiconify: bool = False):
+        """
+        透明重绘恢复窗口: alpha 0 → (deiconify) → update() 完成首帧绘制 → alpha 1。
+        避免恢复最小化窗口时的"先黑屏再加载"。
+        窗口已处于 normal 状态时直接跳过(对已可见窗口闪一帧全透明毫无意义,
+        且 update() 会排空整个事件队列, 积压的日志链会让窗口长时间保持不可见)。
+        任一步失败都保证 alpha 最终恢复 1.0（finally 兜底）。
+        """
+        if self.root.state() == "normal":
+            return
+        try:
+            self.root.attributes("-alpha", 0.0)
+        except Exception:
+            # 不支持透明(个别环境): 退化为普通恢复, 不阻塞
+            try:
+                if do_deiconify:
+                    self.root.deiconify()
+                self.root.update_idletasks()
+            except Exception:
+                pass
+            return
+        try:
+            if do_deiconify:
+                self.root.deiconify()
+            self.root.update()  # 处理事件直到队列空, 强制完成 WM_PAINT 重绘
+        except Exception:
+            pass
+        finally:
+            try:
+                self.root.attributes("-alpha", 1.0)
+            except Exception:
+                pass
+
+    def _on_window_unmap(self, event):
+        """窗口被隐藏/最小化（含托盘 iconify）时记录, 供 <Map> 区分首次显示"""
+        self._ever_unmapped = True
+
+    def _on_window_map(self, event):
+        """
+        窗口恢复可见时的统一状态同步点:
+        - 托盘路径由 _restore_window_impl 主动处理(_restoring_from_tray 抑制)
+        - 外部路径(任务视图/Alt-Tab/Win+D/会话解锁)把"托盘隐藏中"的窗口恢复
+          可见时, 这里同步恢复任务栏样式, 避免"可见但无任务栏按钮"的僵尸态
+        - 首次启动显示由 _ever_unmapped 排除
+        - 普通最小化还原时做透明重绘避免黑屏首帧
+        """
+        if not self._ever_unmapped:
+            return
+        if self._restoring_from_tray:
+            return  # 托盘路径: _restore_window_impl 已完成任务栏还原+透明重绘
+        if self._taskbar_hidden:
+            # 窗口已被外部方式恢复可见: 状态与现实已不一致, 同步还原任务栏按钮
+            self._show_on_taskbar()
+        self._reveal_window_after_redraw(do_deiconify=False)
+
+    def _hide_from_taskbar(self):
+        """隐藏任务栏条目（顶层窗口移除 WS_EX_APPWINDOW、加 WS_EX_TOOLWINDOW）。
+        0 是合法的扩展样式前值, 不是失败标志(set_ex_style 内部用 GetLastError
+        判断真实失败)。失败时记录日志并保持 _taskbar_hidden=False, 由
+        _on_closing 据实回退, 不再静默吞掉。"""
+        if self._taskbar_hidden:
+            return
+        try:
+            style = win32_helpers.get_ex_style(self._top_hwnd)
+            # _original_exstyle 已在 _create_widgets 记录, 无需惰性兜底
+            new_style = ((style & ~win32_helpers.WS_EX_APPWINDOW)
+                         | win32_helpers.WS_EX_TOOLWINDOW)
+            if win32_helpers.set_ex_style(self._top_hwnd, new_style):
+                self._taskbar_hidden = True     # 仅成功时置位
+            else:
+                self._log_to_gui("警告: 隐藏任务栏按钮失败(扩展样式设置失败)", "error")
+        except Exception as e:
+            self._log_to_gui(f"警告: 隐藏任务栏按钮失败: {e}", "error")
+
+    def _show_on_taskbar(self):
+        """恢复任务栏条目（还原原始窗口样式）。失败时如实记录"""
+        if not self._taskbar_hidden:
+            return
+        try:
+            if self._original_exstyle is not None:
+                if win32_helpers.set_ex_style(self._top_hwnd, self._original_exstyle):
+                    self._taskbar_hidden = False
+                else:
+                    self._log_to_gui("警告: 恢复任务栏按钮失败(扩展样式设置失败)", "error")
+        except Exception as e:
+            self._log_to_gui(f"警告: 恢复任务栏按钮失败: {e}", "error")
+
+    def _hide_window_to_tray(self):
+        """隐藏窗口到托盘: 用 iconify 而非 ShowWindow(SW_HIDE)
+
+        iconify 最小化窗口,Windows 保留显示表面,恢复时直接显示缓存,
+        无黑屏/全量重绘;配合 _hide_from_taskbar 移除任务栏按钮后最小化
+        窗口完全不可见,等效"隐藏"。且 state() 变 "iconic" 使 customtkinter
+        的 DPI 轮询跳过隐藏窗口。
+        旧实现把 SW_HIDE 发给 winfo_id 的客户区子窗口,只隐藏内容区,
+        残留带标题栏的黑框窗口。
+        """
+        try:
+            self.root.iconify()
+        except Exception as e:
+            self._log_to_gui(f"警告: 最小化窗口失败: {e}", "error")
 
     def _quit_app(self):
         """从托盘菜单完全退出程序"""
@@ -1324,6 +1523,14 @@ class MainApplication:
         if hasattr(self, 'stats_panel'):
             try:
                 self.stats_panel.destroy()
+            except Exception:
+                pass
+        # 还原设置页滚动修复的子类化窗口过程与全局滚轮绑定
+        # (否则退出时子类化过程被遗留在已销毁/复用的 HWND 上)
+        settings_fix = getattr(self, "_settings_ghost_fix", None)
+        if settings_fix is not None:
+            try:
+                settings_fix.uninstall()
             except Exception:
                 pass
         if self.tray_icon:
@@ -1355,13 +1562,7 @@ class MainApplication:
 
     def _insert_log(self, message: str, tag: str):
         """实际执行日志插入（必须在主线程调用）"""
-        try:
-            self.log_text.configure(state="normal")
-            self.log_text.insert("end", f"{message}\n", tag)
-            self.log_text.see("end")
-            self.log_text.configure(state="disabled")
-        except Exception:
-            pass
+        self._append_log_line(message, tag)
 
     def _on_closing(self):
         """
@@ -1375,7 +1576,16 @@ class MainApplication:
             # 尝试最小化到托盘，失败则回退到退出确认
             try:
                 if self._setup_tray():
-                    self.root.withdraw()
+                    # 先隐藏任务栏条目，再隐藏窗口（避免黑屏）
+                    self._hide_from_taskbar()
+                    self._hide_window_to_tray()
+                    # 验证隐藏是否完整生效: 样式设置或 iconify 任一环节失败时
+                    # 窗口仍留在屏幕/任务栏, 如实告知, 避免"以为已退出"的误解
+                    if not (self._taskbar_hidden
+                            and self.root.state() == "iconic"):
+                        self._log_to_gui(
+                            "警告: 隐藏到托盘未完全生效，窗口仍保留在屏幕/任务栏，"
+                            "可点击任务栏窗口或托盘图标恢复", "error")
                     if self.tray_icon and hasattr(self.tray_icon, 'notify'):
                         try:
                             # 等待图标 NIM_ADD 完成再通知，否则气泡静默丢失
@@ -1402,3 +1612,144 @@ class MainApplication:
             if not messagebox.askokcancel("退出", "确定要退出程序吗?\n正在进行的上传任务将被中断。"):
                 return
             self._perform_exit()
+
+    # ==================== 设置页 ====================
+
+    def _create_settings_page(self):
+        """创建设置页面: 顶部保存按钮 + 分组配置卡片"""
+        page = self.page_settings
+        page.grid_columnconfigure(0, weight=1)
+        page.grid_rowconfigure(1, weight=1)
+
+        # 顶部保存按钮栏
+        header = ctk.CTkFrame(page, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        self._settings_save_btn = theme.primary_button(
+            header, "保存设置", self._save_settings, width=120)
+        self._settings_save_btn.pack(side="right")
+        self._settings_status_label = ctk.CTkLabel(
+            header, text="", font=theme.font(11), text_color=theme.SUCCESS)
+        self._settings_status_label.pack(side="right", padx=12)
+
+        # 可滚动配置区
+        scroll = ctk.CTkScrollableFrame(page, fg_color="transparent")
+        scroll.grid(row=1, column=0, sticky="nsew")
+        scroll.grid_columnconfigure(0, weight=1)
+        self._settings_scroll = scroll
+        # 滚动残影修复(与统计面板共用同一实现; 页面被盖住时 active_check 跳过重绘;
+        # _perform_exit 中 uninstall 还原)
+        self._settings_ghost_fix = win32_helpers.ScrollGhostFix(
+            scroll, self.root,
+            active_check=lambda: self._current_page == "settings")
+
+        # 存储所有配置控件的引用: key -> {"var": ..., "type": ..., "required": ...}
+        self._settings_widgets = {}
+        editable = self.config.get_all_editable()
+
+        for group_idx, (group_name, items) in enumerate(editable.items()):
+            card = theme.card(scroll)
+            card.grid(row=group_idx, column=0, sticky="ew", pady=(0, 12))
+            theme.card_title(card, group_name).pack(fill="x", padx=20, pady=(16, 12))
+
+            for item in items:
+                row = ctk.CTkFrame(card, fg_color="transparent")
+                row.pack(fill="x", padx=20, pady=(0, 10))
+                row.grid_columnconfigure(1, weight=1)
+
+                # 标签 + 帮助文字
+                label_col = ctk.CTkFrame(row, fg_color="transparent")
+                label_col.grid(row=0, column=0, sticky="w", padx=(0, 16))
+                theme.settings_label(label_col, item["label"]).pack(anchor="w")
+                if item.get("help"):
+                    theme.settings_help(label_col, item["help"]).pack(anchor="w")
+
+                # 根据类型创建控件
+                key = item["key"]
+                current_val = self.config.get(key, item["default"])
+                cfg_type = item["type"]
+
+                if cfg_type == "bool":
+                    var = ctk.BooleanVar(value=bool(current_val))
+                    widget = theme.settings_switch(row, var)
+                    widget.grid(row=0, column=1, sticky="w")
+                    self._settings_widgets[key] = {
+                        "var": var, "type": "bool",
+                        "required": bool(item.get("required"))}
+                elif cfg_type == "combo":
+                    var = ctk.StringVar(value=str(current_val))
+                    widget = theme.settings_combo(row, var, values=item.get("options", []))
+                    widget.grid(row=0, column=1, sticky="w")
+                    self._settings_widgets[key] = {
+                        "var": var, "type": "combo",
+                        "required": bool(item.get("required"))}
+                elif cfg_type == "int":
+                    var = ctk.StringVar(value=str(current_val))
+                    widget = theme.settings_entry(row, var)
+                    widget.grid(row=0, column=1, sticky="w")
+                    self._settings_widgets[key] = {
+                        "var": var, "type": "int",
+                        "required": bool(item.get("required"))}
+                elif cfg_type == "float":
+                    var = ctk.StringVar(value=str(current_val))
+                    widget = theme.settings_entry(row, var)
+                    widget.grid(row=0, column=1, sticky="w")
+                    self._settings_widgets[key] = {
+                        "var": var, "type": "float",
+                        "required": bool(item.get("required"))}
+                else:  # str
+                    var = ctk.StringVar(value=str(current_val))
+                    widget = theme.settings_entry(row, var)
+                    widget.grid(row=0, column=1, sticky="w")
+                    self._settings_widgets[key] = {
+                        "var": var, "type": "str",
+                        "required": bool(item.get("required"))}
+
+    def _save_settings(self):
+        """
+        保存所有设置到 config.json: 先全量校验再一次性原子落盘(set_many)。
+        任何字段格式非法或必填字段为空都不落盘, 避免旧的逐键 set() 在循环
+        中途失败时留下"已保存一半却报失败"的混合状态(且 20+ 次磁盘写并
+        非原子, 崩溃会截断 config.json)。
+        """
+        type_map = {
+            "int": int,
+            "float": float,
+            "bool": lambda v: bool(v),
+            "str": str,
+            "combo": str,
+        }
+        errors = []
+        updates = {}
+        for key, info in self._settings_widgets.items():
+            raw = info["var"].get()
+            converter = type_map[info["type"]]
+            try:
+                value = converter(raw)
+            except (ValueError, TypeError):
+                errors.append(f"{key}: 格式错误")
+                continue
+            # 必填字符串字段不允许清空(如 ROOT_DIR 清空会导致文件监控启动失败);
+            # 非必填清空则保存空串(覆盖旧值, ConfigManager 属性层的回退链
+            # 会把空串归一化为"未配置", 否则旧值残留会导致回退链永不生效)
+            if info["type"] in ("str", "combo") and isinstance(value, str) \
+                    and not value.strip():
+                if info.get("required"):
+                    errors.append(f"{key}: 不能为空")
+                    continue
+            updates[key] = value
+
+        if errors:
+            self._settings_status_label.configure(
+                text=f"保存失败: {'; '.join(errors)}", text_color=theme.DANGER)
+            return  # 有任何错误则完全不落盘
+
+        try:
+            self.config.set_many(updates)
+        except Exception as e:
+            self._settings_status_label.configure(
+                text=f"保存失败: {e}", text_color=theme.DANGER)
+            return
+        self._settings_status_label.configure(
+            text="✓ 已保存", text_color=theme.SUCCESS)
+        # 3秒后清除状态文字
+        self.root.after(3000, lambda: self._settings_status_label.configure(text=""))

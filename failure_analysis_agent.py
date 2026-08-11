@@ -42,18 +42,9 @@ class FailureAnalysisAgent:
         self.db = DatabaseManager()
         self.config = ConfigManager()
 
-        # LLM 提供商：优先 Qwen，否则 DeepSeek
-        qwen_key = self.config.qwen_api_key
-        if qwen_key:
-            self.deepseek = DeepSeekHelper(
-                api_url=self.config.qwen_api_url,
-                api_key=qwen_key,
-                model=self.config.qwen_model
-            )
-            self._log(f"AnalysisAgent: 使用 Qwen/{self.config.qwen_model}")
-        else:
-            self.deepseek = DeepSeekHelper()
-            self._log("AnalysisAgent: 使用 DeepSeek")
+        # LLM 提供商：使用 LLM_* 配置的模型（DeepSeek v4-flash 等）
+        self.deepseek = DeepSeekHelper()
+        self._log(f"AnalysisAgent: 使用 {self.deepseek.model}")
 
         self.log_queue = log_queue
 

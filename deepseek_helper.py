@@ -27,14 +27,17 @@ class DeepSeekHelper:
     def __init__(self, api_url: str = None, api_key: str = None, model: str = None):
         """
         Args:
-            api_url: API 端点 URL，默认 DeepSeek
-            api_key: API Key，默认从 ConfigManager 读取 deepseek_api_key
-            model: 模型名，默认 deepseek-chat
+            api_url: API 端点 URL，默认从 ConfigManager 属性读取（llm_api_url）
+            api_key: API Key，默认从 ConfigManager 属性读取（llm_api_key）
+            model: 模型名，默认从 ConfigManager 属性读取（llm_model）
+
+        统一走 ConfigManager 属性（单真源回退链: LLM_* → DEEPSEEK/QWEN 旧键）。
+        属性已把空串归一化为默认值/未配置, 不会出现 requests.post('')。
         """
         cfg = ConfigManager()
-        self.api_url = api_url or self.DEFAULT_API_URL
-        self.api_key = api_key or cfg.deepseek_api_key
-        self.model = model or self.DEFAULT_MODEL
+        self.api_url = api_url or cfg.llm_api_url
+        self.api_key = api_key or cfg.llm_api_key
+        self.model = model or cfg.llm_model
 
     def chat(self, system_prompt: str, user_content: str, temperature: float = 0) -> Optional[str]:
         """
