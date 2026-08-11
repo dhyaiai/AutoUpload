@@ -1498,19 +1498,20 @@ class MainApplication:
             self._log_to_gui(f"警告: 恢复任务栏按钮失败: {e}", "error")
 
     def _hide_window_to_tray(self):
-        """隐藏窗口到托盘: 用 iconify 而非 ShowWindow(SW_HIDE)
+        """隐藏窗口到托盘: 用 withdraw 彻底隐藏
 
-        iconify 最小化窗口,Windows 保留显示表面,恢复时直接显示缓存,
-        无黑屏/全量重绘;配合 _hide_from_taskbar 移除任务栏按钮后最小化
-        窗口完全不可见,等效"隐藏"。且 state() 变 "iconic" 使 customtkinter
-        的 DPI 轮询跳过隐藏窗口。
+        Windows 上最小化"无任务栏按钮"的窗口(WS_EX_TOOLWINDOW)时,系统
+        会把标题栏画成屏幕底部的一个浮动小窗口(残留"作业自动上传管理工具"
+        小标题栏)。withdraw 直接卸载窗口表面,不经过最小化状态,桌面和任务栏
+        均不可见,等效"隐藏"。恢复走 _reveal_window_after_redraw 的
+        deiconify + 透明重绘,无黑屏。
         旧实现把 SW_HIDE 发给 winfo_id 的客户区子窗口,只隐藏内容区,
         残留带标题栏的黑框窗口。
         """
         try:
-            self.root.iconify()
+            self.root.withdraw()
         except Exception as e:
-            self._log_to_gui(f"警告: 最小化窗口失败: {e}", "error")
+            self._log_to_gui(f"警告: 隐藏窗口失败: {e}", "error")
 
     def _quit_app(self):
         """从托盘菜单完全退出程序"""
@@ -1579,10 +1580,10 @@ class MainApplication:
                     # 先隐藏任务栏条目，再隐藏窗口（避免黑屏）
                     self._hide_from_taskbar()
                     self._hide_window_to_tray()
-                    # 验证隐藏是否完整生效: 样式设置或 iconify 任一环节失败时
+                    # 验证隐藏是否完整生效: 样式设置或 withdraw 任一环节失败时
                     # 窗口仍留在屏幕/任务栏, 如实告知, 避免"以为已退出"的误解
                     if not (self._taskbar_hidden
-                            and self.root.state() == "iconic"):
+                            and self.root.state() == "withdrawn"):
                         self._log_to_gui(
                             "警告: 隐藏到托盘未完全生效，窗口仍保留在屏幕/任务栏，"
                             "可点击任务栏窗口或托盘图标恢复", "error")
