@@ -140,7 +140,7 @@ UploadProcessor 每个阶段调用 `heartbeat.beat(stage, file)` 上报心跳，
 | `file_monitor.py` | watchdog `on_created` 事件，文件稳定等待 2 秒后入队，过滤根目录下的直接文件。用**墓碑窗口**区分"编辑器保存重建"与"真新文件"：`on_deleted` 记录路径→删除时间戳，`on_created` 时若同路径重建发生在 `RECREATE_SUPPRESS_SECONDS`(5秒) 内视为删旧写新跳过，超过窗口照常入队（旧实现 `_known_paths` 集合只增不减，删除后同路径重建会被永久压制，已移除） |
 | `db_manager.py` | SQLite，`upload_records` + `analysis_records` + `repair_experiences` 三表，`check_same_thread=False`。分析表支持按科目/学校年级/日期聚合查询。Agent 通过工具函数查询/更新失败记录 |
 | `config_manager.py` | 处理 PyInstaller 打包路径（`sys._MEIPASS`），`@property` 暴露配置项，自动清理 Unicode 控制字符。默认值统一在模块级 `DEFAULT_CONFIG`（`get_all_editable` 设置页默认值派生自它，避免两处漂移）。`set_many()` 批量保存 + `.tmp`+`os.replace` 原子写盘。LLM 配置回退链只存在于属性中（见下） |
-| `file_merger.py` | 试题+答案合并（试题在前，分页符分隔，答案在后）。.doc/.docx 用 Word COM（支持 MS Word / WPS），.pdf 用 pypdf |
+| `file_merger.py` | 试题+答案合并（试题在前，分页符分隔，答案在后）。.docx 用纯 Python zip+XML 合并（零 COM 依赖，不启动 Word/WPS，解决 WPS 自动化不稳定问题），.doc 用 Word COM（支持 MS Word / WPS），.pdf 用 pypdf |
 | `stats_panel.py` | 数据统计页：tkinter Canvas 自绘柱状图（按科目/学校年级切换）+ 折线图（按日/周/月聚合）+ 上传/失败记录表 + openpyxl Excel 导出 + 失败分析报告入口 |
 | `main.py` | 入口，协调线程启停。`--api-only` 参数切换到纯 API 模式。优雅退出：等队列清空（最多30秒）→ 停监控 → 关浏览器 → 关数据库 |
 
@@ -187,7 +187,7 @@ SQLite 文件 `data.db`，三张表：
 
 ## 文件合并功能
 
-GUI 的"合并文件"区域支持将试题文件和答案文件合并为一个文件（试题在前，分页符分隔，答案在后），合并后的文件自动加入上传队列。要求试题和答案格式一致（同为 .doc/.docx 或同为 .pdf）。Word 合并通过 win32com 调用本机 MS Word 或 WPS，PDF 合并通过 pypdf。
+GUI 的"合并文件"区域支持将试题文件和答案文件合并为一个文件（试题在前，分页符分隔，答案在后），合并后的文件自动加入上传队列。要求试题和答案格式一致（同为 .doc/.docx 或同为 .pdf）。.docx 合并为纯 Python 实现（zip + XML 级，媒体关系迁移、rId 重映射，标准库即可），.doc 合并通过 win32com 调用本机 MS Word 或 WPS，PDF 合并通过 pypdf。
 
 ## 打包注意事项
 
